@@ -8,7 +8,7 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 |---|----------|-----|
 | D1 | Download only. Re-running a job mirrors: unchanged files are skipped, partial files resume, nothing local is deleted unless `--prune`. | Replaces OneDrive zip downloads; two-way sync is out of scope. |
 | D2 | Auth uses the user's SharePoint browser session (FedAuth / rtFa cookies). No Entra app registration. | Works in any tenant without IT involvement. |
-| D3 | Sign-in methods, tried in order: (1) embedded webview, (2) installed Edge/Chrome with a throwaway profile read over the DevTools protocol, (3) pasted `Cookie` header. | Conditional Access may block embedded webviews. |
+| D3 | Sign-in methods, tried in order: (1) embedded webview (persistent profile, see D15), (2) installed Edge/Chrome with a throwaway profile read over the DevTools protocol, (3) pasted `Cookie` header. | Conditional Access may block embedded webviews. |
 | D4 | Zero config for users. The tenant host is taken from the pasted URL. Sessions live in the OS keychain, keyed by host. Settings are edited in the GUI and saved to `settings.toml` in the per-user config dir. | Non-developers must never edit a file. |
 | D5 | No hardcoded tenants, sites, URLs or company names anywhere in code. | Public, cross-org repo. |
 | D6 | Files are written to `<name>.ampsync-part`, downloaded in parallel byte ranges, verified (QuickXorHash when available, else size + unchanged eTag), then atomically renamed. | Corruption-proof, resumable. |
@@ -18,6 +18,9 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D10 | Platforms: Windows x64 and Ubuntu x64. No macOS in v1. No code signing, no auto-update, no telemetry. | Agreed scope. |
 | D11 | GUI is Tauri 2 + Svelte 5, following `design/prototype.html` (approved). | |
 | D13 | First launch shows a skippable walkthrough: a dimmed overlay spotlights one control at a time with a short text box (Back / Next / Skip, step counter). It is replayable from Settings. The "seen" flag lives in `settings.toml`. | Non-developer users. |
+| D15 | The webview sign-in uses a persistent AmpSync-only browser profile (per-user data dir), separate from the user's browsers. On launch the app silently checks every saved session (hidden webview load of the site); if Microsoft needs a password or MFA, the sign-in window opens right then, before any download starts. Mid-job expiry also tries a silent refresh first and shows the window only if interaction is required. On Windows, WebView2 SSO with the OS work account is enabled, so managed machines sign in with no prompt. Password saving is a Settings toggle, off by default. "Sign out" deletes the profile and the stored session. | Personal machines otherwise hit MFA on every sign-in; prompts should come at launch, not halfway through an 80 GB job. |
+| D16 | AmpSync never reads, signs in to, or syncs with the user's existing browser profiles (Edge, Chrome, Teams, …). The webview profile lives only in AmpSync's own data dir. The Edge/Chrome fallback always launches a fresh AmpSync-owned `--user-data-dir` with `--disable-sync` and browser implicit sign-in disabled, and only the SharePoint web session is captured. No code path imports cookies or passwords from a browser profile. | User requirement; browser profiles hold personal and work identities that AmpSync must not touch. |
+| D17 | Release builds (installers, portable exe, AppImage, .deb, CLI binaries) run only when a `v*` tag is pushed, and publish a GitHub Release for that tag. Pushes to `main` build nothing. Pull requests run only fmt + clippy + tests on Windows and Ubuntu. `v1.0.0` is tagged after the user has tested on a personal and a work Windows machine. | Avoids burning CI and publishing artifacts on every push. |
 | D14 | Commits and PRs never credit Claude (no co-author trailers or "generated with" lines). | Public contributor list must show humans only. |
 | D12 | Contributors list is generated from the GitHub API at build time; repo slug comes from `AMPSYNC_REPO` / `GITHUB_REPOSITORY`, never hardcoded. | Forks show their own contributors; works offline. |
 
@@ -230,4 +233,5 @@ Tauri 2 commands mirror the engine (`resolve`, `plan`, `enqueue`, `pause`, `resu
 
 - Unit tests in every core module.
 - Integration tests run the engine against a mock SharePoint server (`wiremock` or an `axum` fake) that supports both remote APIs, Range requests, 429 with `Retry-After`, auth expiry mid-job, eTag change mid-job, and corrupted bytes.
-- CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` on `windows-latest` and `ubuntu-24.04`.
+- CI on pull requests only: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` on `windows-latest` and `ubuntu-24.04`.
+- Release workflow on `v*` tags only (D17).

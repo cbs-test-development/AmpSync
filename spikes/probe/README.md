@@ -4,7 +4,7 @@ Throwaway diagnostic for AmpSync. It answers one question against **your** Share
 Online tenant: *which download approaches work when we only have the browser-session cookies
 (`FedAuth` / `rtFa`) and no Entra app registration?*
 
-It signs in (one of four ways), then runs seven independent experiments:
+It signs in (one of four ways), then runs eight independent experiments:
 
 | id | what it checks |
 |----|----------------|
@@ -15,6 +15,7 @@ It signs in (one of four ways), then runs seven independent experiments:
 | E5 | walks up to 2000 items / 60 s: counts, bytes, depth, path lengths, illegal Windows names, 429/503 |
 | E6 | Range requests (start and end of the largest file) over four download methods, then a 4x parallel throughput test (up to 64 MiB, nothing saved) |
 | E7 | downloads one small file in memory and compares QuickXorHash with the listed hash |
+| E8 | tries to turn the cookie session into a v2.x bearer token (`contextinfo` digest, then `SP.OAuth.Token/Acquire`/`SP.OAuth.NativeClient`), decodes only non-identifying JWT claims, then retries the v2.1/v2.0 listing and a hash verification with that token |
 
 **It never stores cookies or file contents.** Cookie values live only in memory. File data is
 read into memory and discarded (E7 keeps a file under 20 MiB in RAM for a few seconds). The
@@ -87,7 +88,10 @@ Notes:
   the terminal when the SharePoint page is visible.
 - Sub-sites (`/sites/A/B/Library`) are treated as site `/sites/A` with library `B`; tell us if your
   folder lives in a sub-site.
-- The run takes about 1 to 3 minutes. It only does GET requests.
+- The run takes about 1 to 3 minutes. Almost everything is a GET request; E8 also makes two
+  read-only POSTs (`_api/contextinfo`, `_api/SP.OAuth.Token/Acquire`) that ask the server for a
+  request digest and a token for the session that is already signed in - neither changes anything
+  on the tenant.
 
 ## What to send back
 
@@ -108,7 +112,8 @@ src/auth.rs         captured-cookie type, paste mode
 src/webview.rs      wry + tao sign-in window, cookie read, WebView2 SSO option
 src/cdp.rs          edge/chrome launch + DevTools Protocol cookie read
 src/http.rs         recording HTTP client (cookie jar, manual redirects)
-src/experiments.rs  E1..E7
+src/experiments.rs  E1..E8
+src/jwt.rs          unverified JWT payload decoding, redacted to non-identifying claims (E8)
 src/qxor.rs         QuickXorHash (rclone test vectors)
 src/redact.rs       redaction
 src/names.rs        Windows file-name checks

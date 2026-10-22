@@ -2,6 +2,7 @@
 
 use crate::auth::{is_auth_name, Captured};
 use crate::http::{Http, Req, Resp};
+use crate::jwt;
 use crate::names::check_name;
 use crate::qxor::QuickXor;
 use crate::redact::{redact_name, scrub_text, url_shape};
@@ -1056,4 +1057,284 @@ async fn e7_inner(http: &Http, st: &mut State) -> Out {
         }
     }
     Ok((Status::Fail, "could not download the file with any method".into(), json!({"tried": tried})))
+}
+
+// ---------------------------------------------------------------------------------------------
+// E8 hidden bearer token
+// ---------------------------------------------------------------------------------------------
+//
+// Real-tenant observation this probe is checking: with FedAuth/rtFa cookies only, the v2.x
+// drive API (`/_api/v2.0/shares/...`, `/_api/v2.0/drives`, `/_api/v2.0/drive/root:/...`) returns
+// 403, while the classic `/_api/web/GetFolderByServerRelativePath(...)/Files` listing works (no
+// hash) and `/_layouts/15/download.aspx?UniqueId=` honours Range. QuickXorHash is only exposed by
+// the v2.x API. Hypothesis: the SharePoint/OneDrive web UI turns its cookie session into a bearer
+// token for that same v2.x API. This tries, in order, stopping at the first step that yields a
+// usable token:
+//   1. POST {site}/_api/contextinfo (cookies, Accept: application/json;odata=nometadata, empty
+//      body) -> FormDigestValue. This is the standard SharePoint REST "request digest" call used
+//      before any write; see Microsoft's SharePoint REST documentation ("getcontextwebinformation"
+//      / `_api/contextinfo`).
+//   2. POST {site}/_api/SP.OAuth.Token/Acquire with X-RequestDigest, trying up to 3 well-evidenced
+//      body/Content-Type variants (resource = the tenant host; resource = the tenant host with any
+//      `-my` suffix dropped, e.g. contoso-my.sharepoint.com -> contoso.sharepoint.com, since that is
+//      the OneDrive-for-Business "MySite" host pattern; and a plain `application/json` variant
+//      instead of `application/json;odata=verbose`). This endpoint is NOT publicly documented by
+//      Microsoft; it is reverse-engineered from the SharePoint/OneDrive modern web client's own
+//      network traffic (the same internal surface used by `SP.OAuth.NativeClient`, below) and is
+//      recorded here as an untested hypothesis, not a confirmed API - every attempt and its
+//      outcome is kept in the report either way.
+//   3. As a 4th, non-token-value discovery attempt (bringing step 2's total to the requested
+//      max of 4): GET {site}/_api/SP.OAuth.NativeClient with no auth. SharePoint Online responds
+//      to this well-known (if undocumented) endpoint with a 302 to
+//      login.microsoftonline.com/.../oauth2/authorize?client_id=...&resource=..., which is how
+//      several community tools (e.g. PnP-style device-code flows) discover the first-party
+//      client_id/resource pair for this tenant; it does not itself hand back a bearer token
+//      through the cookie session, so it is only recorded as evidence, never used as `token`.
+//   4. If a token was obtained: decode its JWT payload (no signature check; see `jwt.rs`) and
+//      keep only aud / scp / roles / minutes-to-expiry / token length - never the token itself.
+//      Then call `GET {site}/_api/v2.1/drive/root:/{path}:/children?$top=50&select=...` (and the
+//      `v2.0` equivalent), with the bearer token, both without and with cookies, plus a bare
+//      `GET {site}/_api/v{ver}/drives` as an extra access-check. Record status and whether
+//      `file.hashes.quickXorHash` / `@content.downloadUrl` are present.
+//   5. If a quickXorHash is present on some file < 20 MiB, download it (download URL, or
+//      download.aspx by UniqueId) and compare with the existing `qxor` module.
+
+pub async fn e8_hidden_token(http: &Http, st: &mut State) -> ExpResult {
+    finish("E8", "hidden bearer token", e8_inner(http, st).await)
+}
+
+/// `contoso-my.sharepoint.com` -> `contoso.sharepoint.com`; any other host is returned unchanged.
+fn root_host(host: &str) -> String {
+    if let Some(dot) = host.find('.') {
+        let (label, rest) = host.split_at(dot);
+        if let Some(stripped) = label.strip_suffix("-my") {
+            return format!("{stripped}{rest}");
+        }
+    }
+    host.to_string()
+}
+
+/// Up to 3 `SP.OAuth.Token/Acquire` body/header variants (the 4th attempt, `SP.OAuth.NativeClient`,
+/// is handled separately since it is a GET with no body).
+fn token_acquire_variants(host: &str) -> Vec<(&'static str, String, &'static str)> {
+    let root = root_host(host);
+    let mut v = vec![("resource_host_verbose", format!("https://{host}"), "application/json;odata=verbose")];
+    if root != host {
+        v.push(("resource_hostroot_verbose", format!("https://{root}"), "application/json;odata=verbose"));
+    }
+    v.push(("resource_host_plain_json", format!("https://{host}"), "application/json"));
+    v.truncate(3);
+    v
+}
+
+async fn get_form_digest(http: &Http, base: &str) -> Result<String> {
+    let url = format!("{base}/_api/contextinfo");
+    let r = http.send(Req::post("E8", "/_api/contextinfo", url, Vec::new()).nometadata()).await?;
+    if !r.is_success() {
+        return Err(status_err(&r));
+    }
+    let v = r.json()?;
+    v.get("FormDigestValue")
+        .and_then(|d| d.as_str())
+        .or_else(|| v["d"]["GetContextWebInformation"]["FormDigestValue"].as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("no FormDigestValue in response"))
+}
+
+fn extract_access_token(v: &Value) -> Option<String> {
+    v.get("access_token")
+        .and_then(|t| t.as_str())
+        .or_else(|| v["d"].get("access_token").and_then(|t| t.as_str()))
+        .or_else(|| v["d"]["Acquire"].get("access_token").and_then(|t| t.as_str()))
+        .map(|s| s.to_string())
+}
+
+/// `/_api/{ver}/drive/root(:/{path}:)/children?$top=N&$select=...`, scoped to the library's
+/// default drive (no drive-id discovery needed - that is the point of this fallback shape).
+fn default_children_url(base: &str, rel: &str, top: u32, ver: &str) -> (String, String) {
+    const SELECT: &str = "name,size,file,eTag,lastModifiedDateTime";
+    if rel.is_empty() {
+        (format!("{base}/_api/{ver}/drive/root/children?$top={top}&$select={SELECT}"), format!("/_api/{ver}/drive/root/children?$top=N&$select=..."))
+    } else {
+        (
+            format!("{base}/_api/{ver}/drive/root:/{}:/children?$top={top}&$select={SELECT}", encode_path(rel)),
+            format!("/_api/{ver}/drive/root:/{{path}}:/children?$top=N&$select=..."),
+        )
+    }
+}
+
+async fn e8_inner(http: &Http, st: &mut State) -> Out {
+    let split = st.split.clone().ok_or_else(|| anyhow!("folder path unknown (E2 failed)"))?;
+    let base = st.site_base();
+    let mut attempts: Vec<Value> = Vec::new();
+
+    // Step 1: form digest (needed to call SP.OAuth.Token/Acquire, which is a POST).
+    let digest = match get_form_digest(http, &base).await {
+        Ok(d) => {
+            attempts.push(json!({"step": "contextinfo", "ok": true}));
+            Some(d)
+        }
+        Err(e) => {
+            attempts.push(json!({"step": "contextinfo", "ok": false, "error": scrub_text(&e.to_string())}));
+            None
+        }
+    };
+
+    // Step 2: up to 3 SP.OAuth.Token/Acquire variants, stopping at the first access_token.
+    let mut token: Option<String> = None;
+    let mut token_source: Option<&'static str> = None;
+    if let Some(digest) = &digest {
+        for (label, resource, content_type) in token_acquire_variants(&st.host) {
+            let url = format!("{base}/_api/SP.OAuth.Token/Acquire");
+            let body = serde_json::to_vec(&json!({"resource": resource})).unwrap_or_default();
+            let req = Req::post("E8", "/_api/SP.OAuth.Token/Acquire", url, body).header("X-RequestDigest", digest).header("Content-Type", content_type).header("Accept", content_type);
+            match http.send(req).await {
+                Ok(r) if r.is_success() => {
+                    let found = r.json().ok().and_then(|v| extract_access_token(&v));
+                    attempts.push(json!({"step": "token_acquire", "variant": label, "status": r.status, "found_token": found.is_some()}));
+                    if let Some(t) = found {
+                        token = Some(t);
+                        token_source = Some(label);
+                        break;
+                    }
+                }
+                Ok(r) => attempts.push(json!({"step": "token_acquire", "variant": label, "status": r.status, "found_token": false})),
+                Err(e) => attempts.push(json!({"step": "token_acquire", "variant": label, "found_token": false, "error": scrub_text(&e.to_string())})),
+            }
+        }
+    } else {
+        attempts.push(json!({"step": "token_acquire", "skipped": true, "reason": "no form digest"}));
+    }
+
+    // Step 2d (4th attempt overall): SP.OAuth.NativeClient discovery, only if still no token.
+    if token.is_none() {
+        let url = format!("{base}/_api/SP.OAuth.NativeClient");
+        match http.send(Req::get("E8", "/_api/SP.OAuth.NativeClient", url).no_store()).await {
+            Ok(r) => {
+                let redirect_host = r.header("location").and_then(|l| Url::parse(&l).ok()).map(|u| host_port(&u));
+                attempts.push(json!({
+                    "step": "nativeclient_discovery",
+                    "status": r.status,
+                    "is_redirect": matches!(r.status, 301 | 302 | 303 | 307 | 308),
+                    "redirect_host_same_as_tenant_auth": redirect_host.map(|h| h.contains("login.microsoftonline") || h.contains("microsoftonline")),
+                    "note": "discovery only; does not itself hand back a bearer token from the cookie session",
+                }));
+            }
+            Err(e) => attempts.push(json!({"step": "nativeclient_discovery", "error": scrub_text(&e.to_string())})),
+        }
+    }
+
+    let Some(token) = token else {
+        return Ok((Status::Fail, "no bearer token obtained from the cookie session".into(), json!({"attempts": attempts})));
+    };
+
+    let claims = match jwt::decode_claims_redacted(&token) {
+        Ok(c) => c,
+        Err(e) => json!({"decode_error": scrub_text(&e.to_string())}),
+    };
+
+    // Step 3: v2.1 then v2.0, bearer-only then bearer+cookies, stopping at the first that lists.
+    let mut v2_attempts: Vec<Value> = Vec::new();
+    let mut listing: Option<(&'static str, Vec<Value>)> = None;
+    for ver in ["v2.1", "v2.0"] {
+        let drives_url = format!("{base}/_api/{ver}/drives");
+        let drives_tpl = format!("/_api/{ver}/drives");
+        match http.send(Req::get("E8", &drives_tpl, drives_url).json().header("Authorization", &format!("Bearer {token}")).no_cookies()).await {
+            Ok(r) => v2_attempts.push(json!({"step": format!("{ver}_drives_bearer_only"), "status": r.status, "ok": r.is_success()})),
+            Err(e) => v2_attempts.push(json!({"step": format!("{ver}_drives_bearer_only"), "error": scrub_text(&e.to_string())})),
+        }
+
+        if listing.is_some() {
+            continue;
+        }
+        for use_cookies in [false, true] {
+            let (url, tpl) = default_children_url(&base, &split.rel, 50, ver);
+            let label: &'static str = match (ver, use_cookies) {
+                ("v2.1", false) => "v2.1_children_bearer_only",
+                ("v2.1", true) => "v2.1_children_bearer_and_cookies",
+                ("v2.0", false) => "v2.0_children_bearer_only",
+                _ => "v2.0_children_bearer_and_cookies",
+            };
+            let mut req = Req::get("E8", &tpl, url).json().header("Authorization", &format!("Bearer {token}"));
+            if !use_cookies {
+                req = req.no_cookies();
+            }
+            match http.send(req).await {
+                Ok(r) if r.is_success() => match r.json() {
+                    Ok(v) => {
+                        let items = v["value"].as_array().cloned().unwrap_or_default();
+                        v2_attempts.push(json!({"step": label, "status": r.status, "ok": true, "items": items.len()}));
+                        listing = Some((label, items));
+                        break;
+                    }
+                    Err(_) => v2_attempts.push(json!({"step": label, "status": r.status, "ok": false, "note": "non-json response"})),
+                },
+                Ok(r) => v2_attempts.push(json!({"step": label, "status": r.status, "ok": false})),
+                Err(e) => v2_attempts.push(json!({"step": label, "ok": false, "error": scrub_text(&e.to_string())})),
+            }
+        }
+    }
+
+    let Some((listing_method, items)) = listing else {
+        let details = json!({"token": {"source": token_source, "claims": claims}, "attempts": attempts, "v2_attempts": v2_attempts});
+        return Ok((Status::Fail, "obtained a bearer token but v2.0/v2.1 listing still failed".into(), details));
+    };
+
+    let mut presence = Presence::default();
+    for it in &items {
+        presence.observe(it);
+    }
+    let cand = items.iter().map(parse_v2_entry).find(|e| !e.is_folder && e.quickxor.is_some() && e.size > 0 && e.size < 20 * 1024 * 1024);
+
+    // Step 4: verify one small file's quickXorHash, if the listing exposed one.
+    let mut verify = json!({"attempted": false});
+    if let Some(c) = &cand {
+        let dl = if let Some(u) = c.download_url.clone() {
+            http.send(Req::get("E8", "<v2 downloadUrl>", u).max_body(c.size as usize + 1)).await
+        } else if let Some(uid) = &c.unique_id {
+            let url = format!("{base}/_layouts/15/download.aspx?UniqueId={}", encode_path(uid));
+            http.send(Req::get("E8", "/_layouts/15/download.aspx?UniqueId={guid}", url).follow().max_body(c.size as usize + 1)).await
+        } else {
+            Err(anyhow!("no downloadUrl or UniqueId on the verification candidate"))
+        };
+        verify = match dl {
+            Ok(r) if r.is_success() => {
+                let mut h = QuickXor::new();
+                h.update(&r.body);
+                let computed = h.finalize_base64();
+                let listed = c.quickxor.clone().unwrap_or_default();
+                json!({
+                    "attempted": true,
+                    "file": redact_name(&c.name, Some(c.size)),
+                    "downloaded_bytes": r.body.len(),
+                    "size_matches": r.body.len() as u64 == c.size,
+                    "match": computed == listed,
+                })
+            }
+            Ok(r) => json!({"attempted": true, "ok": false, "status": r.status}),
+            Err(e) => json!({"attempted": true, "ok": false, "error": scrub_text(&e.to_string())}),
+        };
+    }
+
+    let status = match (cand.is_some(), verify.get("match").and_then(|m| m.as_bool())) {
+        (true, Some(true)) => Status::Pass,
+        (true, _) => Status::Fail,
+        (false, _) => Status::Pass, // token + v2.x listing proven; just nothing small enough to verify with
+    };
+    let summary = format!(
+        "bearer token via {} ({listing_method}); quickXorHash {}, downloadUrl {}, verify match = {}",
+        token_source.unwrap_or("?"),
+        if presence.quick_xor_hash { "yes" } else { "no" },
+        presence.download_url.unwrap_or("no"),
+        verify.get("match").and_then(|m| m.as_bool()).map(|b| b.to_string()).unwrap_or_else(|| "n/a".into()),
+    );
+    let details = json!({
+        "token": {"source": token_source, "claims": claims},
+        "attempts": attempts,
+        "v2_attempts": v2_attempts,
+        "listing_method": listing_method,
+        "fields": presence,
+        "verify": verify,
+    });
+    Ok((status, summary, details))
 }

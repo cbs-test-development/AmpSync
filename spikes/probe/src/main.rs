@@ -6,6 +6,7 @@ mod auth;
 mod cdp;
 mod experiments;
 mod http;
+mod jwt;
 mod names;
 mod qxor;
 #[cfg(test)]
@@ -315,6 +316,7 @@ fn run(args: Args) -> Result<()> {
                 v.push(experiments::e5_walk(&http, &mut st).await);
                 v.push(experiments::e6_range(&http, &mut st).await);
                 v.push(experiments::e7_hash(&http, &mut st).await);
+                v.push(experiments::e8_hidden_token(&http, &mut st).await);
                 v
             });
             report.experiments = exps;

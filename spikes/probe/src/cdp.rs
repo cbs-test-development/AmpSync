@@ -156,6 +156,10 @@ pub async fn capture(b: Browser, url: &str, host: &str) -> Result<AuthResult> {
         .arg(format!("--remote-debugging-port={port}"))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        // Never sign the throwaway profile in to the browser or sync it with the user's profiles.
+        // Edge would otherwise implicitly sign new profiles in with the Windows account.
+        .arg("--disable-sync")
+        .arg("--disable-features=msImplicitSignin,msEdgeSyncConsent,msSignInWithWindowsAccount")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

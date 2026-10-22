@@ -43,6 +43,7 @@ pub struct Req {
     pub follow: bool,
     pub max_body: usize,
     pub store: bool,
+    pub body: Option<Vec<u8>>,
 }
 
 impl Req {
@@ -57,6 +58,24 @@ impl Req {
             follow: false,
             max_body: 16 * 1024 * 1024,
             store: true,
+            body: None,
+        }
+    }
+    /// A POST that carries cookies by default (same recording client; cookies are sent for POSTs
+    /// exactly as they are for GETs). Used only for the two read-only, state-changing-nothing
+    /// calls E8 makes (`contextinfo`, `SP.OAuth.Token/Acquire`).
+    pub fn post(exp: &'static str, template: &str, url: String, body: Vec<u8>) -> Self {
+        Req {
+            method: Method::POST,
+            url,
+            template: template.to_string(),
+            exp,
+            headers: vec![("Accept-Encoding".into(), "identity".into())],
+            cookies: true,
+            follow: false,
+            max_body: 1024 * 1024,
+            store: true,
+            body: Some(body),
         }
     }
     pub fn header(mut self, k: &str, v: &str) -> Self {
@@ -159,6 +178,9 @@ impl Http {
             let mut rb = client.request(r.method.clone(), url.clone());
             for (k, v) in &r.headers {
                 rb = rb.header(k.as_str(), v.as_str());
+            }
+            if let Some(b) = &r.body {
+                rb = rb.body(b.clone());
             }
             let started = Instant::now();
             let template = if hop_no == 0 { r.template.clone() } else { format!("{} (redirect hop {hop_no})", r.template) };
