@@ -192,7 +192,9 @@ class Store {
     };
     switch (ev.type) {
       case "planned":
+        // Files that were already up to date arrive as a count here, not as per-file events.
         job.files_total = ev.files + ev.skipped;
+        job.skipped = ev.skipped;
         job.bytes_total = ev.bytes;
         break;
       case "file_started":
@@ -232,10 +234,6 @@ class Store {
         });
         break;
       }
-      case "file_skipped":
-        job.skipped += 1;
-        touch({ rel_path: ev.rel_path, size: null, state: "skipped", check: "already saved" });
-        break;
       case "file_failed": {
         if (!ev.will_retry) job.failed += 1;
         for (const l of job.lanes) if (l.rel_path === ev.rel_path) l.rel_path = null;
@@ -264,7 +262,11 @@ class Store {
         job.paused = false;
         break;
       case "finished":
+        // The summary is exact; it also repairs counters if events were dropped on the way.
         job.rate_bps = 0;
+        job.verified = ev.downloaded;
+        job.skipped = ev.skipped;
+        job.failed = ev.failed;
         break;
     }
   }

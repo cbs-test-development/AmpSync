@@ -20,6 +20,7 @@ use crate::commands::{self, load_settings, parse_link, require_session, start_ur
 use crate::exit::{self, Failure};
 use crate::human;
 use crate::progress::Display;
+use crate::session_check::{SessionStatus, check, site_url_for};
 use crate::signin::{self, Attempt};
 
 /// Re-sign-in attempts in a row (without a file completing in between) before giving up.
@@ -82,14 +83,19 @@ fn confirm(question: &str) -> bool {
 
 /// Renew an expired session through the sign-in window (silently first, D15) and store it.
 /// Blocks while the window is up.
+///
+/// The old session is passed on as "known bad" only when SharePoint definitely rejects it
+/// (`bad` is `Some`): the window's profile is persistent, so a FedAuth that is merely
+/// unconfirmed may be the only one it will ever produce, and refusing it would wait forever.
 fn refresh_session(
     link: &ParsedLink,
     settings: &Settings,
-    old: &Session,
+    bad: Option<&Session>,
     store: &dyn SessionStore,
 ) -> Result<Session, Failure> {
     let start = start_url(link);
-    match signin::webview(&link.host, &start, settings, true, Some(old)) {
+    let site = site_url_for(link);
+    match signin::webview(&link.host, &start, &site, settings, true, bad) {
         Attempt::Got(s) => {
             if let Err(e) = store.save(&s) {
                 eprintln!(
@@ -107,10 +113,19 @@ fn refresh_session(
     }
 }
 
+/// Probe `session`; the flag is true only when SharePoint definitely rejects it.
+async fn probe(session: &Session, link: &ParsedLink) -> (SessionStatus, bool) {
+    let status = check(session, &site_url_for(link)).await;
+    let bad = matches!(status, SessionStatus::Expired);
+    (status, bad)
+}
+
 enum Stop {
     Finished,
     Interrupted,
     AuthGaveUp(String),
+    /// The sign-in is valid but SharePoint keeps refusing the request.
+    Refused(String),
 }
 
 /// `ampsync get <url> <dest> ...`: plan, confirm unless `--yes`, download. Exit codes: 0 ok,
@@ -161,8 +176,19 @@ async fn get_inner(args: GetArgs) -> Result<u8, Failure> {
                 Ok(plan) => break (engine, plan),
                 Err(Error::AuthExpired { host }) if can_reauth && attempts < 2 => {
                     attempts += 1;
+                    let (status, bad) = probe(&session, &link).await;
+                    if matches!(status, SessionStatus::Valid) {
+                        return Err(Failure::new(
+                            format!(
+                                "SharePoint refused the request for {host} although the sign-in is still valid. \
+                                 Check that you have access to this folder."
+                            ),
+                            exit::ERROR,
+                        ));
+                    }
                     eprintln!("Sign-in expired for {host}. Refreshing it...");
-                    session = refresh_session(&link, &settings, &session, &store)?;
+                    let old = session.clone();
+                    session = refresh_session(&link, &settings, bad.then_some(&old), &store)?;
                 }
                 Err(e) => return Err(Failure::from_core(&e, &args.url)),
             }
@@ -201,15 +227,6 @@ async fn get_inner(args: GetArgs) -> Result<u8, Failure> {
     let handle = engine.start(spec, plan);
     let mut events = handle.events();
     let mut display = (!args.json).then(|| Display::new(totals.files, totals.bytes));
-    if args.json {
-        let planned = Event::Planned {
-            files: totals.files,
-            bytes: totals.bytes,
-            skipped: totals.skipped,
-        };
-        emit_json(&planned);
-    }
-
     // Ctrl+C: first press stops cleanly (progress is kept), second quits at once.
     let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     tokio::spawn(async move {
@@ -221,34 +238,64 @@ async fn get_inner(args: GetArgs) -> Result<u8, Failure> {
     });
 
     let mut reauths = 0u32;
+    let mut lagged = 0u64;
+    let mut refused_while_valid = false;
     let stop = loop {
         tokio::select! {
             _ = sig_rx.recv() => break Stop::Interrupted,
             received = events.recv() => {
                 let event = match received {
                     Ok(e) => e,
-                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Lagged(n)) => {
+                        // Progress is cumulative, so the bars catch up by themselves; only the
+                        // per-file counters can be short until the final summary.
+                        lagged += n;
+                        if lagged == n {
+                            let note = "note: the display fell behind the transfer; file counts may lag until the summary.";
+                            match &display {
+                                Some(d) => d.say(note),
+                                None => eprintln!("{note}"),
+                            }
+                        }
+                        continue;
+                    }
                     Err(RecvError::Closed) => break Stop::Finished,
                 };
                 match &mut display {
                     Some(d) => d.on_event(&event),
-                    None if !matches!(event, Event::Planned { .. }) => emit_json(&event),
-                    None => {}
+                    None => emit_json(&event),
                 }
                 match event {
                     Event::Finished(_) | Event::Failed { .. } | Event::Cancelled => break Stop::Finished,
                     Event::FileVerified { .. } => reauths = 0,
                     Event::AuthExpired { host } => {
-                        if !can_reauth || reauths >= MAX_REAUTH {
+                        if reauths >= MAX_REAUTH {
+                            break if refused_while_valid {
+                                Stop::Refused(host)
+                            } else {
+                                Stop::AuthGaveUp(host)
+                            };
+                        }
+                        if !can_reauth {
                             break Stop::AuthGaveUp(host);
                         }
                         reauths += 1;
+                        let (status, bad) = probe(&session, &link).await;
+                        refused_while_valid = matches!(status, SessionStatus::Valid);
+                        if refused_while_valid {
+                            // The sign-in works, so a new window would hand back the same cookies.
+                            // Try once more with what we have; the cap above ends a real refusal.
+                            handle.resume();
+                            continue;
+                        }
+                        let old = session.clone();
+                        let old_ref = bad.then_some(&old);
                         let renewed = match &display {
                             Some(d) => d.suspend(|| {
                                 eprintln!("Sign-in expired for {host}. Refreshing it...");
-                                refresh_session(&link, &settings, &session, &store)
+                                refresh_session(&link, &settings, old_ref, &store)
                             }),
-                            None => refresh_session(&link, &settings, &session, &store),
+                            None => refresh_session(&link, &settings, old_ref, &store),
                         };
                         match renewed {
                             Ok(s) => {
@@ -290,6 +337,13 @@ async fn get_inner(args: GetArgs) -> Result<u8, Failure> {
             eprintln!(
                 "Sign-in expired for {host}. Progress is saved. Run `ampsync login \"{}\"`, then run the same command again to resume.",
                 args.url
+            );
+            Ok(exit::AUTH_EXPIRED)
+        }
+        Stop::Refused(host) => {
+            eprintln!(
+                "SharePoint kept refusing access for {host} even though your sign-in is valid. Progress is saved. \
+                 Check that you still have access to this folder, then run the same command again to resume."
             );
             Ok(exit::AUTH_EXPIRED)
         }

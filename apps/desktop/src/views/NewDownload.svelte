@@ -4,17 +4,19 @@
   import { api, on, toCmdError } from "../core/api";
   import { app } from "../core/store.svelte";
   import { joinPath, num, size } from "../core/format";
-  import { allTicked, isPartial, setTick, toFilters, totals, type Ticks } from "../core/selection";
+  import { TreeModel } from "../core/selection";
   import type { CmdError, PlanTree, Resolved } from "../core/types";
+  import FolderTree from "../parts/FolderTree.svelte";
   import SignInForm from "../parts/SignInForm.svelte";
 
   let link = $state("");
   let phase = $state<"idle" | "working" | "ready">("idle");
   let error = $state<CmdError | null>(null);
   let resolved = $state<Resolved | null>(null);
-  let tree = $state<PlanTree | null>(null);
-  let ticks = $state<Ticks>({});
-  let expanded = $state<Record<string, boolean>>({});
+  let tree = $state.raw<PlanTree | null>(null);
+  /** Selection state; plain (not a rune) because it is mutated in place, see `selected`. */
+  let model = $state.raw<TreeModel | null>(null);
+  let selected = $state({ files: 0, bytes: 0 });
   let listing = $state({ files: 0, bytes: 0 });
   let saveTo = $state("");
   let existing = $state<"skip_unchanged" | "redownload">("skip_unchanged");
@@ -32,26 +34,11 @@
     return () => off?.();
   });
 
-  const nodes = $derived(tree?.nodes ?? []);
-  const sel = $derived(totals(nodes, ticks));
-  const visible = $derived.by(() => {
-    const out = [];
-    const hidden: string[] = [];
-    for (const n of nodes) {
-      if (hidden.some((h) => n.path.startsWith(h + "/"))) continue;
-      out.push(n);
-      if (n.kind === "folder" && !expanded[n.path]) hidden.push(n.path);
-    }
-    return out;
-  });
-  const hasChildren = $derived.by(() => {
-    const s = new Set<string>();
-    for (const n of nodes) {
-      const i = n.path.lastIndexOf("/");
-      if (i > 0) s.add(n.path.slice(0, i));
-    }
-    return s;
-  });
+  const sel = $derived(selected);
+
+  function syncSelection() {
+    if (model) selected = model.selected;
+  }
 
   async function openFolder() {
     const text = link.trim();
@@ -62,23 +49,20 @@
     phase = "working";
     error = null;
     tree = null;
+    model = null;
     resolved = null;
     listing = { files: 0, bytes: 0 };
     try {
       resolved = await api.resolve(text);
       tree = await api.plan(text);
-      ticks = allTicked(tree.nodes);
-      expanded = Object.fromEntries(tree.nodes.filter((n) => n.depth === 0 && n.kind === "folder").map((n) => [n.path, true]));
+      model = new TreeModel(tree);
+      syncSelection();
       phase = "ready";
       await app.refreshSessions();
     } catch (e) {
       error = toCmdError(e);
       phase = "idle";
     }
-  }
-
-  function toggle(path: string, value: boolean) {
-    ticks = setTick(nodes, ticks, path, value);
   }
 
   async function browse() {
@@ -107,10 +91,10 @@
   const canAdd = $derived(phase === "ready" && sel.files > 0 && saveTo.trim() !== "" && !adding);
 
   async function addToQueue() {
-    if (!resolved || !tree) return;
+    if (!resolved || !tree || !model) return;
     adding = true;
     try {
-      const f = toFilters(nodes, ticks);
+      const f = model.filters();
       const ahead = app.queue.filter((q) => ["queued", "running", "preparing", "needs_sign_in"].includes(q.status));
       const where = joinPath(saveTo.trim(), resolved.display_name);
       const trail = resolved.server_relative_path.split("/").filter(Boolean).join(" › ");
@@ -129,6 +113,7 @@
       app.toast(ahead.length > 0 ? `Added to queue. It starts after ${ahead[ahead.length - 1].title}.` : "Added. The download starts now.");
       phase = "idle";
       tree = null;
+      model = null;
       resolved = null;
       link = "";
       app.go("transfers");
@@ -208,37 +193,16 @@
     {/if}
   </div>
   {#if tree}
-    {#if nodes.length === 0}
+    {#if !model || model.n === 0}
       <p class="placeholder">This folder is empty.</p>
     {:else}
-      <div class="tree" role="tree" aria-label="Folders to download">
-        {#each visible as n (n.path)}
-          <div class="node" class:off={!ticks[n.path]} style:--indent="{n.depth * 22}px" role="treeitem" aria-selected={ticks[n.path]} aria-expanded={n.kind === "folder" && hasChildren.has(n.path) ? !!expanded[n.path] : undefined}>
-            <div class="lead">
-              {#if n.kind === "folder" && hasChildren.has(n.path)}
-                <button type="button" class="caret" aria-label={expanded[n.path] ? `Collapse ${n.name}` : `Expand ${n.name}`} onclick={() => (expanded[n.path] = !expanded[n.path])}>{expanded[n.path] ? "▾" : "▸"}</button>
-              {:else}
-                <span class="caret-gap"></span>
-              {/if}
-              <label>
-                <input
-                  type="checkbox"
-                  checked={ticks[n.path]}
-                  indeterminate={n.kind === "folder" && isPartial(nodes, ticks, n.path)}
-                  onchange={(e) => toggle(n.path, e.currentTarget.checked)}
-                />
-                <span title={n.path}>{n.name}</span>
-              </label>
-            </div>
-            <span class="count">{n.kind === "file" ? "file" : `${num(n.files)} ${n.files === 1 ? "file" : "files"}`}</span>
-            <span class="size">{size(n.bytes)}</span>
-          </div>
-        {/each}
-      </div>
+      {#key model}
+        <FolderTree {model} onchange={syncSelection} />
+      {/key}
     {/if}
     <div class="foot-bar">
       <span class="total">{size(sel.bytes)} <small>· {num(sel.files)} {sel.files === 1 ? "file" : "files"} selected</small></span>
-      <span class="meta">Untick anything you don't need</span>
+      <span class="meta">Untick anything you don't need. Folders open to show their files.</span>
     </div>
   {:else}
     <p class="placeholder">Open a folder above and its subfolders show up here with their sizes, so you can untick what you don't need.</p>
@@ -276,19 +240,6 @@
   .resolved { display: flex; gap: 8px 18px; flex-wrap: wrap; font: 12px var(--f-mono); color: var(--muted); }
   .resolved span b { color: var(--fg); font-weight: 500; }
   .placeholder { margin: 0; padding: 22px 14px; color: var(--muted); font-size: 13px; }
-  .tree { padding: 6px 0; font: 13px var(--f-mono); max-height: 460px; overflow-y: auto; }
-  .node { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 14px; align-items: center; padding: 3px 14px; }
-  .node:hover { background: var(--raise); }
-  .lead { display: flex; align-items: center; min-width: 0; padding-left: var(--indent); }
-  .caret, .caret-gap { width: 22px; flex: none; }
-  .caret { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 2px 0; font-size: 12px; }
-  .caret:hover { color: var(--fg); }
-  label { display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer; }
-  label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .count, .size { color: var(--muted); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
-  .size { min-width: 80px; }
-  input[type="checkbox"] { accent-color: var(--signal); width: 14px; height: 14px; margin: 0; flex: none; }
-  .node.off label span { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--line); }
   .total { font: 500 15px var(--f-mono); }
   .total small { color: var(--muted); font-size: 12px; font-weight: 400; }
   .note { font-size: 13px; color: var(--muted); }

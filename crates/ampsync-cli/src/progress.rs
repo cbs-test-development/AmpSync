@@ -147,7 +147,6 @@ impl Display {
                 self.sizes.remove(rel_path);
                 self.file_done(rel_path);
             }
-            Event::FileSkipped { .. } => {}
             Event::FileFailed {
                 rel_path,
                 error,
@@ -171,7 +170,8 @@ impl Display {
             Event::Paused => self.say("Paused."),
             Event::Resumed => self.say("Resumed."),
             Event::Failed { error } => self.say(&format!("Download stopped: {error}")),
-            Event::Planned { .. } | Event::Finished(_) | Event::Cancelled => {}
+            // Plan-time skips arrive as counts in `Planned`, not as per-file events.
+            _ => {}
         }
     }
 

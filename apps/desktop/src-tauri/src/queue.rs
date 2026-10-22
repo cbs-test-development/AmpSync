@@ -1,11 +1,13 @@
 //! The download queue: jobs run one at a time (D16 in the UI), survive restarts, and wait for a
 //! working sign-in before they start or resume.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ampsync_core::Error;
+use ampsync_core::SessionStatus;
 use ampsync_core::auth::Session;
 use ampsync_core::engine::{Engine, Event, Summary};
 use ampsync_core::link::{self, ParsedLink};
@@ -116,6 +118,9 @@ struct Inner {
 
 pub struct Queue {
     inner: Mutex<Inner>,
+    /// Held across snapshot, write, rename and event, so concurrent publishes cannot interleave
+    /// or let an older snapshot overwrite a newer one. Always taken before `inner`, never after.
+    persist: Mutex<()>,
     wake: Notify,
     gate: watch::Sender<bool>,
 }
@@ -127,6 +132,7 @@ impl Queue {
                 next_id: 1,
                 ..Inner::default()
             }),
+            persist: Mutex::new(()),
             wake: Notify::new(),
             gate: watch::channel(false).0,
         }
@@ -136,12 +142,10 @@ impl Queue {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Load the saved queue. Jobs that were mid-run go back to "queued".
+    /// Load the saved queue (falling back to the last good backup if the file is damaged). Jobs
+    /// that were mid-run go back to "queued".
     pub fn restore(&self, path: &Path) {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let Ok(mut items) = serde_json::from_str::<Vec<QueueItem>>(&text) else {
+        let Some(mut items) = load_queue(path) else {
             return;
         };
         for it in &mut items {
@@ -179,6 +183,21 @@ impl Queue {
         hosts
     }
 
+    /// Where to probe a host's session: the site of a queued job for it, else of any job for it
+    /// (the link that was pasted is the only place the site is known). `None` when no job names
+    /// the host; callers then fall back to the tenant root.
+    pub fn site_hint(&self, host: &str) -> Option<Url> {
+        let g = self.lock();
+        let mut mine = g.items.iter().filter(|i| i.host == host);
+        let pick = mine
+            .clone()
+            .find(|i| i.status == ItemStatus::Queued)
+            .or_else(|| mine.next())?;
+        link::parse(&pick.spec.source)
+            .ok()
+            .map(|p| crate::commands::start_url(&p))
+    }
+
     pub fn has_active(&self) -> bool {
         let g = self.lock();
         g.current.is_some()
@@ -196,6 +215,7 @@ impl Queue {
     }
 
     fn publish(&self, app: &AppHandle) {
+        let _persist = self.persist.lock().unwrap_or_else(|p| p.into_inner());
         let snap = {
             let mut g = self.lock();
             // Keep only the most recent finished jobs.
@@ -211,15 +231,8 @@ impl Queue {
             }
             g.items.clone()
         };
-        if let Ok(text) = serde_json::to_string_pretty(&snap) {
-            let path = paths::queue_file();
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+        if let Err(e) = save_queue(&paths::queue_file(), &snap) {
+            tracing::warn!("could not save the download queue: {e}");
         }
         let _ = app.emit("queue-changed", &snap);
     }
@@ -250,47 +263,70 @@ impl Queue {
         id
     }
 
-    fn send_ctl(&self, id: u64, ctl: Ctl) -> bool {
-        let g = self.lock();
-        match &g.current {
-            Some(c) if c.id == id => c.tx.send(ctl).is_ok(),
-            _ => false,
-        }
-    }
-
+    /// Pause, resume and cancel decide and act under one lock, so they cannot interleave with the
+    /// runner picking the job up: either the running job gets the control message, or a waiting
+    /// job gets its new status before the runner can start it.
     pub fn pause(&self, app: &AppHandle, id: u64) {
-        if self.send_ctl(id, Ctl::Pause) {
-            return;
-        }
-        let queued = self.item(id).is_some_and(|i| i.status == ItemStatus::Queued);
-        if queued {
-            self.set_status(app, id, ItemStatus::Paused, None);
+        let changed = {
+            let mut g = self.lock();
+            if let Some(c) = g.current.as_ref().filter(|c| c.id == id) {
+                let _ = c.tx.send(Ctl::Pause);
+                false
+            } else if let Some(it) = g
+                .items
+                .iter_mut()
+                .find(|i| i.id == id && i.status == ItemStatus::Queued)
+            {
+                it.status = ItemStatus::Paused;
+                it.error = None;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.publish(app);
         }
     }
 
     pub fn resume(&self, app: &AppHandle, id: u64) {
-        if self.send_ctl(id, Ctl::Resume) {
-            return;
-        }
-        let paused = self.item(id).is_some_and(|i| i.status == ItemStatus::Paused);
-        if paused {
-            self.set_status(app, id, ItemStatus::Queued, None);
+        let changed = {
+            let mut g = self.lock();
+            if let Some(c) = g.current.as_ref().filter(|c| c.id == id) {
+                let _ = c.tx.send(Ctl::Resume);
+                false
+            } else if let Some(it) = g
+                .items
+                .iter_mut()
+                .find(|i| i.id == id && i.status == ItemStatus::Paused)
+            {
+                it.status = ItemStatus::Queued;
+                it.error = None;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.publish(app);
             self.wake.notify_one();
         }
     }
 
     pub fn cancel(&self, app: &AppHandle, id: u64) {
-        if self.send_ctl(id, Ctl::Cancel) {
-            return;
-        }
-        let waiting = self
-            .item(id)
-            .is_some_and(|i| matches!(i.status, ItemStatus::Queued | ItemStatus::Paused));
-        if waiting {
-            {
-                let mut g = self.lock();
-                g.items.retain(|i| i.id != id);
+        let changed = {
+            let mut g = self.lock();
+            if let Some(c) = g.current.as_ref().filter(|c| c.id == id) {
+                let _ = c.tx.send(Ctl::Cancel);
+                false
+            } else {
+                let before = g.items.len();
+                g.items
+                    .retain(|i| !(i.id == id && matches!(i.status, ItemStatus::Queued | ItemStatus::Paused)));
+                g.items.len() != before
             }
+        };
+        if changed {
             self.publish(app);
         }
     }
@@ -354,9 +390,84 @@ impl Default for Queue {
     }
 }
 
-fn root_url(host: &str) -> Url {
-    Url::parse(&format!("https://{host}/")).expect("host came from a parsed link")
+/// Writing and reading `queue.json`.
+///
+/// Writes go to `queue.json.tmp` and are renamed over the real file; the previous good file is
+/// kept as `queue.json.bak`. A damaged file is never silently dropped: reading falls back to the
+/// backup, and the damaged copy is kept as `queue.json.corrupt`.
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
 }
+
+fn save_queue(path: &Path, items: &[QueueItem]) -> std::io::Result<()> {
+    let text = serde_json::to_string_pretty(items).map_err(std::io::Error::other)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    if path.exists() {
+        // The file on disk is the last thing this function (or `load_queue`) vouched for.
+        if let Err(e) = std::fs::copy(path, backup_path(path)) {
+            tracing::warn!("could not back up the download queue: {e}");
+        }
+    }
+    std::fs::rename(&tmp, path)
+}
+
+fn parse_queue(path: &Path) -> Result<Vec<QueueItem>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+fn load_queue(path: &Path) -> Option<Vec<QueueItem>> {
+    if !path.exists() {
+        return None;
+    }
+    match parse_queue(path) {
+        Ok(items) => Some(items),
+        Err(why) => {
+            tracing::warn!("the download queue file is damaged ({why}); trying the backup");
+            let bak = backup_path(path);
+            let corrupt = path.with_extension("json.corrupt");
+            if let Err(e) = std::fs::rename(path, &corrupt) {
+                tracing::warn!("could not set the damaged queue file aside: {e}");
+            }
+            match parse_queue(&bak) {
+                Ok(items) => {
+                    tracing::warn!("restored the download queue from its backup");
+                    // Put the good copy back so the next save backs up good data.
+                    if let Err(e) = std::fs::copy(&bak, path) {
+                        tracing::warn!("could not restore queue.json from the backup: {e}");
+                    }
+                    Some(items)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "the download queue could not be restored ({e}); the damaged file was kept as {}",
+                        corrupt.display()
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// The text to show for a failed job.
+fn failure_text(e: &Error) -> String {
+    match e {
+        Error::DestinationBusy { .. } => {
+            "Another AmpSync download is already using this folder. Wait for it to finish, or save to a different folder.".into()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// A refresh that followed a replaced session this recently counts as "just renewed".
+const REFRESH_LOOP_WINDOW: Duration = Duration::from_secs(30);
+
+const REFUSED_MESSAGE: &str = "SharePoint refused some files even though your sign-in is valid. This is usually a permissions issue on those files. Progress is saved; use Retry to try again.";
 
 #[derive(Serialize, Clone)]
 struct JobEvent {
@@ -394,10 +505,25 @@ enum Outcome {
 async fn run_item(app: &AppHandle, id: u64) {
     let state = app.state::<AppState>();
     let queue = &state.queue;
-    let Some(item) = queue.item(id) else { return };
     let (tx, mut rx) = mpsc::unbounded_channel::<Ctl>();
-    queue.lock().current = Some(Current { id, tx: tx.clone() });
-    queue.set_status(app, id, ItemStatus::Preparing, None);
+    // Check the status and take the job in one step: a Pause or Cancel that landed after the
+    // runner chose this job but before now has already changed the status, and wins.
+    let item = {
+        let mut g = queue.lock();
+        let Some(it) = g
+            .items
+            .iter_mut()
+            .find(|i| i.id == id && i.status == ItemStatus::Queued)
+        else {
+            return;
+        };
+        it.status = ItemStatus::Preparing;
+        it.error = None;
+        let item = it.clone();
+        g.current = Some(Current { id, tx: tx.clone() });
+        item
+    };
+    queue.publish(app);
 
     let result = run_item_inner(app, &item, &tx, &mut rx).await;
 
@@ -414,7 +540,7 @@ async fn run_item(app: &AppHandle, id: u64) {
         }
         Ok(None) => {} // paused or cancelled: status already set
         Err(Error::Cancelled) => queue.set_status(app, id, ItemStatus::Cancelled, None),
-        Err(e) => queue.set_status(app, id, ItemStatus::Failed, Some(e.to_string())),
+        Err(e) => queue.set_status(app, id, ItemStatus::Failed, Some(failure_text(&e))),
     }
     crate::tray::update_tooltip(app, None);
 }
@@ -430,7 +556,8 @@ async fn run_item_inner(
     let queue = &state.queue;
     let id = item.id;
     let parsed: ParsedLink = link::parse(&item.spec.source)?;
-    let start_url = root_url(&parsed.host);
+    let start_url = crate::commands::start_url(&parsed);
+    let site_url = crate::signin::site_url_of(&start_url);
 
     let mut force = false;
     let mut attempts = 0;
@@ -463,6 +590,9 @@ async fn run_item_inner(
         queue.set_status(app, id, ItemStatus::Running, None);
         let mut refreshing = false;
         let mut cancelled = false;
+        let mut refused = false;
+        let mut current_session = session.clone();
+        let mut renewed_at: Option<Instant> = None;
         loop {
             tokio::select! {
                 ctl = rx.recv() => match ctl {
@@ -470,6 +600,8 @@ async fn run_item_inner(
                     Some(Ctl::Resume) => { handle.resume(); }
                     Some(Ctl::Replace(s)) => {
                         refreshing = false;
+                        renewed_at = Some(Instant::now());
+                        current_session = s.clone();
                         handle.replace_session(s);
                     }
                     Some(Ctl::Cancel) => { handle.cancel(); cancelled = true; break; }
@@ -490,14 +622,28 @@ async fn run_item_inner(
                             }
                             Event::Resumed => queue.set_status(app, id, ItemStatus::Running, None),
                             Event::AuthExpired { host } => {
+                                // Loop guard: the session was swapped a moment ago and SharePoint
+                                // accepts it, yet something still asked for sign-in. Another
+                                // refresh would only hand back the same cookies, so stop here.
+                                let just_renewed = renewed_at.is_some_and(|t| t.elapsed() < REFRESH_LOOP_WINDOW);
+                                if just_renewed
+                                    && matches!(
+                                        ampsync_core::check_session(&current_session, &site_url).await,
+                                        SessionStatus::Valid
+                                    )
+                                {
+                                    refused = true;
+                                    handle.cancel();
+                                    break;
+                                }
                                 state.set_status(app, host, "expired");
                                 queue.set_status(app, id, ItemStatus::NeedsSignIn, None);
                                 if !refreshing {
                                     refreshing = true;
-                                    let (app2, tx2, host2) = (app.clone(), tx.clone(), host.clone());
+                                    let (app2, tx2, host2, url2) = (app.clone(), tx.clone(), host.clone(), start_url.clone());
                                     tauri::async_runtime::spawn(async move {
                                         let st = app2.state::<AppState>();
-                                        if let Ok(s) = st.signin.obtain(&app2, &host2, &root_url(&host2), true, true).await {
+                                        if let Ok(s) = st.signin.obtain(&app2, &host2, &url2, true, true).await {
                                             let _ = tx2.send(Ctl::Replace(s));
                                         }
                                     });
@@ -507,13 +653,21 @@ async fn run_item_inner(
                             _ => {}
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Progress is cumulative and recovers by itself; per-file counters in the
+                        // window are corrected from the summary when the job ends.
+                        tracing::warn!("job {id}: the event stream fell behind and skipped {n} events");
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
             }
         }
         if cancelled {
             state.signin.cancel(app);
+        }
+        if refused {
+            let _ = handle.wait().await;
+            return Err(Error::State(REFUSED_MESSAGE.into()));
         }
         return handle.wait().await.map(Some);
     }
@@ -557,7 +711,7 @@ async fn acquire(
                 }
             }
             Err(e) => {
-                queue.set_status(app, id, ItemStatus::Failed, Some(e.to_string()));
+                queue.set_status(app, id, ItemStatus::Failed, Some(failure_text(&e)));
                 return Outcome::Stop;
             }
         }
@@ -582,5 +736,120 @@ async fn wait_stop(rx: &mut mpsc::UnboundedReceiver<Ctl>, queue: &Queue, app: &A
             }
             Some(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("ampsync-queue-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn item(id: u64, title: &str) -> QueueItem {
+        QueueItem {
+            id,
+            title: title.into(),
+            path_label: String::new(),
+            host: "contoso.sharepoint.com".into(),
+            spec: JobSpec::new("https://contoso.sharepoint.com/sites/T/Docs/P", "dest"),
+            est_files: 1,
+            est_bytes: 1,
+            status: ItemStatus::Queued,
+            error: None,
+            summary: None,
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_and_leaves_no_temp_file() {
+        let dir = temp_dir("rt");
+        let path = dir.join("queue.json");
+        save_queue(&path, &[item(1, "one")]).unwrap();
+        let loaded = load_queue(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].title, "one");
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn the_previous_good_file_is_kept_as_backup() {
+        let dir = temp_dir("bak");
+        let path = dir.join("queue.json");
+        save_queue(&path, &[item(1, "first")]).unwrap();
+        save_queue(&path, &[item(1, "first"), item(2, "second")]).unwrap();
+        assert_eq!(parse_queue(&backup_path(&path)).unwrap().len(), 1);
+        assert_eq!(parse_queue(&path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_damaged_file_falls_back_to_the_backup_and_is_kept() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("queue.json");
+        save_queue(&path, &[item(1, "first")]).unwrap();
+        save_queue(&path, &[item(1, "first"), item(2, "second")]).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        let loaded = load_queue(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(path.with_extension("json.corrupt").exists());
+        // The good copy is back in place, so the next save backs up good data.
+        assert_eq!(parse_queue(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_damaged_file_without_backup_is_set_aside_not_lost() {
+        let dir = temp_dir("nobak");
+        let path = dir.join("queue.json");
+        std::fs::write(&path, "garbage").unwrap();
+        assert!(load_queue(&path).is_none());
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.corrupt")).unwrap(),
+            "garbage"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_just_an_empty_queue() {
+        let dir = temp_dir("none");
+        assert!(load_queue(&dir.join("queue.json")).is_none());
+    }
+
+    #[test]
+    fn concurrent_saves_never_leave_a_torn_file() {
+        // Mirrors `publish`: one lock around snapshot + write.
+        let dir = temp_dir("race");
+        let path = Arc::new(dir.join("queue.json"));
+        let lock = Arc::new(Mutex::new(0u64));
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let (path, lock) = (path.clone(), lock.clone());
+                std::thread::spawn(move || {
+                    for k in 0..25 {
+                        let mut n = lock.lock().unwrap();
+                        *n += 1;
+                        let items: Vec<_> = (0..*n).map(|i| item(i, &format!("t{t}k{k}"))).collect();
+                        save_queue(&path, &items).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(parse_queue(&path).unwrap().len(), 200);
+    }
+
+    #[test]
+    fn destination_busy_has_a_friendly_text() {
+        let e = Error::DestinationBusy {
+            path: PathBuf::from("x"),
+        };
+        assert!(failure_text(&e).contains("already using this folder"));
     }
 }

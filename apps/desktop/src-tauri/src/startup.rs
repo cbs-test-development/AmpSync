@@ -8,7 +8,7 @@ use ampsync_core::Error;
 use tauri::{AppHandle, Manager, Url};
 
 use crate::AppState;
-use crate::signin::{Validity, validate};
+use crate::signin::{Validity, site_url_of, validate};
 
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
@@ -27,21 +27,28 @@ pub async fn check_all(app: &AppHandle, allow_window: bool) {
             continue;
         };
         state.set_status(app, &host, "checking");
-        match validate(&session).await {
+        // Probe the site of a queued link where one is known; the tenant root only as a last
+        // resort (guests and restricted users are refused there even with a good session).
+        let Some(url) = state
+            .queue
+            .site_hint(&host)
+            .or_else(|| Url::parse(&format!("https://{host}/")).ok())
+        else {
+            continue;
+        };
+        match validate(&session, &site_url_of(&url)).await {
             Validity::Valid => {
                 state.set_status(app, &host, "active");
                 continue;
             }
             Validity::Unknown => {
-                // Offline or a server hiccup: do not nag; the job will find out itself.
+                // Offline, a server hiccup or a site that refuses the probe: keep the session and
+                // do not nag; a job will find out itself if it really is gone.
                 state.set_status(app, &host, "unknown");
                 continue;
             }
             Validity::Invalid => {}
         }
-        let Ok(url) = Url::parse(&format!("https://{host}/")) else {
-            continue;
-        };
         let interactive = allow_window && pending.contains(&host);
         match state.signin.obtain(app, &host, &url, true, interactive).await {
             Ok(_) => {}

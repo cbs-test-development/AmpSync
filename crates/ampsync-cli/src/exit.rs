@@ -92,6 +92,10 @@ pub fn describe(e: &Error, link: &str) -> String {
         }
         Error::Io { path, source } => format!("Can't use {}: {source}", path.display()),
         Error::State(why) => why.clone(),
+        Error::DestinationBusy { path } => format!(
+            "Another AmpSync download is already using this folder ({}). Wait for it to finish, or choose a different folder.",
+            path.display()
+        ),
         Error::Cancelled => "Cancelled. Run the same command again to resume.".to_string(),
     }
 }
@@ -128,6 +132,12 @@ mod tests {
         assert_eq!(for_error(&Error::Network("x".into())), 1);
         assert_eq!(for_error(&Error::NotFound("x".into())), 1);
         assert_eq!(for_error(&Error::State("x".into())), 1);
+        assert_eq!(
+            for_error(&Error::DestinationBusy {
+                path: PathBuf::from("x")
+            }),
+            1
+        );
     }
 
     #[test]
@@ -165,6 +175,9 @@ mod tests {
                 source: std::io::Error::other("denied"),
             },
             Error::State("bad".into()),
+            Error::DestinationBusy {
+                path: PathBuf::from("dest"),
+            },
             Error::Cancelled,
         ];
         for e in &all {
@@ -174,6 +187,8 @@ mod tests {
         let m = describe(&all[0], "https://l");
         assert!(m.contains("Sign-in expired for contoso.sharepoint.com"));
         assert!(m.contains("same command again to resume"));
+        let busy = describe(&all[10], "x");
+        assert!(busy.contains("already using this folder"), "{busy}");
         assert!(describe(&all[5], "x").starts_with("This link isn't a SharePoint folder link"));
     }
 }

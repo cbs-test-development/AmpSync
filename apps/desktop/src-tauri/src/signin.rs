@@ -22,15 +22,52 @@ const REFRESH_LABEL: &str = "signin-refresh";
 const POLL: Duration = Duration::from_millis(750);
 const SILENT_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub const USER_AGENT: &str = concat!("NONISV|AmpSync|AmpSync/", env!("CARGO_PKG_VERSION"));
-
 /// Result of a cheap authenticated request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Validity {
     Valid,
+    /// SharePoint definitely rejects the session (401, or a redirect to the login page).
     Invalid,
-    /// The check itself failed (offline, server error): do not treat the session as expired.
+    /// SharePoint gave no clear answer (offline, 403 on a restricted site, server error): do not
+    /// treat the session as expired.
     Unknown,
+}
+
+/// The web (site) a URL belongs to: `/sites/X`, `/teams/X` or `/personal/X` for site and folder
+/// URLs, the same for sharing links (`/:f:/s/X/...`, `/:f:/t/X/...`, `/:f:/g/personal/X/...`,
+/// `/:f:/r/sites/X/...`), and the tenant root for anything else.
+///
+/// The session probe goes here rather than to the tenant root: guests and users without access
+/// to the root site are refused there even though their session is perfectly good.
+pub fn site_url_of(url: &Url) -> Url {
+    let segs: Vec<&str> = url
+        .path_segments()
+        .map(|s| s.filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    let is_web = |k: &str| {
+        ["sites", "teams", "personal"]
+            .iter()
+            .any(|w| w.eq_ignore_ascii_case(k))
+    };
+    let path = match segs.as_slice() {
+        [tok, "s", name, ..] if is_sharing_token(tok) => Some(format!("/sites/{name}")),
+        [tok, "t", name, ..] if is_sharing_token(tok) => Some(format!("/teams/{name}")),
+        [tok, "g" | "r", kind, name, ..] if is_sharing_token(tok) && is_web(kind) => {
+            Some(format!("/{kind}/{name}"))
+        }
+        [kind, name, ..] if is_web(kind) => Some(format!("/{kind}/{name}")),
+        _ => None,
+    };
+    let mut out = url.clone();
+    out.set_query(None);
+    out.set_fragment(None);
+    out.set_path(path.as_deref().unwrap_or("/"));
+    out
+}
+
+fn is_sharing_token(seg: &str) -> bool {
+    let b = seg.as_bytes();
+    b.len() == 3 && b[0] == b':' && b[2] == b':' && b[1].is_ascii_alphabetic()
 }
 
 /// A WebView2 environment handle. COM reference counting is thread-safe and the handle is only
@@ -105,9 +142,10 @@ impl SignInCoordinator {
     ) -> Result<Session, Error> {
         let began = OffsetDateTime::now_utc();
         let state = app.state::<crate::AppState>();
+        let site = site_url_of(start_url);
         if !force
             && let Some(s) = state.store.load(host)?
-            && validate(&s).await != Validity::Invalid
+            && validate(&s, &site).await != Validity::Invalid
         {
             return Ok(s);
         }
@@ -115,19 +153,18 @@ impl SignInCoordinator {
         // Someone else may have signed in while we waited for the gate.
         if let Some(s) = state.store.load(host)?
             && s.captured_at >= began
-            && validate(&s).await != Validity::Invalid
+            && validate(&s, &site).await != Validity::Invalid
         {
             return Ok(s);
         }
         let settings = state.settings();
-        let previous = state.store.load(host)?;
         state.set_status(app, host, "checking");
-        if let Ok(s) = self
-            .run_window(app, host, start_url, &settings, previous.as_ref(), false)
+        if let Ok((s, verdict)) = self
+            .run_window(app, host, start_url, &site, &settings, false)
             .await
         {
             state.store.save(&s)?;
-            state.set_status(app, host, "active");
+            state.set_status(app, host, status_name(verdict));
             return Ok(s);
         }
         if !interactive {
@@ -140,7 +177,7 @@ impl SignInCoordinator {
             serde_json::json!({ "host": host, "state": "window_open" }),
         );
         let res = self
-            .run_window(app, host, start_url, &settings, previous.as_ref(), true)
+            .run_window(app, host, start_url, &site, &settings, true)
             .await;
         self.interactive_open.store(false, Ordering::SeqCst);
         let _ = app.emit(
@@ -148,9 +185,9 @@ impl SignInCoordinator {
             serde_json::json!({ "host": host, "state": "closed" }),
         );
         match res {
-            Ok(s) => {
+            Ok((s, verdict)) => {
                 state.store.save(&s)?;
-                state.set_status(app, host, "active");
+                state.set_status(app, host, status_name(verdict));
                 Ok(s)
             }
             Err(e) => {
@@ -160,16 +197,18 @@ impl SignInCoordinator {
         }
     }
 
-    /// Open a webview on `start_url`, poll its cookie store, return the session once it works.
+    /// Open a webview on `start_url`, poll its cookie store, return the session once SharePoint
+    /// does not reject it. Only a definite rejection keeps the window waiting; an unclear answer
+    /// (`Unknown`) accepts the session, because a persistent profile may never produce another.
     async fn run_window(
         &self,
         app: &AppHandle,
         host: &str,
         start_url: &Url,
+        site: &Url,
         settings: &Settings,
-        previous: Option<&Session>,
         visible: bool,
-    ) -> Result<Session, Error> {
+    ) -> Result<(Session, Validity), Error> {
         let label = if visible { SIGNIN_LABEL } else { REFRESH_LABEL };
         if let Some(old) = app.get_webview_window(label) {
             let _ = old.destroy();
@@ -237,14 +276,12 @@ impl SignInCoordinator {
                 method: SignInMethod::Webview,
                 captured_at: OffsetDateTime::now_utc(),
             };
-            // A cookie left over from an earlier, expired sign-in must not end the wait.
-            let same_as_before = previous
-                .map(|p| p.cookies.iter().any(|c| c.name == "FedAuth" && c.value == key.0))
-                .unwrap_or(false);
-            let verdict = validate(&session).await;
+            // A cookie left over from an earlier, expired sign-in is rejected by the probe and
+            // does not end the wait; the same cookie is not probed again until it changes.
+            let verdict = validate(&session, site).await;
             last_checked = Some(key);
-            if verdict == Validity::Valid || (verdict == Validity::Unknown && !same_as_before) {
-                break Ok(session);
+            if verdict != Validity::Invalid {
+                break Ok((session, verdict));
             }
         };
         let _ = window.destroy();
@@ -347,46 +384,27 @@ fn convert(c: &tauri::webview::cookie::Cookie<'_>, host: &str) -> SessionCookie 
     }
 }
 
-/// One cheap authenticated request: `POST /_api/contextinfo` answers 200 to any signed-in user.
-pub async fn validate(session: &Session) -> Validity {
+/// The status string the frontend shows for a probe result that was accepted.
+fn status_name(v: Validity) -> &'static str {
+    match v {
+        Validity::Valid => "active",
+        _ => "unknown",
+    }
+}
+
+/// Probe `session` against `site` (core's `check_session`): only a definite rejection is
+/// `Invalid`.
+pub async fn validate(session: &Session, site: &Url) -> Validity {
     let now = OffsetDateTime::now_utc();
     if let Some(fed) = session.cookies.iter().find(|c| c.name == "FedAuth")
         && fed.expires.is_some_and(|e| e <= now)
     {
         return Validity::Invalid;
     }
-    let header = session.cookie_header(now);
-    if header.is_empty() {
-        return Validity::Invalid;
-    }
-    let Ok(client) = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(15))
-        .build()
-    else {
-        return Validity::Unknown;
-    };
-    let url = format!("https://{}/_api/contextinfo", session.host);
-    let resp = client
-        .post(url)
-        .header("Cookie", header)
-        .header("Accept", "application/json;odata=nometadata")
-        .header("Content-Length", "0")
-        .send()
-        .await;
-    match resp {
-        Ok(r) => {
-            let s = r.status();
-            if s.is_success() {
-                Validity::Valid
-            } else if s.as_u16() == 401 || s.as_u16() == 403 || s.is_redirection() {
-                Validity::Invalid
-            } else {
-                Validity::Unknown
-            }
-        }
-        Err(_) => Validity::Unknown,
+    match ampsync_core::check_session(session, site).await {
+        ampsync_core::SessionStatus::Valid => Validity::Valid,
+        ampsync_core::SessionStatus::Expired => Validity::Invalid,
+        ampsync_core::SessionStatus::Unknown => Validity::Unknown,
     }
 }
 
@@ -453,3 +471,62 @@ fn apply_password_setting(window: &WebviewWindow, save: bool) {
 
 #[cfg(not(windows))]
 fn apply_password_setting(_window: &WebviewWindow, _save: bool) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn site(u: &str) -> String {
+        site_url_of(&Url::parse(u).unwrap()).to_string()
+    }
+
+    #[test]
+    fn site_of_folder_and_site_urls() {
+        assert_eq!(
+            site("https://contoso.sharepoint.com/sites/Team"),
+            "https://contoso.sharepoint.com/sites/Team"
+        );
+        assert_eq!(
+            site("https://contoso-my.sharepoint.com/personal/jo_contoso_com/Documents/x?id=1"),
+            "https://contoso-my.sharepoint.com/personal/jo_contoso_com"
+        );
+    }
+
+    #[test]
+    fn site_of_sharing_links() {
+        assert_eq!(
+            site("https://contoso.sharepoint.com/:f:/s/Team/Eabc?e=x"),
+            "https://contoso.sharepoint.com/sites/Team"
+        );
+        assert_eq!(
+            site("https://contoso.sharepoint.com/:f:/t/Crew/Eabc"),
+            "https://contoso.sharepoint.com/teams/Crew"
+        );
+        assert_eq!(
+            site("https://contoso-my.sharepoint.com/:f:/g/personal/jo_contoso_com/Eabc"),
+            "https://contoso-my.sharepoint.com/personal/jo_contoso_com"
+        );
+        assert_eq!(
+            site("https://contoso.sharepoint.com/:f:/r/sites/Team/Shared%20Documents/x"),
+            "https://contoso.sharepoint.com/sites/Team"
+        );
+    }
+
+    #[test]
+    fn site_falls_back_to_the_root() {
+        assert_eq!(
+            site("https://contoso.sharepoint.com/"),
+            "https://contoso.sharepoint.com/"
+        );
+        assert_eq!(
+            site("https://contoso.sharepoint.com/:f:/x"),
+            "https://contoso.sharepoint.com/"
+        );
+    }
+
+    #[test]
+    fn accepted_probe_results_map_to_status_names() {
+        assert_eq!(status_name(Validity::Valid), "active");
+        assert_eq!(status_name(Validity::Unknown), "unknown");
+    }
+}

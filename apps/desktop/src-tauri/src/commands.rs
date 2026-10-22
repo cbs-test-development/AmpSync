@@ -1,6 +1,6 @@
 //! Tauri commands. Argument names are snake_case on the JavaScript side too.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ pub struct Resolved {
     pub site_url: String,
 }
 
-fn start_url(parsed: &ParsedLink) -> Url {
+pub(crate) fn start_url(parsed: &ParsedLink) -> Url {
     match &parsed.kind {
         link::LinkKind::Sharing { url } => url.clone(),
         link::LinkKind::Folder { site_url, .. } => site_url.clone(),
@@ -87,26 +87,114 @@ pub async fn resolve(app: AppHandle, link: String) -> CmdResult<Resolved> {
     })
 }
 
-#[derive(Serialize)]
-pub struct TreeNode {
-    pub path: String,
-    pub name: String,
-    pub depth: usize,
-    pub kind: &'static str,
-    pub files: u64,
-    pub bytes: u64,
-}
-
-#[derive(Serialize)]
+/// The listed folder as flat, parallel arrays in display order (folders before files, each group
+/// sorted case-insensitively). Parents always come before their children and every subtree is a
+/// contiguous range, so the frontend can build rollups and toggle whole folders with plain loops.
+/// Roots (the folder's direct contents) have parent -1.
+#[derive(Serialize, Debug, Default, PartialEq, Eq)]
 pub struct PlanTree {
     pub total_files: u64,
     pub total_bytes: u64,
     pub listed_ms: u64,
-    pub nodes: Vec<TreeNode>,
+    pub names: Vec<String>,
+    pub parents: Vec<i32>,
+    /// 1 for a folder, 0 for a file.
+    pub dirs: Vec<u8>,
+    /// File sizes in bytes; 0 for folders.
+    pub sizes: Vec<u64>,
 }
 
-/// Deepest folder level shown in the picker (0-based). Deeper folders count towards their parent.
-const MAX_TREE_DEPTH: usize = 5;
+struct BNode {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    children: Vec<usize>,
+}
+
+/// Collects listed entries into a tree, then flattens it (see [`PlanTree`]).
+#[derive(Default)]
+struct TreeBuilder {
+    nodes: Vec<BNode>,
+    roots: Vec<usize>,
+    dirs: HashMap<(Option<usize>, String), usize>,
+}
+
+impl TreeBuilder {
+    fn push(&mut self, parent: Option<usize>, name: &str, is_dir: bool, size: u64) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(BNode {
+            name: name.to_string(),
+            is_dir,
+            size,
+            children: Vec::new(),
+        });
+        match parent {
+            Some(p) => self.nodes[p].children.push(idx),
+            None => self.roots.push(idx),
+        }
+        idx
+    }
+
+    /// Make sure the folder chain `comps` exists; returns the last folder (None for no components).
+    fn ensure_dirs(&mut self, comps: &[&str]) -> Option<usize> {
+        let mut parent = None;
+        for c in comps {
+            let key = (parent, c.to_lowercase());
+            let idx = match self.dirs.get(&key) {
+                Some(i) => *i,
+                None => {
+                    let i = self.push(parent, c, true, 0);
+                    self.dirs.insert(key, i);
+                    i
+                }
+            };
+            parent = Some(idx);
+        }
+        parent
+    }
+
+    fn add_dir(&mut self, comps: &[&str]) {
+        self.ensure_dirs(comps);
+    }
+
+    fn add_file(&mut self, comps: &[&str], size: u64) {
+        let Some((name, dirs)) = comps.split_last() else {
+            return;
+        };
+        let parent = self.ensure_dirs(dirs);
+        self.push(parent, name, false, size);
+    }
+
+    fn finish(mut self, listed_ms: u64) -> PlanTree {
+        let mut out = PlanTree {
+            listed_ms,
+            ..PlanTree::default()
+        };
+        let order = |nodes: &[BNode], list: &mut Vec<usize>| {
+            list.sort_by_cached_key(|&i| (!nodes[i].is_dir, nodes[i].name.to_lowercase()));
+        };
+        let mut roots = std::mem::take(&mut self.roots);
+        order(&self.nodes, &mut roots);
+        // Depth-first, children in order: a stack of (node, new index of its parent).
+        let mut stack: Vec<(usize, i32)> = roots.into_iter().rev().map(|r| (r, -1)).collect();
+        while let Some((i, parent_new)) = stack.pop() {
+            let new_idx = i32::try_from(out.names.len()).unwrap_or(i32::MAX);
+            let mut kids = std::mem::take(&mut self.nodes[i].children);
+            order(&self.nodes, &mut kids);
+            let n = &mut self.nodes[i];
+            out.names.push(std::mem::take(&mut n.name));
+            out.parents.push(parent_new);
+            out.dirs.push(u8::from(n.is_dir));
+            out.sizes.push(n.size);
+            if !n.is_dir {
+                out.total_files += 1;
+                out.total_bytes += n.size;
+            }
+            stack.extend(kids.into_iter().rev().map(|k| (k, new_idx)));
+        }
+        out
+    }
+}
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn plan(app: AppHandle, link: String) -> CmdResult<PlanTree> {
@@ -127,33 +215,21 @@ pub async fn plan(app: AppHandle, link: String) -> CmdResult<PlanTree> {
 
 async fn list_tree(app: &AppHandle, remote: &ClassicRemote, root: &RemoteRoot) -> Result<PlanTree, Error> {
     let began = Instant::now();
-    let mut folders: BTreeMap<Vec<String>, (u64, u64)> = BTreeMap::new();
-    let mut root_files: Vec<(String, u64)> = Vec::new();
+    let mut builder = TreeBuilder::default();
     let (mut total_files, mut total_bytes) = (0u64, 0u64);
     let mut last_emit = Instant::now();
     let mut stream = remote.walk(root);
     while let Some(entry) = stream.next().await {
         match entry? {
             RemoteEntry::File(f) => {
-                let comps: Vec<String> = f.rel_path.components().map(str::to_string).collect();
+                let comps: Vec<&str> = f.rel_path.components().collect();
                 total_files += 1;
                 total_bytes += f.size;
-                if comps.len() == 1 {
-                    root_files.push((comps[0].clone(), f.size));
-                } else {
-                    let dirs = comps.len() - 1;
-                    for i in 0..dirs.min(MAX_TREE_DEPTH) {
-                        let e = folders.entry(comps[..=i].to_vec()).or_default();
-                        e.0 += 1;
-                        e.1 += f.size;
-                    }
-                }
+                builder.add_file(&comps, f.size);
             }
             RemoteEntry::Folder { rel_path } => {
-                let comps: Vec<String> = rel_path.components().map(str::to_string).collect();
-                for i in 0..comps.len().min(MAX_TREE_DEPTH) {
-                    folders.entry(comps[..=i].to_vec()).or_default();
-                }
+                let comps: Vec<&str> = rel_path.components().collect();
+                builder.add_dir(&comps);
             }
         }
         if last_emit.elapsed() > Duration::from_millis(400) {
@@ -165,35 +241,7 @@ async fn list_tree(app: &AppHandle, remote: &ClassicRemote, root: &RemoteRoot) -
         }
     }
     drop(stream);
-    let mut nodes: Vec<TreeNode> = folders
-        .iter()
-        .map(|(comps, (files, bytes))| TreeNode {
-            path: comps.join("/"),
-            name: comps.last().cloned().unwrap_or_default(),
-            depth: comps.len() - 1,
-            kind: "folder",
-            files: *files,
-            bytes: *bytes,
-        })
-        .collect();
-    // BTreeMap order is byte order of the component lists; re-sort case-insensitively.
-    let key = |p: &str| p.split('/').map(str::to_lowercase).collect::<Vec<_>>();
-    nodes.sort_by_key(|n| key(&n.path));
-    root_files.sort_by_key(|(n, _)| n.to_lowercase());
-    nodes.extend(root_files.into_iter().map(|(name, size)| TreeNode {
-        path: name.clone(),
-        name,
-        depth: 0,
-        kind: "file",
-        files: 1,
-        bytes: size,
-    }));
-    Ok(PlanTree {
-        total_files,
-        total_bytes,
-        listed_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
-        nodes,
-    })
+    Ok(builder.finish(u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX)))
 }
 
 // ---------------------------------------------------------------- queue

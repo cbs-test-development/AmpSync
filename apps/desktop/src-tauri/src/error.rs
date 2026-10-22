@@ -33,14 +33,15 @@ impl From<Error> for CmdError {
             Error::NotFound(_) => "not_found",
             Error::InvalidLink(_) => "invalid_link",
             Error::Network(_) => "network",
+            Error::DestinationBusy { .. } => "destination_busy",
             Error::Cancelled => "cancelled",
             _ => "error",
         };
-        CmdError {
-            kind,
-            message: e.to_string(),
-            host,
-        }
+        let message = match &e {
+            Error::DestinationBusy { .. } => "Another AmpSync download is already using this folder. Wait for it to finish, or save to a different folder.".to_string(),
+            other => other.to_string(),
+        };
+        CmdError { kind, message, host }
     }
 }
 

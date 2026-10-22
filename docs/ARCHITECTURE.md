@@ -230,6 +230,16 @@ Engine rules:
 
 The code in `crates/ampsync-core` is now the source of truth for exact types. Additions beyond this doc: `ClassicRemote::new(&Session)`, `MemoryStore::new()`, one flat `settings::Settings` (engine + app fields, re-exported as `engine::Settings`), `PlannedFile`, `Totals`, `Summary`, `FileFailure`, `state::{FileRecord, FileStatus}`. `Event` serializes with a snake_case `type` tag and durations as `*_ms`. `link::parse` rejects site-only URLs with no library.
 
+### After the first review (as built)
+
+- `download.aspx` answers 206 with `Content-Type: text/html` on real tenants. Download responses never infer auth expiry from content type; only 401/403 or a login redirect do.
+- `auth::check_session(&Session, &site_url) -> SessionStatus { Valid, Expired, Unknown }` and `Remote::probe()`. Only `Expired` rejects a session; `Unknown` (e.g. 403 on a restricted site) keeps it. Probes go to the link's own site, not the tenant root.
+- On `AuthExpired` for one file the engine probes the session: still `Valid` ⇒ that file fails with 403 and the job continues; otherwise the job pauses.
+- Listing, resolve and stat go through `remote::RetryPolicy` (honours `Retry-After`, bounded backoff).
+- `<dest>/.ampsync/lock` is held (`File::try_lock`) from plan until the job ends; a second process gets `Error::DestinationBusy`. Before rename, recorded ranges must cover the whole file.
+- Plan-time skips are reported only as counts on `Event::Planned { skipped, skipped_bytes }`.
+- The Edge/Chrome fallback talks CDP over `--remote-debugging-pipe` / `--remote-debugging-io-pipes`; no TCP port is opened.
+
 ## `ampsync-cli`
 
 ```

@@ -19,6 +19,8 @@ use crate::{paths, signin_webview};
 pub struct Request<'a> {
     pub host: &'a str,
     pub start_url: &'a Url,
+    /// Site that holds the link; a fresh session is probed here.
+    pub check_url: &'a Url,
     pub method: Option<Method>,
     pub cookie_file: Option<&'a Path>,
     pub settings: &'a Settings,
@@ -56,12 +58,15 @@ fn stdin_is_terminal() -> bool {
 
 /// Sign in with the embedded window. `hidden` starts it invisible so an already-valid profile
 /// refreshes silently; the window appears if interaction turns out to be needed. `known_bad` is
-/// the rejected session being replaced, so its stale cookies are not handed straight back.
+/// a session that `check_session` definitely reported as expired (never merely "unknown"), so its
+/// stale cookies are not handed straight back. Each candidate is probed against `check_url`;
+/// only a definite `Expired` rejects it.
 ///
 /// Blocks the calling thread for as long as the window is open.
 pub fn webview(
     host: &str,
     start_url: &Url,
+    check_url: &Url,
     settings: &Settings,
     hidden: bool,
     known_bad: Option<&Session>,
@@ -84,11 +89,13 @@ pub fn webview(
     };
     // The window runs on this thread; the check runs on a runtime worker.
     let rt = tokio::runtime::Handle::current();
+    let check_url = check_url.clone();
     let mut validate = |candidate: &Session| {
         let s = candidate.clone();
+        let site = check_url.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         rt.spawn(async move {
-            let _ = tx.send(check(&s).await);
+            let _ = tx.send(check(&s, &site).await);
         });
         // Only a definite "expired" rejects; an unreachable server must not trap the user here.
         !matches!(rx.recv(), Ok(SessionStatus::Expired))
@@ -146,7 +153,7 @@ pub async fn obtain(req: &Request<'_>) -> Result<Session, Failure> {
         let attempt = match method {
             Method::Webview => {
                 eprintln!("Opening the sign-in window for {}...", req.host);
-                webview(req.host, req.start_url, req.settings, false, None)
+                webview(req.host, req.start_url, req.check_url, req.settings, false, None)
             }
             Method::Edge => {
                 eprintln!("Opening Microsoft Edge with a temporary profile...");

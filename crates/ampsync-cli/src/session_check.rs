@@ -1,101 +1,113 @@
-//! Is a stored session still accepted by SharePoint? One cheap authenticated GET.
-
-use std::time::Duration;
+//! Is a stored session still accepted by SharePoint? The probe itself lives in core
+//! (`check_session`); this module decides *where* to probe and how to word the answer.
+//!
+//! The probe goes to the site that holds the pasted link, never the tenant root: guests and
+//! users without access to the root site get a 403 there even though their session is fine, and
+//! core only reports `Expired` for a definite 401 or a redirect to the login page.
 
 use ampsync_core::auth::Session;
-use ampsync_core::remote::http_client;
+use ampsync_core::link::{LinkKind, ParsedLink};
+use url::Url;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionStatus {
-    Valid,
-    Expired,
-    /// Could not tell (offline, throttled, unexpected answer).
-    Unknown(String),
-}
+pub use ampsync_core::SessionStatus;
 
-impl SessionStatus {
-    pub fn label(&self) -> &'static str {
-        match self {
-            SessionStatus::Valid => "valid",
-            SessionStatus::Expired => "expired",
-            SessionStatus::Unknown(_) => "unknown",
-        }
-    }
-}
-
-/// Interpret the answer to the probe request. `location` is the `Location` header, if any.
-pub fn classify(status: u16, location: Option<&str>, tenant: &str) -> SessionStatus {
+pub fn label(status: &SessionStatus) -> &'static str {
     match status {
-        200..=299 => SessionStatus::Valid,
-        401 | 403 => SessionStatus::Expired,
-        300..=399 => {
-            let host = location
-                .and_then(|l| url::Url::parse(l).ok())
-                .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
-            match host {
-                // A relative or same-tenant redirect is SharePoint routing us around, not a login.
-                None => SessionStatus::Valid,
-                Some(h) if h == tenant.to_ascii_lowercase() => SessionStatus::Valid,
-                Some(_) => SessionStatus::Expired,
-            }
-        }
-        other => SessionStatus::Unknown(format!("HTTP {other}")),
+        SessionStatus::Valid => "valid",
+        SessionStatus::Expired => "expired",
+        SessionStatus::Unknown => "unknown",
     }
 }
 
-/// Ask the tenant for the root web's title with the session's cookies.
-pub async fn check(session: &Session) -> SessionStatus {
-    let client = http_client(session);
-    let url = format!("https://{}/_api/web/title", session.host);
-    let request = client
-        .get(url)
-        .header("Accept", "application/json;odata=nometadata")
-        .send();
-    match tokio::time::timeout(Duration::from_secs(15), request).await {
-        Err(_) => SessionStatus::Unknown("timed out".into()),
-        Ok(Err(e)) => SessionStatus::Unknown(e.to_string()),
-        Ok(Ok(resp)) => {
-            let location = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            classify(resp.status().as_u16(), location.as_deref(), &session.host)
+/// `https://host/`: the last resort when no link is known.
+pub fn host_root(host: &str) -> Url {
+    Url::parse(&format!("https://{host}/")).expect("host came from a parsed link or the keychain")
+}
+
+/// The web (site) that a pasted link belongs to. Folder links carry it; sharing links name it in
+/// their path (`/:f:/s/Team/...`, `/:f:/t/...`, `/:f:/g/personal/...`, `/:f:/r/sites/Team/...`).
+/// Anything unrecognised falls back to the tenant root.
+pub fn site_url_for(link: &ParsedLink) -> Url {
+    match &link.kind {
+        LinkKind::Folder { site_url, .. } => site_url.clone(),
+        LinkKind::Sharing { url } => {
+            let segs: Vec<&str> = url
+                .path_segments()
+                .map(|s| s.filter(|x| !x.is_empty()).collect())
+                .unwrap_or_default();
+            // segs[0] is the `:f:` token.
+            let path = match segs.as_slice() {
+                [_, "s", name, ..] => Some(format!("/sites/{name}")),
+                [_, "t", name, ..] => Some(format!("/teams/{name}")),
+                [_, "g" | "r", kind, name, ..]
+                    if ["sites", "teams", "personal"]
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(kind)) =>
+                {
+                    Some(format!("/{kind}/{name}"))
+                }
+                _ => None,
+            };
+            path.and_then(|p| Url::parse(&format!("https://{}{p}", link.host)).ok())
+                .unwrap_or_else(|| host_root(&link.host))
         }
     }
+}
+
+/// Probe `session` against `site`.
+pub async fn check(session: &Session, site: &Url) -> SessionStatus {
+    ampsync_core::check_session(session, site).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ampsync_core::link;
 
-    const T: &str = "contoso.sharepoint.com";
-
-    #[test]
-    fn statuses() {
-        assert_eq!(classify(200, None, T), SessionStatus::Valid);
-        assert_eq!(classify(401, None, T), SessionStatus::Expired);
-        assert_eq!(classify(403, None, T), SessionStatus::Expired);
-        assert!(matches!(classify(503, None, T), SessionStatus::Unknown(_)));
-        assert!(matches!(classify(404, None, T), SessionStatus::Unknown(_)));
+    fn site(input: &str) -> String {
+        site_url_for(&link::parse(input).unwrap()).to_string()
     }
 
     #[test]
-    fn redirects() {
-        let login = "https://login.microsoftonline.com/common/oauth2/authorize?x=1";
-        assert_eq!(classify(302, Some(login), T), SessionStatus::Expired);
+    fn folder_links_use_their_site() {
         assert_eq!(
-            classify(302, Some("https://contoso.sharepoint.com/_layouts/15/x"), T),
-            SessionStatus::Valid
+            site("https://contoso.sharepoint.com/sites/Team/Shared%20Documents/Projects"),
+            "https://contoso.sharepoint.com/sites/Team"
         );
-        assert_eq!(classify(301, Some("/relative"), T), SessionStatus::Valid);
-        assert_eq!(classify(302, None, T), SessionStatus::Valid);
+    }
+
+    #[test]
+    fn sharing_links_name_their_site() {
+        assert_eq!(
+            site("https://contoso.sharepoint.com/:f:/s/Team/EabcDEF123?e=x"),
+            "https://contoso.sharepoint.com/sites/Team"
+        );
+        assert_eq!(
+            site("https://contoso.sharepoint.com/:f:/t/Crew/Eabc"),
+            "https://contoso.sharepoint.com/teams/Crew"
+        );
+        assert_eq!(
+            site("https://contoso-my.sharepoint.com/:f:/g/personal/jo_contoso_com/Eabc"),
+            "https://contoso-my.sharepoint.com/personal/jo_contoso_com"
+        );
+        assert_eq!(
+            site("https://contoso.sharepoint.com/:f:/r/sites/Team/Shared%20Documents/x?csf=1"),
+            "https://contoso.sharepoint.com/sites/Team"
+        );
+    }
+
+    #[test]
+    fn unrecognised_sharing_links_fall_back_to_the_root() {
+        assert_eq!(
+            site("https://contoso.sharepoint.com/:f:/x"),
+            "https://contoso.sharepoint.com/"
+        );
     }
 
     #[test]
     fn labels() {
-        assert_eq!(SessionStatus::Valid.label(), "valid");
-        assert_eq!(SessionStatus::Expired.label(), "expired");
-        assert_eq!(SessionStatus::Unknown("x".into()).label(), "unknown");
+        assert_eq!(label(&SessionStatus::Valid), "valid");
+        assert_eq!(label(&SessionStatus::Expired), "expired");
+        assert_eq!(label(&SessionStatus::Unknown), "unknown");
     }
 }

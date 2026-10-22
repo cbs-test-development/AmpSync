@@ -63,7 +63,6 @@ export type EngineEvent =
   | { type: "progress"; bytes_done: number; bytes_total: number; rate_bps: number }
   | { type: "lane_progress"; lane: number; rel_path: string; offset: number; size: number }
   | { type: "file_verified"; rel_path: string; by: "hash" | "size_and_etag" }
-  | { type: "file_skipped"; rel_path: string }
   | { type: "file_failed"; rel_path: string; error: string; will_retry: boolean }
   | { type: "throttled"; retry_after_ms: number }
   | { type: "auth_expired"; host: string }
@@ -95,20 +94,21 @@ export interface Resolved {
   site_url: string;
 }
 
-export interface TreeNode {
-  path: string;
-  name: string;
-  depth: number;
-  kind: "folder" | "file";
-  files: number;
-  bytes: number;
-}
-
+/**
+ * The listing as flat, parallel arrays in display order (folders first, then files, each sorted
+ * case-insensitively). A parent always precedes its children and a folder's subtree is the
+ * contiguous range after it. Top-level entries have parent -1.
+ */
 export interface PlanTree {
   total_files: number;
   total_bytes: number;
   listed_ms: number;
-  nodes: TreeNode[];
+  names: string[];
+  parents: number[];
+  /** 1 for a folder, 0 for a file. */
+  dirs: number[];
+  /** File sizes in bytes; 0 for folders. */
+  sizes: number[];
 }
 
 export interface SessionInfo {

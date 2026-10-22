@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::cli::{LoginArgs, LogoutArgs, LsArgs, Method};
 use crate::exit::{self, Failure};
-use crate::session_check::{SessionStatus, check};
+use crate::session_check::{self, SessionStatus, check, host_root, site_url_for};
 use crate::signin::{self, Request};
 use crate::{paths, tree};
 
@@ -98,15 +98,17 @@ pub async fn login(args: LoginArgs) -> u8 {
             .method
             .or_else(|| args.cookie_file.is_some().then_some(Method::Paste));
         let start = start_url(&link);
+        let site = site_url_for(&link);
         let session = signin::obtain(&Request {
             host: &link.host,
             start_url: &start,
+            check_url: &site,
             method,
             cookie_file: args.cookie_file.as_deref(),
             settings: &settings,
         })
         .await?;
-        match check(&session).await {
+        match check(&session, &site).await {
             SessionStatus::Valid => {}
             SessionStatus::Expired => {
                 return Err(Failure::error(format!(
@@ -114,8 +116,10 @@ pub async fn login(args: LoginArgs) -> u8 {
                     link.host
                 )));
             }
-            SessionStatus::Unknown(why) => {
-                eprintln!("warning: couldn't confirm the sign-in works ({why}); saving it anyway.");
+            SessionStatus::Unknown => {
+                eprintln!(
+                    "note: couldn't confirm the sign-in works (SharePoint gave no clear answer); saving it anyway."
+                );
             }
         }
         KeyringStore::new()
@@ -209,7 +213,11 @@ pub async fn sessions() -> u8 {
                 ),
             }
         }
-        let statuses = futures::future::join_all(loaded.iter().map(check)).await;
+        let statuses = futures::future::join_all(loaded.iter().map(|s| {
+            let root = host_root(&s.host);
+            async move { check(s, &root).await }
+        }))
+        .await;
         let rows: Vec<Row> = loaded
             .iter()
             .zip(&statuses)
@@ -218,14 +226,14 @@ pub async fn sessions() -> u8 {
                     s.host.clone(),
                     method_label(&s.method).to_string(),
                     captured_text(s),
-                    st.label().to_string(),
+                    session_check::label(st).to_string(),
                 ]
             })
             .collect();
         for l in render_table(["HOST", "METHOD", "SIGNED IN", "STATUS"], &rows) {
             println!("{l}");
         }
-        if statuses.contains(&SessionStatus::Expired) {
+        if statuses.iter().any(|s| matches!(s, SessionStatus::Expired)) {
             eprintln!("Expired sign-ins can be renewed with `ampsync login <link>`.");
         }
         Ok(exit::OK)
