@@ -147,22 +147,17 @@ pub fn capture(url: &str, host: &str, sso: bool) -> Result<AuthResult> {
 
     println!("A sign-in window has opened. Sign in (MFA etc.) until the SharePoint page is visible.");
     println!("The probe continues automatically once SharePoint cookies are present; otherwise press Enter here.");
-    {
-        let p = proxy.clone();
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            if matches!(std::io::stdin().read_line(&mut s), Ok(n) if n > 0) {
-                let _ = p.send_event(UserEvent::EnterPressed);
-            }
-        });
-    }
 
     let mut collected: Option<Vec<Captured>> = None;
     let mut on_tenant = false;
     let host_s = host.to_string();
 
     event_loop.run_return(|event, _, cf| {
-        *cf = ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(2));
+        // Short tick so a pressed Enter (polled below) is noticed quickly.
+        *cf = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(400));
+        if matches!(event, Event::NewEvents(_)) && crate::input::try_line().is_some() {
+            let _ = proxy.send_event(UserEvent::EnterPressed);
+        }
         let finish = |force: bool, collected: &mut Option<Vec<Captured>>| -> bool {
             let c = fetch_cookies(&webview, &host_s);
             if force || has_auth_cookie(&c) {
@@ -201,10 +196,19 @@ pub fn capture(url: &str, host: &str, sso: bool) -> Result<AuthResult> {
             }
             _ => {}
         }
+        if matches!(*cf, ControlFlow::Exit) {
+            window.set_visible(false);
+        }
     });
 
     drop(webview);
     drop(window);
+    // Keep pumping briefly so Windows actually destroys the window. Without this the hidden
+    // (or still visible) window stops processing messages and shows as "Not responding".
+    let until = Instant::now() + Duration::from_millis(500);
+    event_loop.run_return(|_, _, cf| {
+        *cf = if Instant::now() >= until { ControlFlow::Exit } else { ControlFlow::WaitUntil(until) };
+    });
     // WebView2 child processes may keep the temp profile locked for a moment.
     let path = data_dir.path().to_path_buf();
     let mut removed = false;

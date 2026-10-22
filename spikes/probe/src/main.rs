@@ -135,13 +135,68 @@ struct Report {
 
 const REDACTION_NOTE: &str = "No cookie values, file/folder/site names or full URLs are recorded. Names appear as <ext, size>; path segments as <seg:length>; URLs reduced to host.";
 
+/// All terminal line input goes through one reader thread that only reads when asked.
+/// A request left pending (e.g. "press Enter" while the webview finished on its own) is
+/// answered by the next line the user types, so no keystroke is lost or read twice.
+pub mod input {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Mutex, OnceLock};
+
+    struct Reader {
+        req: Sender<()>,
+        lines: Mutex<Receiver<String>>,
+        pending: AtomicBool,
+    }
+
+    fn reader() -> &'static Reader {
+        static R: OnceLock<Reader> = OnceLock::new();
+        R.get_or_init(|| {
+            let (req_tx, req_rx) = channel::<()>();
+            let (line_tx, line_rx) = channel::<String>();
+            std::thread::spawn(move || {
+                for () in req_rx {
+                    let mut s = String::new();
+                    let _ = std::io::stdin().read_line(&mut s);
+                    if line_tx.send(s).is_err() {
+                        break;
+                    }
+                }
+            });
+            Reader { req: req_tx, lines: Mutex::new(line_rx), pending: AtomicBool::new(false) }
+        })
+    }
+
+    fn request(r: &Reader) {
+        if !r.pending.swap(true, Ordering::SeqCst) {
+            let _ = r.req.send(());
+        }
+    }
+
+    /// Blocks until the user enters a line.
+    pub fn line() -> String {
+        let r = reader();
+        request(r);
+        let s = r.lines.lock().unwrap().recv().unwrap_or_default();
+        r.pending.store(false, Ordering::SeqCst);
+        s
+    }
+
+    /// Returns a line if the user has entered one since the last call; never blocks.
+    pub fn try_line() -> Option<String> {
+        let r = reader();
+        request(r);
+        let s = r.lines.lock().unwrap().try_recv().ok()?;
+        r.pending.store(false, Ordering::SeqCst);
+        Some(s)
+    }
+}
+
 fn read_line(prompt: &str) -> String {
     use std::io::Write;
     print!("{prompt}");
     let _ = std::io::stdout().flush();
-    let mut s = String::new();
-    let _ = std::io::stdin().read_line(&mut s);
-    s.trim().to_string()
+    input::line().trim().to_string()
 }
 
 /// Started with no arguments (e.g. double-clicked): ask for everything instead of exiting.

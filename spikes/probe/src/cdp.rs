@@ -166,11 +166,7 @@ pub async fn capture(b: Browser, url: &str, host: &str) -> Result<AuthResult> {
 
     println!("A fresh {} window (temporary profile) has opened. Sign in until the SharePoint page is visible,", b.label());
     println!("then come back here and press Enter.");
-    tokio::task::spawn_blocking(|| {
-        let mut s = String::new();
-        let _ = std::io::stdin().read_line(&mut s);
-    })
-    .await?;
+    tokio::task::spawn_blocking(crate::input::line).await?;
 
     let http = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(10)).build()?;
     let ver: Value = http.get(format!("http://127.0.0.1:{port}/json/version")).send().await.map_err(|e| anyhow!("cannot reach debugging port: {}", e.without_url()))?.json().await?;

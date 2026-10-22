@@ -82,11 +82,7 @@ pub fn paste(cookie_file: Option<&str>) -> Result<AuthResult> {
         println!("Input is hidden. If your terminal truncates long lines, save it to a file and use --cookie-file <path> instead.");
         match rpassword::prompt_password("Cookie header: ") {
             Ok(s) => s,
-            Err(_) => {
-                let mut l = String::new();
-                std::io::stdin().read_line(&mut l)?;
-                l
-            }
+            Err(_) => crate::input::line(),
         }
     };
     let cookies = parse_cookie_header(&raw);
