@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AmpSync probe output (never commit reports or cookie files)
+probe-report*.json
+cookie*.txt
