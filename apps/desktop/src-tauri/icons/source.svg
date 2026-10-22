@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 34 34" width="128" height="128" role="img" aria-label="AmpSync">
+  <rect x="0" y="0" width="34" height="34" rx="6" fill="#0f1216"/>
+  <rect x="1.75" y="1.75" width="30.5" height="30.5" rx="4.5" fill="none" stroke="#2a313b" stroke-width="1.5"/>
+  <path d="M8 9v9M13 9v12M18 9v9M23 9v12" stroke="#f0a43a" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M7 25h20" stroke="#d8dde5" stroke-width="2.4" stroke-linecap="round"/>
+</svg>
