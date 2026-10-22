@@ -49,7 +49,9 @@ The `webview` mode needs a desktop session (X11 or XWayland). The Linux build is
 
 ## Run
 
-Pass the folder URL (quote it). Accepted: a sharing link (`https://x.sharepoint.com/:f:/s/Site/E...`),
+**Easiest:** double-click `ampsync-probe.exe`. It asks for the folder link and sign-in method, saves `probe-<method>.json` next to the exe, and waits for Enter before closing.
+
+From a terminal, pass the folder URL (quote it). Accepted: a sharing link (`https://x.sharepoint.com/:f:/s/Site/E...`),
 the address bar URL of a folder (`...AllItems.aspx?id=%2Fsites%2F...`), or a direct
 `https://x.sharepoint.com/sites/Site/Shared Documents/Folder` URL.
 

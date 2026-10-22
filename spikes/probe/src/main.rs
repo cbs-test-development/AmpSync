@@ -135,18 +135,67 @@ struct Report {
 
 const REDACTION_NOTE: &str = "No cookie values, file/folder/site names or full URLs are recorded. Names appear as <ext, size>; path segments as <seg:length>; URLs reduced to host.";
 
-fn main() {
-    let args = match parse_args() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: {e}\n{USAGE}");
-            std::process::exit(2);
+fn read_line(prompt: &str) -> String {
+    use std::io::Write;
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+    s.trim().to_string()
+}
+
+/// Started with no arguments (e.g. double-clicked): ask for everything instead of exiting.
+fn interactive_args() -> Args {
+    println!("ampsync-probe {VERSION}\n");
+    println!("This checks which ways of downloading from your SharePoint work. It only reads;");
+    println!("it never stores your sign-in or any file contents.\n");
+    let url = loop {
+        let u = read_line("Paste a SharePoint folder link, then press Enter:\n> ");
+        let u = u.trim_matches('"').to_string();
+        match urlparse::classify_url(&u) {
+            Ok(_) => break u,
+            Err(e) => println!("That doesn't look like a SharePoint folder link ({e}). Try again.\n"),
         }
     };
-    if let Err(e) = run(args) {
-        eprintln!("error: {}", redact::scrub_text(&format!("{e:#}")));
-        std::process::exit(1);
+    println!("\nHow should it sign in?");
+    println!("  1  AmpSync window (default)");
+    println!("  2  Microsoft Edge (temporary profile)");
+    println!("  3  Google Chrome (temporary profile)");
+    println!("  4  Paste a Cookie header from browser DevTools");
+    let auth = match read_line("Choose 1-4 [1]: ").as_str() {
+        "2" => AuthMode::Edge,
+        "3" => AuthMode::Chrome,
+        "4" => AuthMode::Paste,
+        _ => AuthMode::Webview,
+    };
+    Args { url, auth, out: format!("probe-{}.json", auth.label()), no_sso: false, ascii: false, cookie_file: None }
+}
+
+fn main() {
+    let interactive = std::env::args().len() == 1;
+    let args = if interactive {
+        interactive_args()
+    } else {
+        match parse_args() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("error: {e}\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    };
+    let code = match run(args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {}", redact::scrub_text(&format!("{e:#}")));
+            1
+        }
+    };
+    if interactive {
+        // Keep the console window open so the summary can be read.
+        read_line("\nPress Enter to close.");
     }
+    std::process::exit(code);
 }
 
 fn run(args: Args) -> Result<()> {
@@ -220,7 +269,8 @@ fn run(args: Args) -> Result<()> {
     report.finished_utc = chrono::Utc::now().to_rfc3339();
     write_report(&report, &args.out)?;
     print_summary(&report, args.ascii);
-    println!("\nReport written to {} (redacted; safe to send). Cookies/file contents were never stored.", args.out);
+    let shown = std::fs::canonicalize(&args.out).map(|p| p.display().to_string()).unwrap_or(args.out.clone());
+    println!("\nReport written to {} (redacted; safe to send). Cookies/file contents were never stored.", shown.trim_start_matches(r"\\?\"));
     Ok(())
 }
 
