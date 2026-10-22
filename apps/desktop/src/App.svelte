@@ -79,7 +79,7 @@
     </header>
 
     <div class="scroll">
-      <section class="view" hidden={app.view !== "transfers"} data-view="transfers"><Transfers /></section>
+      <section class="view fill" hidden={app.view !== "transfers"} data-view="transfers"><Transfers /></section>
       <section class="view" hidden={app.view !== "new"} data-view="new"><NewDownload /></section>
       <section class="view" hidden={app.view !== "signins"} data-view="signins"><SignIns /></section>
       <section class="view" hidden={app.view !== "settings"} data-view="settings"><SettingsView /></section>
@@ -97,9 +97,10 @@
 
 <style>
   .app {
-    height: 100vh; display: grid; grid-template-columns: 64px minmax(0, 1fr); background: var(--panel);
+    height: 100%; overflow: hidden; display: grid; grid-template-columns: 64px minmax(0, 1fr); background: var(--panel);
   }
   .rail {
+    min-height: 0; overflow: hidden;
     background: var(--bg); border-right: 1px solid var(--line); display: flex; flex-direction: column;
     align-items: center; padding-block: 14px; gap: 6px;
   }
@@ -123,9 +124,9 @@
   .badge.dot-badge { min-width: 9px; height: 9px; padding: 0; top: 9px; right: 9px; }
 
   main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
-  .scroll { flex: 1; min-height: 0; overflow-y: auto; }
+  .scroll { flex: 1; min-height: 0; overflow: hidden; }
   .topbar {
-    display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    flex: none; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
     padding: 14px 22px; border-bottom: 1px solid var(--line);
   }
   .topbar h1 { margin: 0; font: 600 18px/1.2 var(--f-display); letter-spacing: .01em; text-wrap: balance; }
@@ -145,9 +146,6 @@
   .toast {
     position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 70; max-width: min(560px, calc(100vw - 32px));
     background: var(--fg); color: var(--bg); padding: 9px 16px; border-radius: 4px; font-size: 13px; font-weight: 500;
-  }
-  @media (max-width: 920px) {
-    .app { grid-template-columns: 64px minmax(0, 1fr); }
   }
   @media (max-width: 600px) {
     .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }

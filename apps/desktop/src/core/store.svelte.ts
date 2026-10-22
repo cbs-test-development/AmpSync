@@ -73,7 +73,7 @@ function emptyLive(lanes: number): LiveJob {
   };
 }
 
-const MAX_ROWS = 300;
+const MAX_ROWS = 500;
 
 class Store {
   view = $state<ViewId>("transfers");

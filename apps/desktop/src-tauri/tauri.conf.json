@@ -17,8 +17,8 @@
         "title": "AmpSync",
         "width": 1200,
         "height": 800,
-        "minWidth": 720,
-        "minHeight": 560,
+        "minWidth": 900,
+        "minHeight": 600,
         "center": true
       }
     ],

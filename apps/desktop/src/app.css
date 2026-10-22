@@ -49,7 +49,7 @@
 }
 
 * { box-sizing: border-box; }
-html, body, #app { height: 100%; }
+html, body, #app { height: 100%; overflow: hidden; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 var(--f-body); overflow: hidden; }
 button, input, select, textarea { font: inherit; color: inherit; }
 :focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
@@ -73,9 +73,17 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .btn.danger { border-color: var(--crit); color: var(--crit); background: none; }
 .btn svg { width: 14px; height: 14px; }
 
-.view { padding: 20px 22px 26px; display: grid; gap: 18px; align-content: start; }
+/* The window never scrolls: a view fills the area under the top bar and scrolls inside itself. */
+.view { height: 100%; min-height: 0; overflow-y: auto; padding: 20px 22px 26px; display: grid; gap: 18px; align-content: start; }
+/* Transfers: fixed header and readouts, the last row takes what is left and its panels scroll. */
+.view.fill { overflow: hidden; display: flex; flex-direction: column; }
+.view.fill > * { flex: none; min-width: 0; }
+.view.fill > .fill-row { flex: 1 1 0; min-height: 0; }
 
 .panel { border: 1px solid var(--line); border-radius: 4px; background: var(--bg); min-width: 0; }
+.panel.col { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.panel.col > .panel-h { flex: none; }
+.panel.col > .body { flex: 1 1 0; min-height: 0; overflow: auto; }
 .panel-h {
   display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 14px;
   border-bottom: 1px solid var(--line);
@@ -91,9 +99,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: repeating-linear-gradient(90deg, transparent 0 calc(10% - 1px), var(--panel) calc(10% - 1px) 10%);
 }
 
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); }
+th { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 1; }
 td { padding: 7px 14px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
 tr:last-child td { border-bottom: 0; }
 td.name { font-family: var(--f-mono); font-size: 12px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
@@ -142,8 +150,11 @@ select.field { font-family: var(--f-body); }
 .empty h2 { margin: 0; font: 600 20px/1.2 var(--f-display); text-wrap: balance; }
 .empty p { margin: 0; color: var(--muted); max-width: 60ch; }
 
-@media (max-width: 920px) {
+@media (max-width: 800px) {
   .grid-2 { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-height: 720px) {
+  .view { padding: 14px 18px 16px; gap: 12px; }
 }
 @media (max-width: 600px) {
   .paste, .form-grid { grid-template-columns: minmax(0, 1fr); }

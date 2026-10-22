@@ -60,8 +60,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            parallel_files: 4,
-            range_size: 8 * MIB,
+            parallel_files: 6,
+            range_size: 16 * MIB,
             large_file_threshold: 64 * MIB,
             bandwidth_limit: None,
             max_retries: 8,
@@ -141,8 +141,8 @@ mod tests {
     #[test]
     fn defaults_match_the_contract() {
         let s = Settings::default();
-        assert_eq!(s.parallel_files, 4);
-        assert_eq!(s.range_size, 8 * MIB);
+        assert_eq!(s.parallel_files, 6);
+        assert_eq!(s.range_size, 16 * MIB);
         assert_eq!(s.large_file_threshold, 64 * MIB);
         assert_eq!(s.bandwidth_limit, None);
         assert_eq!(s.max_retries, 8);
@@ -194,7 +194,7 @@ mod tests {
         let s = Settings::load_from(&path).unwrap();
         assert!(s.tour_seen);
         assert_eq!(s.close_behavior, CloseBehavior::Pause);
-        assert_eq!(s.parallel_files, 4);
+        assert_eq!(s.parallel_files, 6);
     }
 
     #[test]

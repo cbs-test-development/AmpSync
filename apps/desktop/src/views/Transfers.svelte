@@ -151,7 +151,7 @@
     <div>
       <span class="label">Speed</span>
       <div class="v">{rate(rateNow)[0]} <small>{rate(rateNow)[1]}</small></div>
-      <div class="sub">{app.settings?.parallel_files ?? 4} at a time</div>
+      <div class="sub">{app.settings?.parallel_files ?? 6} at a time</div>
     </div>
     <div>
       <span class="label">Time left</span>
@@ -174,9 +174,9 @@
       <div class="panel-h"><span class="label">Speed · last 2 min</span><span class="meta">peak {num(peak / MB, 1)} MB/s</span></div>
       {#if live}<Chart hist={live.hist} />{/if}
     </div>
-    <div class="panel">
-      <div class="panel-h"><span class="label">Parallel lanes</span><span class="meta">pieces of files in flight</span></div>
-      <div class="lanes">
+    <div class="panel col lanes-panel">
+      <div class="panel-h"><span class="label">Parallel lanes</span><span class="meta">{lanesNow.length} at a time</span></div>
+      <div class="lanes body">
         {#each lanesNow as lane, i}
           {@const waiting = laneStatus !== ""}
           <div class="lane" class:waiting>
@@ -208,15 +208,15 @@
   </div>
 {/if}
 
-<div class="grid-2">
-  <div class="panel">
+<div class="grid-2 fill-row">
+  <div class="panel col">
     <div class="panel-h"><span class="label">Files</span><span class="meta">most recent first</span></div>
     {#if live && live.rows.length > 0}
-      <div class="table-wrap">
+      <div class="table-wrap body">
         <table>
           <thead><tr><th class="label">Name</th><th class="label num">Size</th><th class="label">State</th><th class="label">Checked by</th></tr></thead>
           <tbody>
-            {#each live.rows.slice(0, 40) as r (r.rel_path)}
+            {#each live.rows as r (r.rel_path)}
               <tr>
                 <td class="name" title={r.rel_path}>{r.rel_path}</td>
                 <td class="num">{r.size === null ? "-" : size(r.size)}</td>
@@ -228,13 +228,13 @@
         </table>
       </div>
     {:else}
-      <p class="panel-empty">Files appear here as they are saved.</p>
+      <p class="panel-empty body">Files appear here as they are saved.</p>
     {/if}
   </div>
 
-  <div class="panel" data-tour="queue">
+  <div class="panel col" data-tour="queue">
     <div class="panel-h"><span class="label">Queue</span><span class="meta">runs in order</span></div>
-    <div class="queue">
+    <div class="queue body">
       {#if job}
         <div class="qitem active"><span class="t">{job.title}</span><span class="sz">{size(job.est_bytes)}</span><span class="p">{job.path_label}</span></div>
       {/if}
@@ -293,7 +293,10 @@
   .v small { font-size: 13px; color: var(--muted); }
   .sub { font: 12px var(--f-mono); color: var(--muted); }
 
-  .lanes { display: grid; }
+  .lanes { display: grid; align-content: start; }
+  /* The lanes panel takes the chart's height and scrolls when there are more lanes than fit. */
+  .lanes-panel { contain: size; }
+  .fill-row { grid-template-rows: minmax(0, 1fr); }
   .lane { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--line); }
   .lane:last-child { border-bottom: 0; }
   .lane .id { font: 500 11px var(--f-mono); color: var(--signal); }
@@ -307,7 +310,7 @@
   .check { font: 11px var(--f-mono); color: var(--muted); max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
   .panel-empty { margin: 0; padding: 18px 14px; color: var(--muted); font-size: 13px; }
 
-  .queue { display: grid; }
+  .queue { display: grid; align-content: start; }
   .qitem { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
   .qitem:last-child { border-bottom: 0; }
   .qitem .t { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -319,7 +322,16 @@
   .link { background: none; border: 0; padding: 2px; color: var(--muted); cursor: pointer; font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
   .link:hover { color: var(--fg); }
 
-  @media (max-width: 920px) {
+  @media (max-height: 720px) {
+    .v { font-size: 19px; margin-top: 3px; }
+    .readout > div { padding: 8px 14px; }
+    .job-head h2 { font-size: 19px; margin: 0 0 2px; }
+  }
+  @media (max-width: 800px) {
+    .lanes-panel { contain: none; max-height: 260px; }
+    .fill-row { grid-template-rows: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 760px) {
     .readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .readout > div:nth-child(2) { border-right: 0; }
     .readout > div:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
