@@ -135,7 +135,7 @@ jobs:
       #   if: runner.os == 'Windows'
       #   shell: pwsh
       #   run: |
-      #     $exe = (Get-ChildItem target/release -Filter AmpSync.exe).FullName
+      #     $exe = (Get-ChildItem target/release -Filter ampsync-desktop.exe).FullName
       #     $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
       #     & $signtool sign /sha1 $env:WINDOWS_CERTIFICATE_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
 
@@ -149,8 +149,8 @@ jobs:
           [ -d "$bundle" ] || bundle=apps/desktop/src-tauri/target/release/bundle
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp "$bundle"/nsis/*-setup.exe dist/
-            exe=target/release/AmpSync.exe
-            [ -f "$exe" ] || exe=apps/desktop/src-tauri/target/release/AmpSync.exe
+            exe=target/release/ampsync-desktop.exe
+            [ -f "$exe" ] || exe=apps/desktop/src-tauri/target/release/ampsync-desktop.exe
             cp "$exe" "dist/AmpSync-portable-${VERSION}-x64.exe"
           else
             cp "$bundle"/appimage/*.AppImage dist/
