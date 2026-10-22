@@ -14,4 +14,5 @@ pub mod remote;
 pub mod settings;
 pub mod state;
 
+pub use auth::{SessionStatus, check_session};
 pub use errors::Error;

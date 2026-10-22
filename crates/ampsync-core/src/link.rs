@@ -157,20 +157,28 @@ fn trim_trailing_slash(s: &str) -> String {
     if t.is_empty() { "/".into() } else { t.to_string() }
 }
 
-/// Decoded path of `url` with view pages (`/Forms/AllItems.aspx`, `/_layouts/...`, `x.aspx`) removed.
+/// Decoded path of `url` with view pages removed: a `/_layouts/...` tail, the library's own
+/// `Forms/<page>.aspx` (only when `Forms` is the segment directly after the library and is followed
+/// by an `.aspx` page, so a user folder that happens to be called `Forms` survives), and a
+/// trailing `<page>.aspx`.
 fn direct_path(url: &Url) -> String {
     let decoded = percent_decode_str(url.path()).decode_utf8_lossy().to_string();
     let mut segs: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
-    if let Some(i) = segs
-        .iter()
-        .position(|s| s.eq_ignore_ascii_case("Forms") || s.to_ascii_lowercase().starts_with("_layouts"))
-    {
+    if let Some(i) = segs.iter().position(|s| s.eq_ignore_ascii_case("_layouts")) {
         segs.truncate(i);
     }
-    if segs
-        .last()
-        .is_some_and(|l| l.to_ascii_lowercase().ends_with(".aspx"))
+    let is_aspx = |s: &str| s.to_ascii_lowercase().ends_with(".aspx");
+    let site_len = match segs.first() {
+        Some(f) if matches!(f.to_ascii_lowercase().as_str(), "sites" | "teams" | "personal") => 2,
+        _ => 0,
+    };
+    let forms_at = site_len + 1;
+    if segs.len() == forms_at + 2
+        && segs[forms_at].eq_ignore_ascii_case("Forms")
+        && is_aspx(segs[forms_at + 1])
     {
+        segs.truncate(forms_at);
+    } else if segs.last().is_some_and(|l| is_aspx(l)) {
         segs.pop();
     }
     if segs.is_empty() {
@@ -332,6 +340,23 @@ mod tests {
         let (_, _, path) =
             folder("https://contoso.sharepoint.com/sites/Team/Shared%20Documents/Forms/AllItems.aspx");
         assert_eq!(path, "/sites/Team/Shared Documents");
+    }
+
+    #[test]
+    fn forms_is_only_a_view_folder_right_after_the_library() {
+        // A user folder called Forms deeper in the tree is real content.
+        let (_, _, path) = folder("https://contoso.sharepoint.com/sites/Team/Documents/Projects/Forms/Q3");
+        assert_eq!(path, "/sites/Team/Documents/Projects/Forms/Q3");
+        let (_, _, path) = folder("https://contoso.sharepoint.com/sites/Team/Documents/Projects/Forms");
+        assert_eq!(path, "/sites/Team/Documents/Projects/Forms");
+        // ... and so is one inside a library named like the view folder's parent.
+        let (_, _, path) = folder("https://contoso.sharepoint.com/sites/Team/Documents/Forms/Sub/Forms/Deep");
+        assert_eq!(path, "/sites/Team/Documents/Forms/Sub/Forms/Deep");
+        // Library root view pages still resolve to the library, in any site shape.
+        let (_, _, path) = folder("https://contoso.sharepoint.com/sites/Team/Documents/forms/allitems.aspx");
+        assert_eq!(path, "/sites/Team/Documents");
+        let (_, _, path) = folder("https://contoso.sharepoint.com/Shared%20Documents/Forms/AllItems.aspx");
+        assert_eq!(path, "/Shared Documents");
     }
 
     #[test]

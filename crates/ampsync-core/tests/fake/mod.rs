@@ -42,6 +42,12 @@ pub enum Logged {
     },
     /// Request refused because the cookie is not accepted.
     Unauthorized,
+    /// `GET /_api/web?$select=Title` (the session probe).
+    Probe,
+    /// An API request answered with an injected failure status.
+    ApiRejected(u16),
+    /// A download refused for this file only (403) although the session is fine.
+    Forbidden(String),
 }
 
 struct FFile {
@@ -68,6 +74,8 @@ struct Inner {
     flap_etags: bool,
     hang_after_downloads: Option<usize>,
     page_size: Option<usize>,
+    api_failures: std::collections::VecDeque<u16>,
+    forbidden: HashSet<String>,
 }
 
 pub struct Fake {
@@ -186,6 +194,16 @@ impl Fake {
         self.lock().page_size = Some(n);
     }
 
+    /// Answer the next API requests (folder info/listing, file stat) with these statuses, in
+    /// order, one per request (`Retry-After: 0` on 429/503). Cookies are still checked first.
+    pub fn fail_api(&self, statuses: &[u16]) {
+        self.lock().api_failures = statuses.iter().copied().collect();
+    }
+    /// Downloads of this file (server-relative URL) answer 403 even with a valid session.
+    pub fn forbid_download(&self, key: &str) {
+        self.lock().forbidden.insert(key.to_string());
+    }
+
     // ----- observation -----
 
     pub fn log(&self) -> Vec<Logged> {
@@ -204,6 +222,9 @@ impl Fake {
                 _ => None,
             })
             .collect()
+    }
+    pub fn count(&self, pred: impl Fn(&Logged) -> bool) -> usize {
+        self.lock().log.iter().filter(|l| pred(l)).count()
     }
     pub fn download_count(&self) -> usize {
         self.lock().downloads_served
@@ -318,6 +339,23 @@ async fn handle(State(fake): State<Arc<Fake>>, req: Request) -> Response {
             .unwrap();
     }
 
+    if path.ends_with("/_api/web") {
+        fake.lock().log.push(Logged::Probe);
+        return json_response(json!({"Title": "Team"}));
+    }
+    let injected = if path.contains("/_api/web/") {
+        fake.lock().api_failures.pop_front()
+    } else {
+        None
+    };
+    if let Some(status) = injected {
+        fake.lock().log.push(Logged::ApiRejected(status));
+        return Response::builder()
+            .status(status)
+            .header(header::RETRY_AFTER, "0")
+            .body(Body::empty())
+            .unwrap();
+    }
     if let Some((_, rest)) = path.split_once("/_api/web/GetFolderByServerRelativePath(decodedurl='") {
         let (folder, suffix) = rest.split_once("')").unwrap_or((rest, ""));
         let folder = folder.replace("''", "'");
@@ -401,6 +439,10 @@ fn download(fake: &Fake, id: &str, headers: &HeaderMap) -> Response {
     let Some(key) = g.files.iter().find(|(_, f)| f.id == id).map(|(k, _)| k.clone()) else {
         return plain(StatusCode::NOT_FOUND, "no such file");
     };
+    if g.forbidden.contains(&key) {
+        g.log.push(Logged::Forbidden(key));
+        return plain(StatusCode::FORBIDDEN, "forbidden");
+    }
     if g.throttle_remaining > 0 {
         g.throttle_remaining -= 1;
         return Response::builder()
@@ -440,7 +482,8 @@ fn download(fake: &Fake, id: &str, headers: &HeaderMap) -> Response {
             Response::builder()
                 .status(206)
                 .header(header::CONTENT_RANGE, format!("bytes {a}-{b}/{total}"))
-                .header(header::CONTENT_TYPE, "application/octet-stream")
+                // Real tenants label download.aspx bytes as text/html.
+                .header(header::CONTENT_TYPE, "text/html")
                 .body(Body::from(data[a as usize..=b as usize].to_vec()))
                 .unwrap()
         }
@@ -452,7 +495,7 @@ fn download(fake: &Fake, id: &str, headers: &HeaderMap) -> Response {
             });
             Response::builder()
                 .status(200)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONTENT_TYPE, "text/html")
                 .body(Body::from(data))
                 .unwrap()
         }

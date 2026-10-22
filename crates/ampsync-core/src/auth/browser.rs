@@ -2,19 +2,30 @@
 //! AmpSync-owned profile, wait for the user to sign in, read the SharePoint cookies over the
 //! Chrome DevTools Protocol, then close the browser and delete the profile.
 //!
+//! The protocol runs over `--remote-debugging-pipe`, not a TCP port, so no local socket is ever
+//! opened and no other process on the machine can attach to the browser: messages are
+//! NUL-terminated JSON over an anonymous pipe pair that only the child inherits.
+//! - Unix: the browser reads fd 3 and writes fd 4 (set up with `dup2` between fork and exec).
+//! - Windows: Chromium takes the two inherited handles from `--remote-debugging-io-pipes=<read
+//!   handle>,<write handle>`; the child ends are marked inheritable (and the parent ends are not),
+//!   and `std::process::Command` always creates the child with handle inheritance on.
+//!
+//! Closing our end makes the browser exit, so a crash of AmpSync never leaves it running with an
+//! open debugging channel.
+//!
 //! The user's own browser profiles are never read, signed in or synced: the throwaway profile
 //! lives under AmpSync's per-user data directory and the browser is started with sync and
 //! implicit sign-in disabled.
 
+use std::io::{PipeReader, PipeWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use directories::ProjectDirs;
-use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use url::Url;
 
 use super::{BrowserKind, Session, SessionCookie, SignInMethod};
@@ -24,7 +35,7 @@ use crate::Error;
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Cookie poll interval.
 const POLL_INTERVAL: Duration = Duration::from_millis(750);
-/// How long to wait for the browser's debugging endpoint to come up.
+/// How long to wait for the browser to start answering on the debugging pipe.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 
 fn label(kind: BrowserKind) -> &'static str {
@@ -75,15 +86,6 @@ pub(crate) fn find_browser(kind: BrowserKind) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
         .find(|p| p.is_file())
-}
-
-fn free_port() -> Result<u16, Error> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| Error::State(format!("cannot reserve a local port for the browser: {e}")))?;
-    listener
-        .local_addr()
-        .map(|a| a.port())
-        .map_err(|e| Error::State(format!("cannot reserve a local port for the browser: {e}")))
 }
 
 /// Parent directory of the throwaway profiles: `<per-user data dir>/browser-signin`.
@@ -173,52 +175,68 @@ impl Drop for BrowserProcess {
     }
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
 /// Failure of one DevTools call.
 #[derive(Debug)]
 enum CdpError {
-    /// The connection is gone: the user closed the browser.
+    /// The channel is gone: the user closed the browser.
     Closed,
     Failed(String),
 }
 
-/// A minimal DevTools protocol client over one websocket.
+/// Largest single DevTools message accepted from the browser.
+const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+
+/// A minimal DevTools protocol client over the debugging pipe pair.
 struct Cdp {
-    ws: Ws,
+    writer: PipeWriter,
+    replies: UnboundedReceiver<Value>,
     next_id: u64,
 }
 
 impl Cdp {
-    async fn connect(url: &str) -> Result<Self, Error> {
-        let (ws, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(|e| Error::State(format!("cannot connect to the browser's debugging port: {e}")))?;
-        Ok(Cdp { ws, next_id: 1 })
+    /// `reader` receives the browser's messages, `writer` sends ours (NUL-terminated JSON).
+    fn new(reader: PipeReader, writer: PipeWriter) -> Self {
+        let (tx, replies) = unbounded_channel();
+        std::thread::spawn(move || read_messages(reader, tx));
+        Cdp {
+            writer,
+            replies,
+            next_id: 1,
+        }
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, CdpError> {
+        self.call_within(method, params, Duration::from_secs(30)).await
+    }
+
+    async fn call_within(
+        &mut self,
+        method: &str,
+        params: Value,
+        within: Duration,
+    ) -> Result<Value, CdpError> {
         let id = self.next_id;
         self.next_id += 1;
-        let msg = json!({"id": id, "method": method, "params": params}).to_string();
-        self.ws
-            .send(Message::Text(msg.into()))
-            .await
+        let mut msg = json!({"id": id, "method": method, "params": params})
+            .to_string()
+            .into_bytes();
+        msg.push(0);
+        // Requests are tiny, so this never blocks for long even though the write is synchronous.
+        self.writer
+            .write_all(&msg)
+            .and_then(|()| self.writer.flush())
             .map_err(|_| CdpError::Closed)?;
+        let replies = &mut self.replies;
         let wait = async {
-            while let Some(frame) = self.ws.next().await {
-                let frame = frame.map_err(|_| CdpError::Closed)?;
-                if let Message::Text(t) = frame {
-                    let v: Value = serde_json::from_str(t.as_str())
-                        .map_err(|e| CdpError::Failed(format!("bad DevTools reply: {e}")))?;
-                    if v.get("id").and_then(Value::as_u64) == Some(id) {
-                        return Ok(v);
-                    }
+            // Events (no `id`) and replies to earlier, timed-out calls are skipped.
+            while let Some(v) = replies.recv().await {
+                if v.get("id").and_then(Value::as_u64) == Some(id) {
+                    return Ok(v);
                 }
             }
             Err(CdpError::Closed)
         };
-        let reply = tokio::time::timeout(Duration::from_secs(30), wait)
+        let reply = tokio::time::timeout(within, wait)
             .await
             .map_err(|_| CdpError::Failed("the browser did not answer".into()))??;
         if let Some(err) = reply.get("error") {
@@ -230,6 +248,152 @@ impl Cdp {
         }
         Ok(reply.get("result").cloned().unwrap_or(Value::Null))
     }
+}
+
+/// Reader thread: split the pipe into NUL-terminated JSON messages until it closes.
+fn read_messages(mut reader: PipeReader, tx: UnboundedSender<Value>) {
+    let (mut buf, mut chunk) = (Vec::new(), [0u8; 16 * 1024]);
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        for &b in &chunk[..n] {
+            if b != 0 {
+                if buf.len() < MAX_MESSAGE {
+                    buf.push(b);
+                }
+                continue;
+            }
+            if let Ok(v) = serde_json::from_slice::<Value>(&buf)
+                && tx.send(v).is_err()
+            {
+                return;
+            }
+            buf.clear();
+        }
+    }
+}
+
+/// Child-side pipe ends that must stay open until the child has been spawned, then be dropped so
+/// that the pipes report end-of-file when the browser exits.
+struct ChildEnds(#[allow(dead_code)] Box<dyn std::any::Any + Send>);
+
+/// Hand the child ends of the two pipes to `cmd` (flag, fds or handles).
+#[cfg(unix)]
+fn attach_pipes(
+    cmd: &mut Command,
+    child_read: PipeReader,
+    child_write: PipeWriter,
+) -> std::io::Result<ChildEnds> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::process::CommandExt;
+
+    /// A duplicate of `fd` numbered 10 or higher, so the `dup2` calls below can never overwrite
+    /// one source with the other target.
+    fn high(fd: RawFd) -> std::io::Result<OwnedFd> {
+        // SAFETY: plain fcntl on a descriptor we own; the result is wrapped immediately.
+        let n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: `n` is a fresh descriptor that nothing else owns.
+            Ok(unsafe { OwnedFd::from_raw_fd(n) })
+        }
+    }
+    let read_fd = high(child_read.as_raw_fd())?;
+    let write_fd = high(child_write.as_raw_fd())?;
+    drop((child_read, child_write));
+    let (r, w) = (read_fd.as_raw_fd(), write_fd.as_raw_fd());
+    cmd.arg("--remote-debugging-pipe");
+    // SAFETY: the closure only calls async-signal-safe `dup2` on descriptors that are open in
+    // the child; `dup2` also clears close-on-exec on fds 3 and 4, which is what we want.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(r, 3) < 0 || libc::dup2(w, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(ChildEnds(Box::new((read_fd, write_fd))))
+}
+
+#[cfg(windows)]
+fn attach_pipes(
+    cmd: &mut Command,
+    child_read: PipeReader,
+    child_write: PipeWriter,
+    parent_read: &PipeReader,
+    parent_write: &PipeWriter,
+) -> std::io::Result<ChildEnds> {
+    use std::os::windows::io::AsRawHandle;
+
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    fn inheritable(handle: *mut std::ffi::c_void, on: bool) -> std::io::Result<()> {
+        // SAFETY: `handle` is a live pipe handle owned by the caller for the whole call.
+        let ok = unsafe {
+            SetHandleInformation(
+                handle,
+                HANDLE_FLAG_INHERIT,
+                if on { HANDLE_FLAG_INHERIT } else { 0 },
+            )
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    // Only the child's ends are inherited, never ours.
+    inheritable(parent_read.as_raw_handle(), false)?;
+    inheritable(parent_write.as_raw_handle(), false)?;
+    inheritable(child_read.as_raw_handle(), true)?;
+    inheritable(child_write.as_raw_handle(), true)?;
+    cmd.arg("--remote-debugging-pipe").arg(format!(
+        "--remote-debugging-io-pipes={},{}",
+        child_read.as_raw_handle() as usize,
+        child_write.as_raw_handle() as usize
+    ));
+    Ok(ChildEnds(Box::new((child_read, child_write))))
+}
+
+/// Start the browser with the throwaway `profile` and a DevTools pipe; returns the process and
+/// the connected client.
+fn spawn_browser(
+    exe: &Path,
+    profile: &Path,
+    start_url: &str,
+    headless: bool,
+) -> std::io::Result<(Child, Cdp)> {
+    // browser -> us, and us -> browser.
+    let (parent_read, child_write) = std::io::pipe()?;
+    let (child_read, parent_write) = std::io::pipe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg(format!("--user-data-dir={}", profile.display()))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        // Never sign the throwaway profile in to the browser or sync it with other profiles.
+        // Edge would otherwise implicitly sign new profiles in with the Windows account (D16).
+        .arg("--disable-sync")
+        .arg("--disable-features=msImplicitSignin,msEdgeSyncConsent,msSignInWithWindowsAccount");
+    if headless {
+        cmd.arg("--headless=new");
+    }
+    cmd.arg(start_url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    let ends = attach_pipes(&mut cmd, child_read, child_write)?;
+    #[cfg(windows)]
+    let ends = attach_pipes(&mut cmd, child_read, child_write, &parent_read, &parent_write)?;
+    let child = cmd.spawn();
+    drop(ends);
+    Ok((child?, Cdp::new(parent_read, parent_write)))
 }
 
 /// Does a cookie with `domain` apply to `host`? (`.sharepoint.com`, `sharepoint.com` or the host)
@@ -279,31 +443,26 @@ pub(crate) fn has_auth_cookies(cookies: &[SessionCookie]) -> bool {
     has("FedAuth") && has("rtFa")
 }
 
-async fn wait_for_debugger(port: u16, proc: &mut BrowserProcess) -> Result<String, Error> {
-    let http = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| Error::Network(e.to_string()))?;
-    let url = format!("http://127.0.0.1:{port}/json/version");
+/// Wait until the browser answers on the pipe (its first reply can take a few seconds).
+async fn wait_for_browser(cdp: &mut Cdp, proc: &mut BrowserProcess) -> Result<(), Error> {
     let started = Instant::now();
     loop {
         if proc.has_exited() {
             return Err(Error::Cancelled);
         }
-        if let Ok(resp) = http.get(&url).send().await
-            && let Ok(body) = resp.bytes().await
-            && let Ok(v) = serde_json::from_slice::<Value>(&body)
-            && let Some(ws) = v["webSocketDebuggerUrl"].as_str()
+        match cdp
+            .call_within("Browser.getVersion", json!({}), Duration::from_secs(5))
+            .await
         {
-            return Ok(ws.to_string());
+            Ok(_) => return Ok(()),
+            Err(CdpError::Closed) => return Err(Error::Cancelled),
+            Err(CdpError::Failed(_)) => {}
         }
         if started.elapsed() > STARTUP_TIMEOUT {
             return Err(Error::State(
-                "the browser did not start in time (its debugging port never opened)".into(),
+                "the browser did not start in time (it never answered on its debugging pipe)".into(),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -325,26 +484,10 @@ pub(crate) async fn sign_in(kind: BrowserKind, host: &str, start_url: &Url) -> R
         child: None,
         dir: dir.clone(),
     };
-    let port = free_port()?;
-    let child = Command::new(&exe)
-        .arg(format!("--user-data-dir={}", dir.display()))
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        // Never sign the throwaway profile in to the browser or sync it with other profiles.
-        // Edge would otherwise implicitly sign new profiles in with the Windows account (D16).
-        .arg("--disable-sync")
-        .arg("--disable-features=msImplicitSignin,msEdgeSyncConsent,msSignInWithWindowsAccount")
-        .arg(start_url.as_str())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let (child, mut cdp) = spawn_browser(&exe, &dir, start_url.as_str(), false)
         .map_err(|e| Error::State(format!("could not start {}: {e}", label(kind))))?;
     proc.child = Some(child);
-
-    let ws_url = wait_for_debugger(port, &mut proc).await?;
-    let mut cdp = Cdp::connect(&ws_url).await?;
+    wait_for_browser(&mut cdp, &mut proc).await?;
 
     let deadline = Instant::now() + SIGN_IN_TIMEOUT;
     let captured = loop {
@@ -406,6 +549,110 @@ mod tests {
         assert!(has_auth_cookies(&c));
         assert!(!has_auth_cookies(&c[..1]));
         assert!(!has_auth_cookies(&[]));
+    }
+
+    #[test]
+    fn messages_are_nul_terminated_json_split_anywhere() {
+        let (r, mut w) = std::io::pipe().unwrap();
+        let (tx, mut rx) = unbounded_channel();
+        let t = std::thread::spawn(move || read_messages(r, tx));
+        // Two messages, the second delivered in awkward pieces, plus one that is not JSON.
+        w.write_all(b"{\"id\":1}\0not json\0{\"id\"").unwrap();
+        w.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        w.write_all(b":2,\"result\":{\"a\":\"\xc3\xa9\"}}\0").unwrap();
+        drop(w);
+        t.join().unwrap();
+        assert_eq!(rx.try_recv().unwrap()["id"], 1);
+        let second = rx.try_recv().unwrap();
+        assert_eq!(second["id"], 2);
+        assert_eq!(second["result"]["a"], "\u{e9}");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn call_matches_replies_by_id_and_skips_events() {
+        // A fake browser on the other end of two pipes.
+        let (browser_in, our_writer) = std::io::pipe().unwrap();
+        let (our_reader, mut browser_out) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut input = browser_in;
+            let mut got = Vec::new();
+            let mut byte = [0u8; 1];
+            while input.read(&mut byte).unwrap_or(0) == 1 {
+                if byte[0] != 0 {
+                    got.push(byte[0]);
+                    continue;
+                }
+                let req: Value = serde_json::from_slice(&got).unwrap();
+                got.clear();
+                let id = req["id"].as_u64().unwrap();
+                let reply = if req["method"] == "Boom" {
+                    json!({"id": id, "error": {"message": "nope"}})
+                } else {
+                    json!({"id": id, "result": {"echo": req["method"]}})
+                };
+                let mut out = json!({"method": "Some.event", "params": {}})
+                    .to_string()
+                    .into_bytes();
+                out.push(0);
+                out.extend(json!({"id": id + 100, "result": {}}).to_string().into_bytes());
+                out.push(0);
+                out.extend(reply.to_string().into_bytes());
+                out.push(0);
+                browser_out.write_all(&out).unwrap();
+            }
+        });
+        let mut cdp = Cdp::new(our_reader, our_writer);
+        let r = cdp.call("Storage.getCookies", json!({})).await.unwrap();
+        assert_eq!(r["echo"], "Storage.getCookies");
+        match cdp.call("Boom", json!({})).await {
+            Err(CdpError::Failed(m)) => assert!(m.contains("nope")),
+            other => panic!("{other:?}"),
+        }
+        drop(cdp); // closes the request pipe; the fake browser stops
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_reports_a_closed_channel_when_the_browser_goes_away() {
+        let (browser_in, our_writer) = std::io::pipe().unwrap();
+        let (our_reader, browser_out) = std::io::pipe().unwrap();
+        let mut cdp = Cdp::new(our_reader, our_writer);
+        drop(browser_out); // the browser exits: our reader sees EOF
+        match cdp.call("Anything", json!({})).await {
+            Err(CdpError::Closed) => {}
+            other => panic!("{other:?}"),
+        }
+        drop(browser_in);
+    }
+
+    /// Needs Edge or Chrome installed: starts a headless instance with a throwaway profile and
+    /// talks to it over the debugging pipe exactly as `sign_in` does. Run with
+    /// `cargo test -p ampsync-core --lib real_browser -- --ignored`.
+    #[tokio::test]
+    #[ignore = "launches the installed Edge/Chrome"]
+    async fn real_browser_answers_over_the_debugging_pipe() {
+        let exe = find_browser(BrowserKind::Edge)
+            .or_else(|| find_browser(BrowserKind::Chrome))
+            .expect("Edge or Chrome is installed");
+        let dir = std::env::temp_dir().join(format!("ampsync-pipe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (child, mut cdp) = spawn_browser(&exe, &dir, "about:blank", true).unwrap();
+        let mut proc = BrowserProcess {
+            child: Some(child),
+            dir: dir.clone(),
+        };
+        wait_for_browser(&mut cdp, &mut proc).await.unwrap();
+        let version = cdp.call("Browser.getVersion", json!({})).await.unwrap();
+        assert!(
+            version["product"].as_str().is_some_and(|p| !p.is_empty()),
+            "{version}"
+        );
+        let cookies = cdp.call("Storage.getCookies", json!({})).await.unwrap();
+        assert!(cookies["cookies"].is_array(), "{cookies}");
+        proc.shutdown(Some(&mut cdp)).await;
+        assert!(!dir.exists(), "profile removed");
     }
 
     #[test]

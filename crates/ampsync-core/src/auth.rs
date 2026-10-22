@@ -348,6 +348,70 @@ impl SessionStore for MemoryStore {
     }
 }
 
+/// Whether the server still accepts a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    /// The tenant answered a cheap authenticated request normally.
+    Valid,
+    /// 401, or the request was sent to the Microsoft sign-in page: the user must sign in again.
+    Expired,
+    /// Could not tell (403, other statuses, network trouble).
+    Unknown,
+}
+
+/// Ask `site_url` (the web that owns the content, e.g. `https://contoso.sharepoint.com/sites/Team`)
+/// whether `session` is still accepted: `GET {site_url}/_api/web?$select=Title`.
+/// 2xx is `Valid`; 401 or a redirect to a Microsoft sign-in host is `Expired`; 403, any other
+/// status and network errors are `Unknown` (a 403 can also mean "this one file is off limits",
+/// so it proves nothing about the session).
+pub async fn check_session(session: &Session, site_url: &Url) -> SessionStatus {
+    let Some(url) = probe_url(site_url) else {
+        return SessionStatus::Unknown;
+    };
+    let req = crate::remote::http_client(session)
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json;odata=nometadata");
+    match tokio::time::timeout(std::time::Duration::from_secs(20), req.send()).await {
+        Ok(Ok(resp)) => classify_response(&resp),
+        _ => SessionStatus::Unknown,
+    }
+}
+
+/// `{site}/_api/web?$select=Title`
+pub(crate) fn probe_url(site_url: &Url) -> Option<Url> {
+    let base = site_url.as_str().trim_end_matches('/');
+    Url::parse(&format!("{base}/_api/web?$select=Title")).ok()
+}
+
+pub(crate) fn classify_response(resp: &reqwest::Response) -> SessionStatus {
+    let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok());
+    let location = header(reqwest::header::LOCATION).and_then(|l| resp.url().join(l).ok());
+    classify_probe(
+        resp.status().as_u16(),
+        header(reqwest::header::CONTENT_TYPE),
+        location.as_ref(),
+    )
+}
+
+/// Pure decision behind [`check_session`].
+pub(crate) fn classify_probe(
+    status: u16,
+    content_type: Option<&str>,
+    location: Option<&Url>,
+) -> SessionStatus {
+    match status {
+        // A 200 sign-in page instead of JSON is how some tenants say "not signed in".
+        200 if content_type.is_some_and(|c| c.to_ascii_lowercase().starts_with("text/html")) => {
+            SessionStatus::Expired
+        }
+        200..=299 => SessionStatus::Valid,
+        401 => SessionStatus::Expired,
+        300..=399 if location.is_some_and(crate::remote::is_login_host) => SessionStatus::Expired,
+        _ => SessionStatus::Unknown,
+    }
+}
+
 /// Obtains a [`Session`] interactively or from user-supplied data.
 ///
 /// Implemented in core for `Browser` and `Pasted`; the `Webview` method is implemented by the
@@ -438,6 +502,29 @@ impl SignIn for PastedSignIn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_classification() {
+        let login = Url::parse("https://login.microsoftonline.com/x").unwrap();
+        let same = Url::parse("https://contoso.sharepoint.com/other").unwrap();
+        let json = Some("application/json;odata=nometadata");
+        assert_eq!(classify_probe(200, json, None), SessionStatus::Valid);
+        assert_eq!(classify_probe(204, None, None), SessionStatus::Valid);
+        assert_eq!(
+            classify_probe(200, Some("text/html"), None),
+            SessionStatus::Expired
+        );
+        assert_eq!(classify_probe(401, None, None), SessionStatus::Expired);
+        assert_eq!(classify_probe(302, None, Some(&login)), SessionStatus::Expired);
+        assert_eq!(classify_probe(302, None, Some(&same)), SessionStatus::Unknown);
+        assert_eq!(classify_probe(403, None, None), SessionStatus::Unknown);
+        assert_eq!(classify_probe(500, None, None), SessionStatus::Unknown);
+        let site = Url::parse("https://contoso.sharepoint.com/sites/Team").unwrap();
+        assert_eq!(
+            probe_url(&site).unwrap().as_str(),
+            "https://contoso.sharepoint.com/sites/Team/_api/web?$select=Title"
+        );
+    }
     use time::Duration;
 
     fn session(host: &str) -> Session {

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -12,7 +13,7 @@ use crate::Error;
 use crate::link;
 use crate::names;
 use crate::remote::{Remote, RemoteEntry, RemoteFile, RemoteRoot};
-use crate::state::{FileRecord, FileStatus, StateDb};
+use crate::state::{DestLock, FileRecord, FileStatus, StateDb};
 
 /// A path relative to the download root, `/`-separated on every platform.
 ///
@@ -179,12 +180,49 @@ pub struct Totals {
 }
 
 /// The full result of listing and comparing: nothing has been downloaded yet.
+///
+/// A plan keeps the destination folder locked (`<dest>/.ampsync/lock`) until it is dropped or
+/// handed to `Engine::start`, which moves the lock into the job. While it is held, planning or
+/// running another download into the same folder fails with `Error::DestinationBusy`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Plan {
     pub root: RemoteRoot,
     pub items: Vec<PlannedFile>,
     pub totals: Totals,
+    #[serde(skip)]
+    pub(crate) lock: PlanLock,
 }
+
+/// Shared slot for the destination lock; clones of a plan share it, and the job that starts first
+/// takes the lock out so a leftover clone does not keep the folder locked after the job ends.
+#[derive(Clone, Default)]
+pub(crate) struct PlanLock(Arc<Mutex<Option<DestLock>>>);
+
+impl PlanLock {
+    fn holding(lock: DestLock) -> Self {
+        PlanLock(Arc::new(Mutex::new(Some(lock))))
+    }
+
+    /// Take the lock out of the plan (once).
+    pub(crate) fn take(&self) -> Option<DestLock> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+}
+
+impl fmt::Debug for PlanLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PlanLock")
+    }
+}
+
+/// The lock is not part of a plan's identity.
+impl PartialEq for PlanLock {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PlanLock {}
 
 /// Suffix of the file a download is written to before it is verified and renamed.
 pub(crate) const PART_SUFFIX: &str = ".ampsync-part";
@@ -269,9 +307,15 @@ pub(crate) fn hash_text(file: &RemoteFile) -> Option<String> {
 /// List the remote tree, apply the filters, compare with the destination and `state.db`.
 pub(crate) async fn build<R: Remote + ?Sized>(remote: &R, spec: &JobSpec) -> Result<Plan, Error> {
     let filters = Filters::new(&spec.include, &spec.exclude)?;
+    let dest = absolute_dest(&spec.dest);
+    let lock = {
+        let dest = dest.clone();
+        tokio::task::spawn_blocking(move || DestLock::acquire(&dest))
+            .await
+            .map_err(|e| Error::State(format!("background task failed: {e}")))??
+    };
     let parsed = link::parse(&spec.source)?;
     let root = remote.resolve(&parsed).await?;
-    let dest = absolute_dest(&spec.dest);
     let db = StateDb::open(&dest)?;
     let known: HashMap<RelPath, FileRecord> =
         db.files()?.into_iter().map(|r| (r.rel_path.clone(), r)).collect();
@@ -304,7 +348,12 @@ pub(crate) async fn build<R: Remote + ?Sized>(remote: &R, spec: &JobSpec) -> Res
         items.push(PlannedFile { file, action });
     }
     drop(walk);
-    Ok(Plan { root, items, totals })
+    Ok(Plan {
+        root,
+        items,
+        totals,
+        lock: PlanLock::holding(lock),
+    })
 }
 
 fn decide(

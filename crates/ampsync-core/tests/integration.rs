@@ -11,11 +11,13 @@ use ampsync_core::engine::{Engine, Event, Settings, Summary, Tuning, VerifiedBy}
 use ampsync_core::link;
 use ampsync_core::names;
 use ampsync_core::plan::{ExistingPolicy, JobSpec, PlannedAction, RelPath};
-use ampsync_core::remote::{ClassicRemote, Remote, RemoteEntry, RemoteFile, RemoteRoot};
+use ampsync_core::remote::{ClassicRemote, Remote, RemoteEntry, RemoteFile, RemoteRoot, RetryPolicy};
 use ampsync_core::state::{FileStatus, StateDb};
+use ampsync_core::{SessionStatus, check_session};
 use fake::*;
 use futures::StreamExt;
 use tokio::sync::broadcast;
+use url::Url;
 
 const KIB: usize = 1024;
 
@@ -53,6 +55,11 @@ fn tuning() -> Tuning {
         rename_attempts: 3,
         rename_delay: Duration::from_millis(5),
         write_buffer: 64 * 1024,
+        retry: RetryPolicy {
+            max_attempts: 5,
+            backoff_base: Duration::from_millis(2),
+            backoff_max: Duration::from_millis(10),
+        },
     }
 }
 
@@ -529,16 +536,27 @@ async fn rerun_skips_unchanged_files_and_refetches_changed_ones() {
             (plan.totals.files, plan.totals.skipped, plan.totals.bytes),
             (0, 3, 0)
         );
+        drop(plan); // a plan keeps the folder locked
         fake.clear_log();
         let (summary, events) = run(&e, spec(dest.path())).await;
         assert_eq!((summary.downloaded, summary.skipped, summary.bytes), (0, 3, 0));
+        // Plan-time skips are counted in `Planned`, never announced file by file.
         assert_eq!(
             events
                 .iter()
                 .filter(|e| matches!(e, Event::FileSkipped { .. }))
                 .count(),
-            3
+            0
         );
+        assert!(matches!(
+            events[0],
+            Event::Planned {
+                files: 0,
+                skipped: 3,
+                skipped_bytes,
+                ..
+            } if skipped_bytes == 30 + 40 + 300 * KIB as u64
+        ));
         assert!(fake.downloads().is_empty(), "nothing was fetched");
 
         // One file changes on the server, one local file disappears.
@@ -555,6 +573,7 @@ async fn rerun_skips_unchanged_files_and_refetches_changed_ones() {
         assert_eq!(action("a.txt"), PlannedAction::Download);
         assert_eq!(action("b.txt"), PlannedAction::Download);
         assert_eq!(action("big.bin"), PlannedAction::SkipUnchanged);
+        drop(plan);
         let (summary, _) = run(&e, spec(dest.path())).await;
         assert_eq!((summary.downloaded, summary.skipped), (2, 1));
         assert_eq!(read(dest.path(), "a.txt"), data(9, 35));
@@ -563,6 +582,7 @@ async fn rerun_skips_unchanged_files_and_refetches_changed_ones() {
         s.existing = ExistingPolicy::Redownload;
         let plan = e.plan(&s).await.unwrap();
         assert!(plan.items.iter().all(|i| i.action == PlannedAction::Download));
+        drop(plan);
     })
     .await;
 }
@@ -860,6 +880,7 @@ async fn cancel_then_rerun_fetches_only_the_missing_ranges() {
         let plan = e.plan(&spec(dest.path())).await.unwrap();
         assert_eq!(plan.items[0].action, PlannedAction::Resume { have: 3 * step });
         assert_eq!(plan.totals.bytes, 5 * step);
+        drop(plan);
         let (summary, _) = run(&e, spec(dest.path())).await;
         assert_eq!((summary.downloaded, summary.failed), (1, 0));
         assert_eq!(summary.bytes, 5 * step);
@@ -902,6 +923,7 @@ async fn a_part_file_of_an_older_version_is_not_resumed() {
         let e = engine_with(&fake, one_lane);
         let plan = e.plan(&spec(dest.path())).await.unwrap();
         assert_eq!(plan.items[0].action, PlannedAction::Download);
+        drop(plan);
         let (summary, _) = run(&e, spec(dest.path())).await;
         assert_eq!(summary.downloaded, 1);
         assert_eq!(fake.downloads().len(), 4);
@@ -1067,6 +1089,346 @@ async fn a_terminal_event_is_always_emitted() {
             serde_json::to_string(&Event::Cancelled).unwrap(),
             r#"{"type":"cancelled"}"#
         );
+    })
+    .await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Review fixes
+// ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn listing_survives_a_429_and_a_503() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        fake.add_file(&key("sub/b.txt"), data(2, 40));
+        let dest = tempfile::tempdir().unwrap();
+        let e = engine(&fake);
+        // The first two API requests (folder info, then a listing page) are throttled / unavailable.
+        fake.fail_api(&[429, 503]);
+        let plan = e.plan(&spec(dest.path())).await.unwrap();
+        let mut names: Vec<_> = plan.items.iter().map(|i| i.file.rel_path.to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["a.txt", "sub/b.txt"]);
+        assert_eq!(fake.count(|l| matches!(l, Logged::ApiRejected(_))), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn listing_retries_are_bounded_and_auth_expiry_is_not_retried() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        let dest = tempfile::tempdir().unwrap();
+        let e = engine(&fake);
+        fake.fail_api(&[503; 50]);
+        match e.plan(&spec(dest.path())).await {
+            Err(Error::Throttled { .. }) => {} // a 503 surfaces as Throttled once retries run out
+            other => panic!("expected 503 after the retries, got {:?}", other.map(|_| ())),
+        }
+        let rejected = fake.count(|l| matches!(l, Logged::ApiRejected(_)));
+        assert_eq!(rejected, 5, "max_attempts requests, then give up");
+
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        fake.reject_all_cookies();
+        let e = engine(&fake);
+        assert!(matches!(
+            e.plan(&spec(dest.path())).await,
+            Err(Error::AuthExpired { .. })
+        ));
+        assert_eq!(
+            fake.count(|l| *l == Logged::Unauthorized),
+            1,
+            "no retry on AuthExpired"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn stat_is_retried_too() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("f.bin"), data(3, 100));
+        let r = remote(&fake, COOKIE_OLD);
+        let root = root_of(&r, FOLDER_LINK).await;
+        let file = list_files(&r, &root).await.pop().unwrap();
+        r.set_retry_policy(tuning().retry);
+        fake.fail_api(&[503, 429]);
+        assert_eq!(r.stat(&file).await.unwrap().size, 100);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn download_answers_labelled_text_html_are_file_data_not_a_sign_in_page() {
+    guarded(async {
+        // The fake labels every 206 from download.aspx `text/html`, as real tenants do.
+        let fake = Fake::start().await;
+        let body = data(4, 700 * KIB);
+        fake.add_file(&key("big.bin"), body.clone());
+        fake.add_file(&key("small.txt"), data(5, 123));
+        let dest = tempfile::tempdir().unwrap();
+        let (summary, events) = run(&engine(&fake), spec(dest.path())).await;
+        assert_eq!((summary.downloaded, summary.failed), (2, 0));
+        assert_eq!(read(dest.path(), "big.bin"), body);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::AuthExpired { .. } | Event::Paused)),
+            "{events:?}"
+        );
+        assert_eq!(fake.count(|l| *l == Logged::Probe), 0);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forbidden_file_fails_alone_while_the_session_stays_valid() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("ok1.txt"), data(1, 500));
+        fake.add_file(&key("secret.bin"), data(2, 600 * KIB));
+        fake.add_file(&key("ok2.bin"), data(3, 300 * KIB));
+        fake.forbid_download(&key("secret.bin"));
+        let dest = tempfile::tempdir().unwrap();
+        let (summary, events) = run(&engine(&fake), spec(dest.path())).await;
+        assert_eq!((summary.downloaded, summary.failed), (2, 1));
+        assert_eq!(summary.failures[0].rel_path, rel("secret.bin"));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::AuthExpired { .. } | Event::Paused)),
+            "the job must not pause: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::FileFailed { rel_path, will_retry: false, .. } if rel_path.as_str() == "secret.bin"
+        )));
+        assert_eq!(read(dest.path(), "ok1.txt"), data(1, 500));
+        assert_eq!(read(dest.path(), "ok2.bin"), data(3, 300 * KIB));
+        assert!(!exists(dest.path(), "secret.bin"));
+        assert!(fake.count(|l| *l == Logged::Probe) >= 1);
+        let db = StateDb::open(dest.path()).unwrap();
+        assert_eq!(
+            db.file(&rel("secret.bin")).unwrap().unwrap().status,
+            FileStatus::Failed
+        );
+        assert_eq!(
+            db.file(&rel("ok2.bin")).unwrap().unwrap().status,
+            FileStatus::Verified
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_right_after_a_new_session_fails_the_files_instead_of_pausing_again() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 500));
+        fake.add_file(&key("b.txt"), data(2, 500));
+        let dest = tempfile::tempdir().unwrap();
+        let e = engine(&fake);
+        let s = spec(dest.path());
+        let plan = e.plan(&s).await.unwrap();
+        fake.reject_all_cookies(); // the session is dead and stays dead
+        let handle = e.start(s, plan);
+        let mut rx = handle.events();
+        let mut seen = Vec::new();
+        until(&mut rx, &mut seen, |ev| matches!(ev, Event::Paused)).await;
+        handle.replace_session(fake.session("still-bad"));
+        let summary = handle.wait().await.unwrap();
+        drain(&mut rx, &mut seen);
+        assert_eq!((summary.downloaded, summary.failed), (0, 2));
+        assert_eq!(
+            seen.iter()
+                .filter(|e| matches!(e, Event::AuthExpired { .. }))
+                .count(),
+            1,
+            "{seen:?}"
+        );
+        assert_eq!(terminal_events(&seen), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn check_session_and_probe_tell_valid_from_expired_from_unknown() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("f.txt"), data(1, 10));
+
+        // The remote probes the web it last resolved; before that it cannot say.
+        let r = remote(&fake, COOKIE_OLD);
+        assert_eq!(r.probe().await, SessionStatus::Unknown);
+        let _ = root_of(&r, FOLDER_LINK).await;
+        assert_eq!(r.probe().await, SessionStatus::Valid);
+
+        fake.reject_all_cookies();
+        assert_eq!(
+            r.probe().await,
+            SessionStatus::Unknown,
+            "a bare 403 proves nothing"
+        );
+        fake.redirect_to_login(true);
+        assert_eq!(r.probe().await, SessionStatus::Expired);
+
+        // `check_session` talks to the real address of the site, which a test cannot reach, so
+        // the network failure must come back as Unknown rather than an error.
+        let unreachable = Url::parse("https://127.0.0.1:9/sites/Team").unwrap();
+        assert_eq!(
+            check_session(&fake.session(COOKIE_OLD), &unreachable).await,
+            SessionStatus::Unknown
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_second_plan_on_the_same_folder_is_busy_until_the_first_is_dropped() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        let dest = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let e = engine(&fake);
+        let first = e.plan(&spec(dest.path())).await.unwrap();
+        match e.plan(&spec(dest.path())).await {
+            Err(Error::DestinationBusy { path }) => assert!(path.ends_with(dest.path().file_name().unwrap())),
+            other => panic!("expected DestinationBusy, got {:?}", other.map(|_| ())),
+        }
+        assert!(
+            e.plan(&spec(other.path())).await.is_ok(),
+            "other folders are unaffected"
+        );
+        drop(first);
+        assert!(e.plan(&spec(dest.path())).await.is_ok());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn another_process_holding_the_lock_file_blocks_planning() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dest.path().join(".ampsync")).unwrap();
+        // Same effect as a second AmpSync process: an independent handle holds the lock.
+        let foreign = std::fs::File::create(dest.path().join(".ampsync").join("lock")).unwrap();
+        foreign.lock().unwrap();
+        assert!(matches!(
+            engine(&fake).plan(&spec(dest.path())).await,
+            Err(Error::DestinationBusy { .. })
+        ));
+        drop(foreign);
+        assert!(engine(&fake).plan(&spec(dest.path())).await.is_ok());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_running_job_keeps_its_folder_locked_until_it_ends() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.bin"), data(1, 4 * KIB));
+        let dest = tempfile::tempdir().unwrap();
+        let e = engine(&fake);
+        let s = spec(dest.path());
+        let plan = e.plan(&s).await.unwrap();
+        let leftover = plan.clone(); // a stale copy must not keep the lock alive
+        fake.hang_after(0); // downloads never answer: the job stays running
+        let handle = e.start(s.clone(), plan);
+        let mut rx = handle.events();
+        let mut seen = Vec::new();
+        until(&mut rx, &mut seen, |ev| matches!(ev, Event::FileStarted { .. })).await;
+
+        assert!(matches!(e.plan(&s).await, Err(Error::DestinationBusy { .. })));
+        // A second job started from the same plan finds the lock taken: it fails, it does not run.
+        let second = e.start(s.clone(), leftover);
+        assert!(matches!(second.wait().await, Err(Error::DestinationBusy { .. })));
+
+        handle.cancel();
+        assert!(matches!(handle.wait().await, Err(Error::Cancelled)));
+        assert!(e.plan(&s).await.is_ok(), "released when the job ended");
+    })
+    .await;
+}
+
+/// A remote that behaves like `ClassicRemote` but, once, deletes a file's recorded ranges from
+/// `state.db` while the file is being verified (simulating bookkeeping that lost a range).
+struct LosesRanges {
+    inner: ClassicRemote,
+    dest: PathBuf,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Remote for LosesRanges {
+    async fn resolve(&self, link: &link::ParsedLink) -> Result<RemoteRoot, Error> {
+        self.inner.resolve(link).await
+    }
+    fn walk<'a>(
+        &'a self,
+        root: &'a RemoteRoot,
+    ) -> futures::stream::BoxStream<'a, Result<RemoteEntry, Error>> {
+        self.inner.walk(root)
+    }
+    async fn read_range(
+        &self,
+        file: &RemoteFile,
+        range: std::ops::Range<u64>,
+    ) -> Result<futures::stream::BoxStream<'static, Result<bytes::Bytes, Error>>, Error> {
+        self.inner.read_range(file, range).await
+    }
+    async fn stat(&self, file: &RemoteFile) -> Result<RemoteFile, Error> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            StateDb::open(&self.dest)
+                .unwrap()
+                .reset_file(&file.rel_path)
+                .unwrap();
+        }
+        self.inner.stat(file).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recorded_ranges_that_do_not_add_up_reset_the_file_and_it_is_fetched_again() {
+    guarded(async {
+        let fake = Fake::start().await;
+        let big = data(7, 5 * 256 * KIB + 100);
+        fake.add_file(&key("big.bin"), big.clone());
+        let dest = tempfile::tempdir().unwrap();
+        let remote = Arc::new(LosesRanges {
+            inner: ClassicRemote::with_origin(&fake.session(COOKIE_OLD), fake.origin.clone()),
+            dest: dest.path().to_path_buf(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+        let e = Engine::with_tuning(remote, settings(), tuning());
+        let s = spec(dest.path());
+        let plan = e.plan(&s).await.unwrap();
+        let handle = e.start(s, plan);
+        let mut rx = handle.events();
+        let summary = handle.wait().await.unwrap();
+        let mut events = Vec::new();
+        drain(&mut rx, &mut events);
+        assert_eq!((summary.downloaded, summary.failed), (1, 0));
+        assert_eq!(read(dest.path(), "big.bin"), big);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::FileFailed { error, will_retry: true, .. } if error.contains("bytes downloaded")
+            )),
+            "the mismatch must be reported and retried: {events:?}"
+        );
+        // The whole file was fetched a second time.
+        let fetched: u64 = fake.downloads().iter().map(|(_, a, b)| b - a).sum();
+        assert_eq!(fetched, 2 * big.len() as u64);
+        assert!(no_part_files(dest.path()));
     })
     .await;
 }

@@ -15,13 +15,19 @@
 //!   answers 206 with `Content-Range`. Always check status 206 and that `Content-Range` matches
 //!   before writing; a 200 means the server ignored Range (treat as an error).
 //! - Auth expiry shows up as 401/403 or a redirect to `login.microsoftonline.com`. API calls must
-//!   not follow redirects off the tenant host; map those cases to `Error::AuthExpired`.
+//!   not follow redirects off the tenant host; map those cases to `Error::AuthExpired`. A 200 HTML
+//!   page from a JSON API call is a sign-in page too, but `download.aspx` answers 206 with
+//!   `text/html` on real tenants, so downloads never infer expiry from the content type.
 //! - 429/503: parse `Retry-After` into `Error::Throttled`.
+//! - Listing, `resolve` and `stat` requests are retried here (see [`RetryPolicy`]): `Retry-After`
+//!   is honoured, other retryable errors back off exponentially with jitter, attempts are bounded.
+//!   `AuthExpired` is never retried at this level.
 //! - Every request sends User-Agent `NONISV|AmpSync|AmpSync/<version>` (D8).
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -36,7 +42,7 @@ use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::Error;
-use crate::auth::Session;
+use crate::auth::{self, Session, SessionStatus};
 use crate::link::{self, LinkKind, ParsedLink, odata_string_arg, split_site};
 use crate::plan::RelPath;
 
@@ -130,7 +136,78 @@ pub trait Remote: Send + Sync {
     fn replace_session(&self, session: Session) {
         let _ = session;
     }
+
+    /// Is the session still accepted? Called by the engine when a file answers `AuthExpired`, to
+    /// tell a refused file (`Valid`) from a dead session (`Expired`). The default is `Unknown`.
+    async fn probe(&self) -> SessionStatus {
+        SessionStatus::Unknown
+    }
+
+    /// Replace how listing/metadata requests are retried (default no-op, for test doubles).
+    /// Called by `Engine::with_tuning`.
+    fn set_retry_policy(&self, policy: RetryPolicy) {
+        let _ = policy;
+    }
 }
+
+/// How a request is retried: bounded attempts, `Retry-After` honoured, exponential backoff with
+/// jitter otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Total tries including the first (1 = never retry). Default 6.
+    pub max_attempts: u32,
+    /// Delay before the first retry; doubles per attempt (with jitter). Default 1 s.
+    pub backoff_base: Duration,
+    /// Upper bound of the backoff delay. Default 30 s. (`Retry-After` is not capped by this.)
+    pub backoff_max: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_attempts: 6,
+            backoff_base: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Wait before retry number `retry` (1-based) after `error`.
+    fn delay(&self, error: &Error, retry: u32) -> Duration {
+        if let Error::Throttled { retry_after } = error {
+            return *retry_after;
+        }
+        let exp = self
+            .backoff_base
+            .saturating_mul(1u32 << retry.saturating_sub(1).min(16))
+            .min(self.backoff_max);
+        exp.mul_f64(0.5 + fastrand::f64() * 0.5)
+    }
+}
+
+/// Run `op`, retrying retryable errors per `policy`. `AuthExpired` and every other
+/// non-retryable error is returned at once.
+async fn retry_with<T, Fut>(policy: &RetryPolicy, mut op: impl FnMut() -> Fut) -> Result<T, Error>
+where
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let mut attempt = 1u32;
+    loop {
+        match op().await {
+            Err(e) if e.is_retryable() && attempt < policy.max_attempts => {
+                let wait = policy.delay(&e, attempt);
+                tracing::debug!("retrying after {e} (attempt {attempt}, waiting {wait:?})");
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// How long a session probe may take before the answer is `Unknown`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// User-Agent sent with every request (D8).
 const USER_AGENT: &str = concat!("NONISV|AmpSync|AmpSync/", env!("CARGO_PKG_VERSION"));
@@ -233,6 +310,9 @@ pub struct ClassicRemote {
     public_host: String,
     /// Send every request here instead of to the address in the link (tests, local proxies).
     origin: Option<Url>,
+    retry: std::sync::RwLock<RetryPolicy>,
+    /// The web last resolved or walked; `probe` checks the session against it.
+    root_site: Mutex<Option<Url>>,
 }
 
 impl ClassicRemote {
@@ -243,7 +323,23 @@ impl ClassicRemote {
             host: session.host.to_ascii_lowercase(),
             public_host: session.host.to_ascii_lowercase(),
             origin: None,
+            retry: std::sync::RwLock::new(RetryPolicy::default()),
+            root_site: Mutex::new(None),
         }
+    }
+
+    /// Use `policy` for listing, `resolve` and `stat` requests instead of the default.
+    pub fn with_retry_policy(self, policy: RetryPolicy) -> Self {
+        self.set_retry_policy(policy);
+        self
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.retry.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn remember_site(&self, site: &Url) {
+        *self.root_site.lock().unwrap_or_else(|p| p.into_inner()) = Some(site.clone());
     }
 
     /// Like [`ClassicRemote::new`], but every request goes to `origin` (scheme, host and port)
@@ -308,20 +404,23 @@ impl ClassicRemote {
 
     /// Map an HTTP response to `Ok` (2xx) or the matching [`Error`].
     fn check(&self, resp: reqwest::Response, context: &str) -> Result<reqwest::Response, Error> {
-        let status = resp.status().as_u16();
         if resp.status().is_success() {
-            // SharePoint answers an expired session with a 200 sign-in page for some endpoints.
-            if is_html(resp.headers()) {
-                return Err(self.auth_expired());
-            }
+            // No content-type heuristics here: `download.aspx` answers 206 with `text/html` on real
+            // tenants. Callers that expect JSON check for a sign-in page themselves (`get_json`).
             return Ok(resp);
         }
+        Err(self.status_error(&resp, context))
+    }
+
+    /// The [`Error`] for a non-success response.
+    fn status_error(&self, resp: &reqwest::Response, context: &str) -> Error {
+        let status = resp.status().as_u16();
         match status {
-            401 | 403 => Err(self.auth_expired()),
-            429 | 503 => Err(Error::Throttled {
+            401 | 403 => self.auth_expired(),
+            429 | 503 => Error::Throttled {
                 retry_after: parse_retry_after(resp.headers(), OffsetDateTime::now_utc()),
-            }),
-            404 => Err(Error::NotFound(context.to_string())),
+            },
+            404 => Error::NotFound(context.to_string()),
             300..=399 => {
                 let to_login = resp
                     .headers()
@@ -330,28 +429,41 @@ impl ClassicRemote {
                     .and_then(|l| resp.url().join(l).ok())
                     .is_some_and(|u| is_login_host(&u));
                 if to_login {
-                    Err(self.auth_expired())
+                    self.auth_expired()
                 } else {
-                    Err(Error::Http {
+                    Error::Http {
                         status,
                         context: format!("{context}: unexpected redirect"),
-                    })
+                    }
                 }
             }
-            _ => Err(Error::Http {
+            _ => Error::Http {
                 status,
                 context: context.to_string(),
-            }),
+            },
         }
     }
 
+    /// `get_json_once` with the retry policy.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: Url, context: &str) -> Result<T, Error> {
+        retry_with(&self.retry_policy(), || self.get_json_once(url.clone(), context)).await
+    }
+
+    async fn get_json_once<T: serde::de::DeserializeOwned>(
+        &self,
+        url: Url,
+        context: &str,
+    ) -> Result<T, Error> {
         let req = self
             .clients()
             .follow
             .get(self.target(url))
             .header(reqwest::header::ACCEPT, "application/json;odata=nometadata");
         let resp = self.send(req, context).await?;
+        // SharePoint answers an expired session with a 200 sign-in page for some API endpoints.
+        if resp.status().as_u16() == 200 && is_html(resp.headers()) {
+            return Err(self.auth_expired());
+        }
         let body = resp.bytes().await.map_err(net_err)?;
         serde_json::from_slice(&body).map_err(|e| {
             if body.first() == Some(&b'<') {
@@ -385,6 +497,7 @@ impl ClassicRemote {
     async fn root_for(&self, site_url: &Url, server_path: &str) -> Result<RemoteRoot, Error> {
         let url = Self::folder_url(site_url, server_path, "?$select=Name,ServerRelativeUrl")?;
         let info: FolderInfo = self.get_json(url, server_path).await?;
+        self.remember_site(site_url);
         let last = server_path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
         let display_name = info
             .name
@@ -402,14 +515,22 @@ impl ClassicRemote {
     /// Follow a sharing link's redirect chain by hand until it names a folder path.
     async fn resolve_sharing(&self, start: &Url) -> Result<RemoteRoot, Error> {
         let client = self.clients().manual;
+        let policy = self.retry_policy();
         let mut url = self.target(start.clone());
         for _ in 0..MAX_REDIRECTS {
-            let resp = client
-                .get(url.clone())
-                .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
-                .send()
-                .await
-                .map_err(net_err)?;
+            let resp = retry_with(&policy, || async {
+                let resp = client
+                    .get(url.clone())
+                    .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+                    .send()
+                    .await
+                    .map_err(net_err)?;
+                if matches!(resp.status().as_u16(), 429 | 500..=599) {
+                    return Err(self.status_error(&resp, "sharing link"));
+                }
+                Ok(resp)
+            })
+            .await?;
             let status = resp.status().as_u16();
             if (300..400).contains(&status) {
                 let next = resp
@@ -467,9 +588,14 @@ impl ClassicRemote {
     ) -> Result<Vec<T>, Error> {
         let mut out = Vec::new();
         let mut next = Some(first);
+        let policy = self.retry_policy();
         while let Some(url) = next.take() {
-            let _permit = sem.acquire().await.map_err(|_| Error::Cancelled)?;
-            let page: Page<T> = self.get_json(url, context).await?;
+            // The permit is taken per attempt, so a backing-off page does not hold up the others.
+            let page: Page<T> = retry_with(&policy, || async {
+                let _permit = sem.acquire().await.map_err(|_| Error::Cancelled)?;
+                self.get_json_once(url.clone(), context).await
+            })
+            .await?;
             out.extend(page.value);
             if let Some(link) = page.next_link.filter(|l| !l.is_empty()) {
                 let u = Url::parse(&link).map_err(|_| Error::Http {
@@ -521,7 +647,7 @@ fn is_html(headers: &reqwest::header::HeaderMap) -> bool {
 }
 
 /// Microsoft sign-in hosts: a redirect here means the session is no longer accepted.
-fn is_login_host(url: &Url) -> bool {
+pub(crate) fn is_login_host(url: &Url) -> bool {
     url.host_str().is_some_and(|h| {
         let h = h.to_ascii_lowercase();
         h.starts_with("login.")
@@ -668,6 +794,7 @@ struct WalkState<'a> {
 
 impl<'a> WalkState<'a> {
     fn new(remote: &'a ClassicRemote, root: &'a RemoteRoot) -> Self {
+        remote.remember_site(&root.site_url);
         let library_root = split_site(&root.server_relative_path)
             .map(|s| {
                 let site = s.site.trim_end_matches('/');
@@ -852,6 +979,26 @@ impl Remote for ClassicRemote {
         Ok(fresh)
     }
 
+    async fn probe(&self) -> SessionStatus {
+        let site = self.root_site.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(url) = site.as_ref().and_then(auth::probe_url) else {
+            return SessionStatus::Unknown;
+        };
+        let req = self
+            .clients()
+            .follow
+            .get(self.target(url))
+            .header(reqwest::header::ACCEPT, "application/json;odata=nometadata");
+        match tokio::time::timeout(PROBE_TIMEOUT, req.send()).await {
+            Ok(Ok(resp)) => auth::classify_response(&resp),
+            _ => SessionStatus::Unknown,
+        }
+    }
+
+    fn set_retry_policy(&self, policy: RetryPolicy) {
+        *self.retry.write().unwrap_or_else(|p| p.into_inner()) = policy;
+    }
+
     fn replace_session(&self, session: Session) {
         let session = if self.origin.is_some() {
             Self::rebound(&session, &self.host)
@@ -975,6 +1122,68 @@ mod tests {
         let b: Page<FileItem> =
             serde_json::from_str(r#"{"value":[],"@odata.nextLink":"https://x/z"}"#).unwrap();
         assert_eq!(b.next_link.as_deref(), Some("https://x/z"));
+    }
+
+    #[tokio::test]
+    async fn retry_with_backs_off_honours_retry_after_and_is_bounded() {
+        let policy = RetryPolicy {
+            max_attempts: 4,
+            backoff_base: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(2),
+        };
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let n = || calls.load(std::sync::atomic::Ordering::SeqCst);
+        // 429 then 503 then success.
+        let r = retry_with(&policy, || async {
+            match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Err(Error::Throttled {
+                    retry_after: Duration::ZERO,
+                }),
+                1 => Err(Error::Http {
+                    status: 503,
+                    context: String::new(),
+                }),
+                _ => Ok(7),
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(n(), 3);
+        // Persistent failure stops at max_attempts.
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let r: Result<(), Error> = retry_with(&policy, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Network("reset".into()))
+        })
+        .await;
+        assert!(matches!(r, Err(Error::Network(_))));
+        assert_eq!(n(), 4);
+        // AuthExpired and other non-retryable errors are not retried.
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let r: Result<(), Error> = retry_with(&policy, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::AuthExpired { host: "h".into() })
+        })
+        .await;
+        assert!(matches!(r, Err(Error::AuthExpired { .. })));
+        assert_eq!(n(), 1);
+    }
+
+    #[test]
+    fn retry_delay_uses_retry_after_then_jittered_backoff() {
+        let p = RetryPolicy::default();
+        let t = Error::Throttled {
+            retry_after: Duration::from_secs(42),
+        };
+        assert_eq!(p.delay(&t, 1), Duration::from_secs(42));
+        let n = Error::Network(String::new());
+        let d1 = p.delay(&n, 1);
+        assert!(
+            d1 >= Duration::from_millis(500) && d1 <= Duration::from_secs(1),
+            "{d1:?}"
+        );
+        let d9 = p.delay(&n, 9);
+        assert!(d9 <= p.backoff_max && d9 >= p.backoff_max / 2, "{d9:?}");
     }
 
     #[test]

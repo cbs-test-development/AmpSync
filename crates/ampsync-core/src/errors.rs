@@ -41,6 +41,9 @@ pub enum Error {
     /// SQLite / settings / keychain problems.
     #[error("state error: {0}")]
     State(String),
+    /// Another AmpSync process (or job) holds the destination folder's lock.
+    #[error("Another AmpSync download is already using this folder.")]
+    DestinationBusy { path: PathBuf },
     #[error("cancelled")]
     Cancelled,
 }
@@ -106,6 +109,7 @@ mod tests {
         assert!(!Error::NotFound("x".into()).is_retryable());
         assert!(!Error::InvalidLink("x".into()).is_retryable());
         assert!(!Error::Cancelled.is_retryable());
+        assert!(!Error::DestinationBusy { path: "d".into() }.is_retryable());
         assert!(!Error::State("x".into()).is_retryable());
         assert!(
             !Error::RemoteChanged {
@@ -114,6 +118,17 @@ mod tests {
             .is_retryable()
         );
         assert!(!Error::io("p", std::io::Error::other("x")).is_retryable());
+    }
+
+    #[test]
+    fn destination_busy_is_friendly() {
+        let e = Error::DestinationBusy {
+            path: PathBuf::from("/some/where"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "Another AmpSync download is already using this folder."
+        );
     }
 
     #[test]

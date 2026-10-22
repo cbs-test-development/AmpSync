@@ -12,7 +12,7 @@
 //! connection sits behind a mutex, so every write is serialised.
 
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -51,6 +51,45 @@ pub struct FileRecord {
     pub error: Option<String>,
     /// On-disk relative path when sanitising changed it.
     pub local_name: Option<String>,
+}
+
+/// Exclusive advisory lock on `<dest>/.ampsync/lock`, held from planning to the end of a job so
+/// two AmpSync processes (or two jobs) never write into one destination at the same time. The OS
+/// releases it when the value is dropped or the process dies, so a crash never leaves it stuck.
+#[derive(Debug)]
+pub(crate) struct DestLock {
+    _file: std::fs::File,
+    dest: PathBuf,
+}
+
+impl DestLock {
+    /// Take the lock for `dest` (already absolute), or `Error::DestinationBusy` when it is held.
+    pub(crate) fn acquire(dest: &Path) -> Result<DestLock, Error> {
+        let dir = crate::names::long_path(&dest.join(".ampsync"));
+        std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+        let path = dir.join("lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| Error::io(&path, e))?;
+        match file.try_lock() {
+            Ok(()) => Ok(DestLock {
+                _file: file,
+                dest: dest.to_path_buf(),
+            }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Error::DestinationBusy {
+                path: dest.to_path_buf(),
+            }),
+            Err(std::fs::TryLockError::Error(e)) => Err(Error::io(&path, e)),
+        }
+    }
+
+    pub(crate) fn dest(&self) -> &Path {
+        &self.dest
+    }
 }
 
 /// Handle to a job's database.

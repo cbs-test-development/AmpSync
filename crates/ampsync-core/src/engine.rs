@@ -13,8 +13,16 @@
 //!   `Event::FileFailed`.
 //! - Throttling: `Retry-After` on 429/503 pauses all lanes (`Event::Throttled`); otherwise
 //!   exponential backoff with jitter, up to `max_retries` per range.
-//! - `Error::AuthExpired` pauses the job (never fails it): emit `Event::AuthExpired` then
-//!   `Event::Paused`, and wait for `JobHandle::replace_session` / `resume` / `cancel`.
+//! - `Error::AuthExpired` on a file first asks `Remote::probe` whether the session itself is still
+//!   good. If it is, the server refused just that file: the file fails (`FileFailed`, not
+//!   retried) and the job carries on. Otherwise the job pauses (never fails): emit
+//!   `Event::AuthExpired` then `Event::Paused`, and wait for `JobHandle::replace_session` /
+//!   `resume` / `cancel`. A file refused again right after a new session arrived fails instead
+//!   of pausing a second time.
+//! - Only one AmpSync process may use a destination: `<dest>/.ampsync/lock` is held from `plan`
+//!   to the end of the job (`Error::DestinationBusy` otherwise).
+//! - Before the rename, the bytes recorded as downloaded must add up to the file size; if they do
+//!   not, the part file is reset and the file retried once.
 //! - Windows: use `\\?\` long paths ([`crate::names::long_path`]); replace illegal characters with
 //!   [`crate::names::sanitize`] and record the mapping in `state.db`.
 //! - Nothing local is deleted unless `JobSpec::prune`.
@@ -33,11 +41,12 @@ use tokio::task::JoinHandle;
 
 use crate::Error;
 use crate::auth::Session;
+use crate::auth::SessionStatus;
 use crate::hash::QuickXorHash;
 use crate::names;
 use crate::plan::{self, Filters, JobSpec, Plan, PlannedAction, RelPath};
-use crate::remote::{Remote, RemoteFile, RemoteHash};
-use crate::state::{FileRecord, FileStatus, StateDb};
+use crate::remote::{Remote, RemoteFile, RemoteHash, RetryPolicy};
+use crate::state::{DestLock, FileRecord, FileStatus, StateDb};
 
 /// Engine tuning plus application preferences; see [`crate::settings::Settings`].
 pub use crate::settings::Settings;
@@ -88,10 +97,14 @@ fn as_millis<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// The job starts. `skipped` / `skipped_bytes` count the files left alone because they are
+    /// already present and unchanged; there is deliberately no per-file event for those, so a
+    /// 100k-file tree cannot flood the event channel.
     Planned {
         files: u64,
         bytes: u64,
         skipped: u64,
+        skipped_bytes: u64,
     },
     FileStarted {
         rel_path: RelPath,
@@ -114,6 +127,8 @@ pub enum Event {
         rel_path: RelPath,
         by: VerifiedBy,
     },
+    /// A file skipped while the job runs. Files skipped at plan time are only counted in
+    /// `Planned`, never announced one by one.
     FileSkipped {
         rel_path: RelPath,
     },
@@ -159,6 +174,8 @@ pub struct Tuning {
     pub rename_delay: Duration,
     /// Bytes buffered per range before a positional write. Default 1 MiB.
     pub write_buffer: usize,
+    /// Retry policy for listing and metadata requests (`Remote::set_retry_policy`).
+    pub retry: RetryPolicy,
 }
 
 impl Default for Tuning {
@@ -170,6 +187,7 @@ impl Default for Tuning {
             rename_attempts: 10,
             rename_delay: Duration::from_millis(100),
             write_buffer: 1024 * 1024,
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -184,11 +202,17 @@ pub struct Engine<R: Remote> {
 impl<R: Remote + 'static> Engine<R> {
     /// `settings` is passed through [`Settings::sanitized`].
     pub fn new(remote: Arc<R>, settings: Settings) -> Self {
-        Self::with_tuning(remote, settings, Tuning::default())
+        Engine {
+            remote,
+            settings: settings.sanitized(),
+            tuning: Tuning::default(),
+        }
     }
 
-    /// Like [`Engine::new`] with explicit [`Tuning`] (used by tests to make backoff fast).
+    /// Like [`Engine::new`] with explicit [`Tuning`] (used by tests to make backoff fast). The
+    /// tuning's retry policy is handed to the remote.
     pub fn with_tuning(remote: Arc<R>, settings: Settings, tuning: Tuning) -> Self {
+        remote.set_retry_policy(tuning.retry.clone());
         Engine {
             remote,
             settings: settings.sanitized(),
@@ -260,6 +284,8 @@ impl JobHandle {
     /// Swap the cookies (re-sign-in), via `Remote::replace_session`, then resume.
     pub fn replace_session(&self, s: Session) {
         self.remote.replace_session(s);
+        self.ctl.session_unproven.store(true, Ordering::SeqCst);
+        self.ctl.session_gen.fetch_add(1, Ordering::SeqCst);
         self.ctl.resume();
     }
 
@@ -295,6 +321,11 @@ struct Control {
     paused: watch::Sender<bool>,
     cancelled: watch::Sender<bool>,
     throttle_until: Mutex<Option<Instant>>,
+    /// Bumped by every `replace_session`, so a request that started on the old cookies and fails
+    /// with `AuthExpired` afterwards is simply retried instead of pausing the job again.
+    session_gen: AtomicU64,
+    /// A new session arrived and no request has succeeded with it yet.
+    session_unproven: AtomicBool,
 }
 
 impl Control {
@@ -304,7 +335,13 @@ impl Control {
             paused: watch::channel(false).0,
             cancelled: watch::channel(false).0,
             throttle_until: Mutex::new(None),
+            session_gen: AtomicU64::new(0),
+            session_unproven: AtomicBool::new(false),
         }
+    }
+
+    fn is_paused(&self) -> bool {
+        *self.paused.borrow()
     }
 
     fn emit(&self, e: Event) {
@@ -458,6 +495,8 @@ struct FileCtx {
     /// Record each completed range in `state.db` (only worth it for large files).
     record_ranges: bool,
     started: AtomicBool,
+    /// Bytes of ranges that completed in this run (the backstop for files that record no ranges).
+    written: AtomicU64,
     failed: Mutex<Option<Error>>,
     failed_flag: AtomicBool,
 }
@@ -521,6 +560,14 @@ struct Job {
     results: Mutex<Results>,
 }
 
+/// The server refused one file although the session as a whole is fine.
+fn refused(rel: &RelPath) -> Error {
+    Error::Http {
+        status: 403,
+        context: format!("{rel}: SharePoint refused access to this file"),
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -554,6 +601,14 @@ async fn run_job_inner(
 ) -> Result<Summary, Error> {
     let started = Instant::now();
     let dest = plan::absolute_dest(&spec.dest);
+    // The plan normally carries the destination lock; otherwise take it now.
+    let held = match plan.lock.take() {
+        Some(l) if l.dest() == dest => l,
+        _ => {
+            let dest = dest.clone();
+            blocking(move || DestLock::acquire(&dest)).await?
+        }
+    };
     let state = {
         let dest = dest.clone();
         blocking(move || StateDb::open(&dest)).await?
@@ -568,14 +623,13 @@ async fn run_job_inner(
         files: totals.files,
         bytes: totals.bytes,
         skipped: totals.skipped,
+        skipped_bytes: totals.skipped_bytes,
     });
 
     let mut queue = VecDeque::new();
     for item in &plan.items {
         match item.action {
-            PlannedAction::SkipUnchanged => ctl.emit(Event::FileSkipped {
-                rel_path: item.file.rel_path.clone(),
-            }),
+            PlannedAction::SkipUnchanged => {}
             PlannedAction::Download | PlannedAction::Resume { .. } => queue.push_back(Queued {
                 file: item.file.clone(),
                 attempt: 0,
@@ -639,6 +693,9 @@ async fn run_job_inner(
     }
 
     job.emit_progress(&mut RateTracker::new());
+    // Release the folder before announcing the end, so a caller that starts the next job on
+    // `Finished` never trips over this job's lock.
+    drop(held);
     let summary = Summary {
         downloaded,
         skipped: totals.skipped,
@@ -746,26 +803,55 @@ impl Job {
         blocking(move || f(&state)).await
     }
 
-    /// Run `op` with the standard error policy: wait while paused or throttled, pause the job on
-    /// an expired session (retrying afterwards, uncounted), honour `Retry-After`, back off
-    /// exponentially with jitter on other retryable errors (at most `max_retries` times).
+    /// Run `op` with the standard error policy: wait while paused or throttled, honour
+    /// `Retry-After`, back off exponentially with jitter on other retryable errors (at most
+    /// `max_retries` times). On `AuthExpired` the remote is probed: a still-valid session means
+    /// this one file was refused (`Http 403`, the file fails); otherwise the job pauses and the
+    /// request is retried afterwards, once. A second `AuthExpired` for the same request after a
+    /// new session arrived also fails the file instead of pausing again.
     async fn retrying<T, Fut>(&self, rel: &RelPath, mut op: impl FnMut() -> Fut) -> Result<T, Error>
     where
         Fut: Future<Output = Result<T, Error>>,
     {
         let mut attempt = 0u32;
         let mut throttles = 0u32;
+        let mut auth_pauses = 0u32;
         let mut cancelled = self.ctl.cancelled.subscribe();
         loop {
             self.ctl.gate().await?;
+            let generation = self.ctl.session_gen.load(Ordering::SeqCst);
             let outcome = tokio::select! {
                 r = op() => r,
                 _ = cancelled.wait_for(|c| *c) => Err(Error::Cancelled),
             };
             match outcome {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    self.ctl.session_unproven.store(false, Ordering::SeqCst);
+                    return Ok(v);
+                }
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
-                Err(Error::AuthExpired { host }) => self.ctl.auth_expired(&host),
+                Err(Error::AuthExpired { host }) => {
+                    let stale = || self.ctl.session_gen.load(Ordering::SeqCst) != generation;
+                    // Refused again right after a new session arrived: this file is refused, the
+                    // job must not pause a second time.
+                    if (auth_pauses > 0 || self.ctl.session_unproven.load(Ordering::SeqCst)) && !stale() {
+                        return Err(refused(rel));
+                    }
+                    if auth_pauses == 0
+                        && !stale()
+                        && !self.ctl.is_paused()
+                        && self.probe().await == SessionStatus::Valid
+                    {
+                        return Err(refused(rel));
+                    }
+                    // Sent with the old cookies and a new session arrived meanwhile (also while
+                    // probing): try again without pausing. A refusal with the new cookies then
+                    // means the file itself is refused.
+                    auth_pauses += 1;
+                    if !stale() {
+                        self.ctl.auth_expired(&host);
+                    }
+                }
                 Err(Error::Throttled { retry_after }) => {
                     throttles += 1;
                     if throttles > MAX_THROTTLES_PER_REQUEST {
@@ -784,6 +870,15 @@ impl Job {
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// Ask the remote whether the session is still accepted (cancellable).
+    async fn probe(&self) -> SessionStatus {
+        let mut cancelled = self.ctl.cancelled.subscribe();
+        tokio::select! {
+            s = self.remote.probe() => s,
+            _ = cancelled.wait_for(|c| *c) => SessionStatus::Unknown,
         }
     }
 
@@ -989,6 +1084,7 @@ fn prepare_file(job: &Job, file: RemoteFile, attempt: u8) -> Result<FileCtx, Err
         pending: Mutex::new(ranges),
         record_ranges: large,
         started: AtomicBool::new(false),
+        written: AtomicU64::new(0),
         failed: Mutex::new(None),
         failed_flag: AtomicBool::new(false),
     })
@@ -1003,6 +1099,9 @@ async fn process_range(job: &Arc<Job>, lane: usize, ctx: Arc<FileCtx>, range: Ra
     let result = job
         .retrying(&ctx.file.rel_path, || fetch_range(job, lane, &ctx, range.clone()))
         .await;
+    if result.is_ok() {
+        ctx.written.fetch_add(range.end - range.start, Ordering::SeqCst);
+    }
     let result = match result {
         Ok(()) if ctx.record_ranges => {
             let (rel, r) = (ctx.file.rel_path.clone(), range.clone());
@@ -1282,6 +1381,23 @@ async fn finalize(job: &Arc<Job>, ctx: &Arc<FileCtx>) -> Result<VerifiedBy, Fina
         }
     };
 
+    // Backstop: what was recorded as downloaded must add up to the whole file.
+    let covered = if ctx.record_ranges {
+        let rel = ctx.file.rel_path.clone();
+        let ranges = job.db(move |db| db.completed_ranges(&rel)).await?;
+        covered_bytes(&ranges, size)
+    } else {
+        ctx.written.load(Ordering::SeqCst)
+    };
+    if covered != size {
+        return Err(Error::Integrity {
+            rel_path: ctx.file.rel_path.clone(),
+            expected: format!("{size} bytes downloaded"),
+            actual: format!("{covered} bytes downloaded"),
+        }
+        .into());
+    }
+
     // Close our handle, set the remote modification time, and rename over the destination.
     let taken = lock(&ctx.handle).take();
     let (part, dest, modified) = (ctx.part_path.clone(), ctx.final_path.clone(), ctx.file.modified);
@@ -1295,6 +1411,25 @@ async fn finalize(job: &Arc<Job>, ctx: &Arc<FileCtx>) -> Result<VerifiedBy, Fina
     })
     .await?;
     Ok(by)
+}
+
+/// Total length of the union of `ranges`, clipped to `0..size`.
+fn covered_bytes(ranges: &[Range<u64>], size: u64) -> u64 {
+    let mut sorted: Vec<Range<u64>> = ranges
+        .iter()
+        .filter(|r| r.start < r.end && r.start < size)
+        .map(|r| r.start..r.end.min(size))
+        .collect();
+    sorted.sort_by_key(|r| r.start);
+    let (mut total, mut cursor) = (0u64, 0u64);
+    for r in sorted {
+        let start = r.start.max(cursor);
+        if r.end > start {
+            total += r.end - start;
+            cursor = r.end;
+        }
+    }
+    total
 }
 
 fn verify_quickxor(path: &Path, expected: &str, rel: &RelPath) -> Result<(), Error> {
@@ -1456,6 +1591,30 @@ mod tests {
             "{wait:?}"
         );
         assert_eq!(Limiter::new(None).reserve(1 << 30), Duration::ZERO);
+    }
+
+    #[test]
+    fn covered_bytes_is_the_clipped_union() {
+        assert_eq!(covered_bytes(&[0..10, 10..20], 20), 20);
+        assert_eq!(covered_bytes(&[0..10, 12..20], 20), 18, "a gap is not covered");
+        assert_eq!(covered_bytes(&[0..15, 10..20], 20), 20, "overlaps count once");
+        assert_eq!(covered_bytes(&[0..30, 0..1], 20), 20, "clipped to the file size");
+        assert_eq!(covered_bytes(&[], 20), 0);
+        assert_eq!(covered_bytes(&[5..5, 25..30], 20), 0);
+    }
+
+    #[test]
+    fn planned_event_carries_skipped_bytes() {
+        let e = Event::Planned {
+            files: 1,
+            bytes: 2,
+            skipped: 3,
+            skipped_bytes: 4,
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"type":"planned","files":1,"bytes":2,"skipped":3,"skipped_bytes":4}"#
+        );
     }
 
     #[test]
