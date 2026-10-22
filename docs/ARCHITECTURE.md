@@ -21,6 +21,7 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D15 | The webview sign-in uses a persistent AmpSync-only browser profile (per-user data dir), separate from the user's browsers. On launch the app silently checks every saved session (hidden webview load of the site); if Microsoft needs a password or MFA, the sign-in window opens right then, before any download starts. Mid-job expiry also tries a silent refresh first and shows the window only if interaction is required. On Windows, WebView2 SSO with the OS work account is enabled, so managed machines sign in with no prompt. Password saving is a Settings toggle, off by default. "Sign out" deletes the profile and the stored session. | Personal machines otherwise hit MFA on every sign-in; prompts should come at launch, not halfway through an 80 GB job. |
 | D16 | AmpSync never reads, signs in to, or syncs with the user's existing browser profiles (Edge, Chrome, Teams, …). The webview profile lives only in AmpSync's own data dir. The Edge/Chrome fallback always launches a fresh AmpSync-owned `--user-data-dir` with `--disable-sync` and browser implicit sign-in disabled, and only the SharePoint web session is captured. No code path imports cookies or passwords from a browser profile. | User requirement; browser profiles hold personal and work identities that AmpSync must not touch. |
 | D17 | Release builds (installers, portable exe, AppImage, .deb, CLI binaries) run only when a `v*` tag is pushed, and publish a GitHub Release for that tag. Pushes to `main` build nothing. Pull requests run only fmt + clippy + tests on Windows and Ubuntu. `v1.0.0` is tagged after the user has tested on a personal and a work Windows machine. | Avoids burning CI and publishing artifacts on every push. |
+| D18 | Probe result (real tenant, 2026-10-22): with cookies, `/_api/v2.0/*` returns 403 and `SP.OAuth.Token/Acquire` returns 400, so no QuickXorHash. Classic REST listing works; `/_layouts/15/download.aspx?UniqueId=` honours Range (206); `GetFileByServerRelativePath/$value` ignores Range. v1 ships `ClassicRemote` only; verification is exact size + eTag unchanged (re-`stat` after download). `V2Remote` stays a documented extension point, not implemented. | Measured, not assumed. |
 | D14 | Commits and PRs never credit Claude (no co-author trailers or "generated with" lines). | Public contributor list must show humans only. |
 | D12 | Contributors list is generated from the GitHub API at build time; repo slug comes from `AMPSYNC_REPO` / `GITHUB_REPOSITORY`, never hardcoded. | Forks show their own contributors; works offline. |
 
@@ -84,13 +85,23 @@ pub struct MemoryStore;         // tests
 pub trait SignIn: Send + Sync {
     async fn sign_in(&self, host: &str, start_url: &Url) -> Result<Session, Error>;
 }
+// Webview sign-in completion (learned from the probe): do NOT rely on page-load events alone;
+// SharePoint keeps navigating client-side after sign-in, so a check on "page finished" can run
+// before FedAuth exists and never run again. Poll the webview cookie store every ~750 ms from the
+// event-loop thread (never from a WebView2 callback: deadlock) and finish as soon as FedAuth for
+// the tenant host and rtFa are both present, then close the window automatically. Also pump the
+// event loop briefly after dropping the window so Windows destroys it (else "Not responding").
 pub struct BrowserSignIn { pub kind: BrowserKind }
 pub struct PastedSignIn { pub cookie_header: String }
 ```
 
 ### `remote` — talking to SharePoint
 
-One trait, two implementations. Which one is the default is decided by the probe results (`spikes/probe`).
+One trait. v1 implements `ClassicRemote` only (D18). Facts from the probe it must respect:
+- Sharing links resolve by following the 302 (cookie jar on) to `…/_layouts/15/onedrive.aspx?id=<server-relative folder path>` (OneDrive personal sites: `/personal/<user>/Documents/...`); team sites look like `/sites/<Site>/<Library>/...`.
+- Listing: `GET {site}/_api/web/GetFolderByServerRelativePath(decodedurl='{path}')/Files?$select=Name,Length,TimeLastModified,ETag,UniqueId,ServerRelativeUrl` and `/Folders?$select=Name,ServerRelativeUrl,UniqueId,ItemCount`, header `Accept: application/json;odata=nometadata`. `Length` arrives as a string. Folder paths must be percent-encoded with `'` doubled.
+- Download: `GET {site}/_layouts/15/download.aspx?UniqueId={guid}` with `Range: bytes=a-b` → 206 with `Content-Range`. Always check the status is 206 and Content-Range matches before writing; a 200 means the server ignored Range.
+- Auth expiry shows up as 401/403 or a redirect to `login.microsoftonline.com`; the client must not follow redirects off the tenant host for API calls.
 
 ```rust
 pub struct RemoteRoot { pub site_url: Url, pub drive_id: Option<String>, pub item_id: Option<String>,
@@ -115,9 +126,11 @@ pub trait Remote: Send + Sync {
     async fn read_range(&self, file: &RemoteFile, range: Range<u64>) -> Result<BoxStream<'static, Result<Bytes, Error>>, Error>;
     /// Re-fetch metadata of one file (used to confirm the eTag didn't change).
     async fn stat(&self, file: &RemoteFile) -> Result<RemoteFile, Error>;
+    /// Swap cookies after a re-sign-in (default no-op). Used by JobHandle::replace_session.
+    fn replace_session(&self, session: Session) {}
 }
-pub struct V2Remote;       // /_api/v2.0 (OneDrive-style API hosted on SharePoint)
-pub struct ClassicRemote;  // /_api/web + /_layouts/15/download.aspx
+pub struct ClassicRemote;  // /_api/web + /_layouts/15/download.aspx  (v1)
+// V2Remote (/_api/v2.x) is not implemented: it needs a bearer token we cannot get from cookies (D18).
 pub fn http_client(session: &Session) -> reqwest::Client; // cookie jar, UA, timeouts
 ```
 
@@ -212,6 +225,10 @@ Engine rules:
 - Each range is written with positional writes into the preallocated `.ampsync-part`; completed ranges are recorded in `state.db` so a restart only fetches missing ranges.
 - After the last byte: verify hash if present, else size + `stat()` eTag unchanged. Then rename over the destination. On mismatch: delete the part file and retry the file once, then `FileFailed`.
 - Windows: use `\\?\` long paths; replace characters illegal on Windows (`<>:"|?*` and trailing dots/spaces) with a visible substitute and record the mapping in `state.db`.
+
+### Scaffold notes (as built)
+
+The code in `crates/ampsync-core` is now the source of truth for exact types. Additions beyond this doc: `ClassicRemote::new(&Session)`, `MemoryStore::new()`, one flat `settings::Settings` (engine + app fields, re-exported as `engine::Settings`), `PlannedFile`, `Totals`, `Summary`, `FileFailure`, `state::{FileRecord, FileStatus}`. `Event` serializes with a snake_case `type` tag and durations as `*_ms`. `link::parse` rejects site-only URLs with no library.
 
 ## `ampsync-cli`
 

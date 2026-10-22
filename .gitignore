@@ -222,3 +222,8 @@ __marimo__/
 # AmpSync probe output (never commit reports or cookie files)
 probe-report*.json
 cookie*.txt
+
+# AmpSync build output and desktop frontend
+/target
+apps/desktop/node_modules
+apps/desktop/dist

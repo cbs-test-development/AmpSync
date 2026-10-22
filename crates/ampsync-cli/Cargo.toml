@@ -1,0 +1,27 @@
+[package]
+name = "ampsync-cli"
+description = "AmpSync command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ampsync"
+path = "src/main.rs"
+
+[features]
+default = ["webview"]
+# Embedded-webview sign-in. Disable (`--no-default-features`) for headless builds.
+webview = ["dep:wry", "dep:tao", "dep:webview2-com", "dep:windows-core"]
+
+[dependencies]
+ampsync-core.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde_json.workspace = true
+tokio.workspace = true
+wry = { version = "0.57", optional = true }
+tao = { version = "0.37", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = { version = "0.39", optional = true }
+windows-core = { version = "0.62", optional = true }
