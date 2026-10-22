@@ -1,34 +1,347 @@
 //! Subcommand implementations. Each returns the process exit code (see `exit`).
 
-use crate::cli::{GetArgs, LoginArgs, LogoutArgs, LsArgs};
+use std::future::Future;
+use std::io::IsTerminal;
+
+use ampsync_core::Error;
+use ampsync_core::auth::{KeyringStore, Session, SessionStore, SignInMethod};
+use ampsync_core::link::{self, LinkKind, ParsedLink};
+use ampsync_core::remote::{ClassicRemote, Remote, RemoteEntry};
+use ampsync_core::settings::Settings;
+use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressDrawTarget};
+use time::macros::format_description;
+use url::Url;
+
+use crate::cli::{LoginArgs, LogoutArgs, LsArgs, Method};
+use crate::exit::{self, Failure};
+use crate::session_check::{SessionStatus, check};
+use crate::signin::{self, Request};
+use crate::{paths, tree};
+
+/// Run a command body and turn its failure into a printed message and an exit code.
+pub async fn run(body: impl Future<Output = Result<u8, Failure>>) -> u8 {
+    match body.await {
+        Ok(code) => code,
+        Err(f) => {
+            eprintln!("error: {}", f.message);
+            f.code
+        }
+    }
+}
+
+/// Settings from `settings.toml`; a broken file warns and falls back to the defaults.
+pub fn load_settings() -> Settings {
+    match Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: {}; using default settings.", exit::describe(&e, ""));
+            Settings::default()
+        }
+    }
+}
+
+pub fn parse_link(input: &str) -> Result<ParsedLink, Failure> {
+    link::parse(input).map_err(|e| Failure::from_core(&e, input))
+}
+
+/// The page to open for sign-in: the pasted link itself, or the site that holds the folder.
+pub fn start_url(link: &ParsedLink) -> Url {
+    match &link.kind {
+        LinkKind::Sharing { url } => url.clone(),
+        LinkKind::Folder { site_url, .. } => site_url.clone(),
+    }
+}
+
+pub fn require_session(store: &dyn SessionStore, host: &str, link_text: &str) -> Result<Session, Failure> {
+    match store.load(host) {
+        Ok(Some(s)) => Ok(s),
+        Ok(None) => Err(Failure::error(format!(
+            "You're not signed in to {host}. Run `ampsync login \"{link_text}\"` first."
+        ))),
+        Err(e) => Err(Failure::from_core(&e, link_text)),
+    }
+}
+
+/// `https://Host/x` or `Host` -> `host`.
+pub fn normalize_host(input: &str) -> String {
+    let t = input.trim();
+    let host = if t.contains("://") {
+        Url::parse(t)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| t.to_string())
+    } else {
+        t.trim_end_matches('/').to_string()
+    };
+    host.to_ascii_lowercase()
+}
+
+pub fn method_label(m: &SignInMethod) -> &'static str {
+    match m {
+        SignInMethod::Webview => "webview",
+        SignInMethod::Browser { kind } => match kind {
+            ampsync_core::auth::BrowserKind::Edge => "edge",
+            ampsync_core::auth::BrowserKind::Chrome => "chrome",
+        },
+        SignInMethod::Pasted => "pasted",
+    }
+}
 
 /// `ampsync login`: obtain a session (webview, then Edge/Chrome, then paste unless `--method`
 /// says otherwise) and save it to the keychain.
-#[allow(unused_variables)]
 pub async fn login(args: LoginArgs) -> u8 {
-    todo!()
+    run(async {
+        let link = parse_link(&args.url)?;
+        let settings = load_settings();
+        let method = args
+            .method
+            .or_else(|| args.cookie_file.is_some().then_some(Method::Paste));
+        let start = start_url(&link);
+        let session = signin::obtain(&Request {
+            host: &link.host,
+            start_url: &start,
+            method,
+            cookie_file: args.cookie_file.as_deref(),
+            settings: &settings,
+        })
+        .await?;
+        match check(&session).await {
+            SessionStatus::Valid => {}
+            SessionStatus::Expired => {
+                return Err(Failure::error(format!(
+                    "SharePoint did not accept that sign-in for {}, so nothing was saved. Try again.",
+                    link.host
+                )));
+            }
+            SessionStatus::Unknown(why) => {
+                eprintln!("warning: couldn't confirm the sign-in works ({why}); saving it anyway.");
+            }
+        }
+        KeyringStore::new()
+            .save(&session)
+            .map_err(|e| Failure::from_core(&e, &args.url))?;
+        println!(
+            "Signed in to {} ({}).",
+            session.host,
+            method_label(&session.method)
+        );
+        Ok(exit::OK)
+    })
+    .await
 }
 
-/// `ampsync logout <host>`.
-#[allow(unused_variables)]
+/// `ampsync logout <host>`: forget the stored session and the sign-in window's profile (D15).
 pub async fn logout(args: LogoutArgs) -> u8 {
-    todo!()
+    run(async {
+        let host = normalize_host(&args.host);
+        let store = KeyringStore::new();
+        let had = store
+            .hosts()
+            .map(|h| h.iter().any(|x| x.eq_ignore_ascii_case(&host)))
+            .unwrap_or(false);
+        store.delete(&host).map_err(|e| Failure::from_core(&e, &host))?;
+        if had {
+            println!("Signed out of {host}.");
+        } else {
+            println!("There was no saved sign-in for {host}.");
+        }
+        match paths::delete_webview_profile() {
+            Ok(true) => println!("Deleted the sign-in window's saved browser data."),
+            Ok(false) => {}
+            Err(e) => eprintln!("warning: couldn't delete the sign-in window's browser data: {e}"),
+        }
+        Ok(exit::OK)
+    })
+    .await
 }
 
-/// `ampsync sessions`: print stored hosts.
+/// One row of the `sessions` table.
+pub type Row = [String; 4];
+
+/// Left-aligned columns separated by two spaces, with a header.
+pub fn render_table(header: [&str; 4], rows: &[Row]) -> Vec<String> {
+    let mut widths = header.map(|h| h.chars().count());
+    for r in rows {
+        for (w, c) in widths.iter_mut().zip(r) {
+            *w = (*w).max(c.chars().count());
+        }
+    }
+    let line = |cells: [&str; 4]| {
+        cells
+            .iter()
+            .zip(widths)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string()
+    };
+    let mut out = vec![line(header)];
+    out.extend(rows.iter().map(|r| line([&r[0], &r[1], &r[2], &r[3]])));
+    out
+}
+
+fn captured_text(s: &Session) -> String {
+    s.captured_at
+        .to_offset(time::UtcOffset::UTC)
+        .format(format_description!("[year]-[month]-[day] [hour]:[minute] UTC"))
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+/// `ampsync sessions`: host, method, captured time, and whether the server still accepts it.
 pub async fn sessions() -> u8 {
-    todo!()
+    run(async {
+        let store = KeyringStore::new();
+        let hosts = store.hosts().map_err(|e| Failure::from_core(&e, ""))?;
+        if hosts.is_empty() {
+            println!("No saved sign-ins. Run `ampsync login <link>` to add one.");
+            return Ok(exit::OK);
+        }
+        let mut loaded = Vec::new();
+        for h in &hosts {
+            match store.load(h) {
+                Ok(Some(s)) => loaded.push(s),
+                Ok(None) => {}
+                Err(e) => eprintln!(
+                    "warning: couldn't read the sign-in for {h}: {}",
+                    exit::describe(&e, "")
+                ),
+            }
+        }
+        let statuses = futures::future::join_all(loaded.iter().map(check)).await;
+        let rows: Vec<Row> = loaded
+            .iter()
+            .zip(&statuses)
+            .map(|(s, st)| {
+                [
+                    s.host.clone(),
+                    method_label(&s.method).to_string(),
+                    captured_text(s),
+                    st.label().to_string(),
+                ]
+            })
+            .collect();
+        for l in render_table(["HOST", "METHOD", "SIGNED IN", "STATUS"], &rows) {
+            println!("{l}");
+        }
+        if statuses.contains(&SessionStatus::Expired) {
+            eprintln!("Expired sign-ins can be renewed with `ampsync login <link>`.");
+        }
+        Ok(exit::OK)
+    })
+    .await
 }
 
 /// `ampsync ls <url> [--depth N]`.
-#[allow(unused_variables)]
 pub async fn ls(args: LsArgs) -> u8 {
-    todo!()
+    run(async {
+        let link = parse_link(&args.url)?;
+        let store = KeyringStore::new();
+        let session = require_session(&store, &link.host, &args.url)?;
+        let remote = ClassicRemote::new(&session);
+        let fail = |e: Error| Failure::from_core(&e, &args.url);
+
+        let spinner = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+        spinner.enable_steady_tick(std::time::Duration::from_millis(120));
+        spinner.set_message("Listing...");
+        let root = remote.resolve(&link).await.map_err(fail)?;
+
+        let mut items: Vec<tree::Item> = Vec::new();
+        let mut stream = remote.walk(&root);
+        while let Some(entry) = stream.next().await {
+            match entry.map_err(fail)? {
+                RemoteEntry::File(f) => items.push(tree::Item {
+                    path: f.rel_path.to_string(),
+                    size: Some(f.size),
+                }),
+                RemoteEntry::Folder { rel_path } => items.push(tree::Item {
+                    path: rel_path.to_string(),
+                    size: None,
+                }),
+            }
+            if items.len().is_multiple_of(200) {
+                spinner.set_message(format!("Listing... {} items", items.len()));
+            }
+        }
+        spinner.finish_and_clear();
+
+        let (lines, totals) = tree::render(&root.display_name, &items, args.depth.unwrap_or(1));
+        for l in lines {
+            println!("{l}");
+        }
+        println!("{}", tree::totals_line(&totals));
+        Ok(exit::OK)
+    })
+    .await
 }
 
-/// `ampsync get <url> <dest> ...`: plan, confirm unless `--yes`, download. Exit codes: 0 ok,
-/// 3 auth expired (state kept; rerun resumes), 4 some files failed.
-#[allow(unused_variables)]
-pub async fn get(args: GetArgs) -> u8 {
-    todo!()
+pub fn stdin_is_terminal() -> bool {
+    std::io::stdin().is_terminal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ampsync_core::auth::BrowserKind;
+
+    #[test]
+    fn hosts_are_normalised() {
+        assert_eq!(normalize_host("Contoso.SharePoint.com"), "contoso.sharepoint.com");
+        assert_eq!(
+            normalize_host("  contoso.sharepoint.com/ "),
+            "contoso.sharepoint.com"
+        );
+        assert_eq!(
+            normalize_host("https://Contoso.sharepoint.com/sites/a?x=1"),
+            "contoso.sharepoint.com"
+        );
+    }
+
+    #[test]
+    fn method_labels() {
+        assert_eq!(method_label(&SignInMethod::Webview), "webview");
+        assert_eq!(method_label(&SignInMethod::Pasted), "pasted");
+        assert_eq!(
+            method_label(&SignInMethod::Browser {
+                kind: BrowserKind::Chrome
+            }),
+            "chrome"
+        );
+        assert_eq!(
+            method_label(&SignInMethod::Browser {
+                kind: BrowserKind::Edge
+            }),
+            "edge"
+        );
+    }
+
+    #[test]
+    fn table_aligns_columns() {
+        let rows = vec![
+            [
+                "a.sharepoint.com".into(),
+                "webview".into(),
+                "2026-10-22 10:00 UTC".into(),
+                "valid".into(),
+            ],
+            [
+                "bb.sharepoint.com".into(),
+                "pasted".into(),
+                "2026-10-21 09:30 UTC".into(),
+                "expired".into(),
+            ],
+        ];
+        let t = render_table(["HOST", "METHOD", "SIGNED IN", "STATUS"], &rows);
+        assert_eq!(t.len(), 3);
+        assert!(t[0].starts_with("HOST "));
+        let col = |l: &str| {
+            l.find("webview")
+                .or_else(|| l.find("pasted"))
+                .or_else(|| l.find("METHOD"))
+        };
+        assert_eq!(col(&t[0]), col(&t[1]));
+        assert_eq!(col(&t[1]), col(&t[2]));
+        assert!(!t[1].ends_with(' '));
+    }
 }

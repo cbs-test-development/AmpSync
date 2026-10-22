@@ -15,6 +15,8 @@ use url::Url;
 
 use crate::Error;
 
+mod browser;
+
 /// How a session was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -121,19 +123,195 @@ impl KeyringStore {
     }
 }
 
-#[allow(unused_variables)]
+/// Keychain service name for every AmpSync entry.
+const KEYRING_SERVICE: &str = "AmpSync";
+/// Account name of the host index entry. Hosts are DNS names, so this can never collide.
+const INDEX_ACCOUNT: &str = "__hosts__";
+/// Largest piece of a session stored in one keychain entry. Windows Credential Manager limits a
+/// credential blob to 2560 bytes and the keyring crate stores text as UTF-16, so 1000 bytes of
+/// UTF-8 (at most 1000 UTF-16 units = 2000 bytes) always fits. A SharePoint session (FedAuth +
+/// rtFa) is routinely larger than one blob, so it is split over `host`, `host#1`, `host#2`, ...
+const CHUNK_BYTES: usize = 1000;
+
+/// A flat key/value secret store: the seam between the session logic and the OS keychain.
+trait SecretBackend {
+    fn get(&self, account: &str) -> Result<Option<String>, Error>;
+    fn set(&self, account: &str, value: &str) -> Result<(), Error>;
+    /// Not an error if the entry does not exist.
+    fn remove(&self, account: &str) -> Result<(), Error>;
+}
+
+struct OsKeychain;
+
+fn keychain_err(e: keyring::Error) -> Error {
+    Error::State(format!("keychain: {e}"))
+}
+
+impl OsKeychain {
+    fn entry(account: &str) -> Result<keyring::Entry, Error> {
+        keyring::Entry::new(KEYRING_SERVICE, account).map_err(keychain_err)
+    }
+}
+
+impl SecretBackend for OsKeychain {
+    fn get(&self, account: &str) -> Result<Option<String>, Error> {
+        match Self::entry(account)?.get_password() {
+            Ok(v) => Ok(Some(v)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(keychain_err(e)),
+        }
+    }
+    fn set(&self, account: &str, value: &str) -> Result<(), Error> {
+        Self::entry(account)?.set_password(value).map_err(keychain_err)
+    }
+    fn remove(&self, account: &str) -> Result<(), Error> {
+        match Self::entry(account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(keychain_err(e)),
+        }
+    }
+}
+
+/// Serialises read-modify-write cycles on the host index within this process.
+static KEYCHAIN_LOCK: Mutex<()> = Mutex::new(());
+
+fn chunk_account(host: &str, i: usize) -> String {
+    if i == 0 {
+        host.to_string()
+    } else {
+        format!("{host}#{i}")
+    }
+}
+
+fn split_chunks(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        let mut cut = CHUNK_BYTES.min(rest.len());
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let (head, tail) = rest.split_at(cut);
+        out.push(head);
+        rest = tail;
+    }
+    if out.is_empty() {
+        out.push("");
+    }
+    out
+}
+
+/// Number of chunks announced by the first entry, and its payload.
+fn parse_first_chunk(raw: &str) -> Option<(usize, &str)> {
+    if raw.starts_with('{') {
+        return Some((1, raw)); // plain JSON, no chunk header
+    }
+    let (n, payload) = raw.split_once(':')?;
+    Some((n.parse().ok().filter(|n| (1..=1024).contains(n))?, payload))
+}
+
+fn read_hosts(b: &dyn SecretBackend) -> Result<Vec<String>, Error> {
+    match b.get(INDEX_ACCOUNT)? {
+        None => Ok(Vec::new()),
+        Some(text) => {
+            let mut hosts: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
+            hosts.sort();
+            hosts.dedup();
+            Ok(hosts)
+        }
+    }
+}
+
+fn write_hosts(b: &dyn SecretBackend, hosts: &[String]) -> Result<(), Error> {
+    if hosts.is_empty() {
+        return b.remove(INDEX_ACCOUNT);
+    }
+    let text = serde_json::to_string(hosts).map_err(|e| Error::State(format!("keychain: {e}")))?;
+    b.set(INDEX_ACCOUNT, &text)
+}
+
+fn store_load(b: &dyn SecretBackend, host: &str) -> Result<Option<Session>, Error> {
+    let host = host.to_ascii_lowercase();
+    let Some(first) = b.get(&host)? else {
+        return Ok(None);
+    };
+    let Some((n, payload)) = parse_first_chunk(&first) else {
+        return Err(Error::State(format!("keychain entry for {host} is damaged")));
+    };
+    let mut json = String::from(payload);
+    for i in 1..n {
+        match b.get(&chunk_account(&host, i))? {
+            Some(part) => json.push_str(&part),
+            None => return Err(Error::State(format!("keychain entry for {host} is incomplete"))),
+        }
+    }
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|_| Error::State(format!("keychain entry for {host} is damaged")))
+}
+
+fn store_save(b: &dyn SecretBackend, session: &Session) -> Result<(), Error> {
+    let host = session.host.to_ascii_lowercase();
+    let json = serde_json::to_string(session).map_err(|e| Error::State(format!("keychain: {e}")))?;
+    let chunks = split_chunks(&json);
+    let previous = b
+        .get(&host)?
+        .and_then(|raw| parse_first_chunk(&raw).map(|(n, _)| n))
+        .unwrap_or(0);
+    // Write the tail first and the header entry last, so a reader never sees a header that
+    // promises chunks which are not there yet.
+    for (i, chunk) in chunks.iter().enumerate().skip(1) {
+        b.set(&chunk_account(&host, i), chunk)?;
+    }
+    b.set(&host, &format!("{}:{}", chunks.len(), chunks[0]))?;
+    for i in chunks.len()..previous {
+        b.remove(&chunk_account(&host, i))?;
+    }
+    let mut hosts = read_hosts(b)?;
+    if !hosts.contains(&host) {
+        hosts.push(host);
+        hosts.sort();
+        write_hosts(b, &hosts)?;
+    }
+    Ok(())
+}
+
+fn store_delete(b: &dyn SecretBackend, host: &str) -> Result<(), Error> {
+    let host = host.to_ascii_lowercase();
+    let n = b
+        .get(&host)?
+        .and_then(|raw| parse_first_chunk(&raw).map(|(n, _)| n))
+        .unwrap_or(1);
+    for i in (1..n).rev() {
+        b.remove(&chunk_account(&host, i))?;
+    }
+    b.remove(&host)?;
+    let mut hosts = read_hosts(b)?;
+    let before = hosts.len();
+    hosts.retain(|h| *h != host);
+    if hosts.len() != before {
+        write_hosts(b, &hosts)?;
+    }
+    Ok(())
+}
+
+fn locked<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = KEYCHAIN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    f()
+}
+
 impl SessionStore for KeyringStore {
     fn load(&self, host: &str) -> Result<Option<Session>, Error> {
-        todo!()
+        locked(|| store_load(&OsKeychain, host))
     }
     fn save(&self, session: &Session) -> Result<(), Error> {
-        todo!()
+        locked(|| store_save(&OsKeychain, session))
     }
     fn delete(&self, host: &str) -> Result<(), Error> {
-        todo!()
+        locked(|| store_delete(&OsKeychain, host))
     }
     fn hosts(&self) -> Result<Vec<String>, Error> {
-        todo!()
+        locked(|| read_hosts(&OsKeychain))
     }
 }
 
@@ -189,10 +367,9 @@ pub struct BrowserSignIn {
 }
 
 #[async_trait]
-#[allow(unused_variables)]
 impl SignIn for BrowserSignIn {
     async fn sign_in(&self, host: &str, start_url: &Url) -> Result<Session, Error> {
-        todo!()
+        browser::sign_in(self.kind, host, start_url).await
     }
 }
 
@@ -212,11 +389,49 @@ impl fmt::Debug for PastedSignIn {
     }
 }
 
+/// Cookies from a `Cookie:` header value (`a=b; c=d`). Tolerates a leading `Cookie:`, surrounding
+/// quotes, and the header being wrapped over several lines. Entries without `=` are ignored.
+pub(crate) fn parse_cookie_header(header: &str, host: &str) -> Vec<SessionCookie> {
+    let mut text = header.trim().trim_matches(['"', '\'']).trim();
+    if text.len() >= 7 && text.is_char_boundary(7) && text[..7].eq_ignore_ascii_case("cookie:") {
+        text = text[7..].trim();
+    }
+    text.split(';')
+        .filter_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(SessionCookie {
+                name: name.to_string(),
+                value: value.trim().to_string(),
+                domain: host.to_string(),
+                path: "/".to_string(),
+                expires: None,
+            })
+        })
+        .collect()
+}
+
 #[async_trait]
-#[allow(unused_variables)]
 impl SignIn for PastedSignIn {
-    async fn sign_in(&self, host: &str, start_url: &Url) -> Result<Session, Error> {
-        todo!()
+    async fn sign_in(&self, host: &str, _start_url: &Url) -> Result<Session, Error> {
+        let host = host.to_ascii_lowercase();
+        let cookies = parse_cookie_header(&self.cookie_header, &host);
+        if cookies.is_empty() {
+            return Err(Error::State(
+                "no cookies found in the pasted text; paste the value of the request `Cookie:` header \
+                 (name=value pairs separated by `;`)"
+                    .into(),
+            ));
+        }
+        Ok(Session {
+            host,
+            cookies,
+            method: SignInMethod::Pasted,
+            captured_at: OffsetDateTime::now_utc(),
+        })
     }
 }
 
@@ -292,5 +507,143 @@ mod tests {
         store.delete("a.sharepoint.com").unwrap();
         store.delete("a.sharepoint.com").unwrap();
         assert_eq!(store.hosts().unwrap(), ["b.sharepoint.com"]);
+    }
+
+    /// In-memory stand-in for the OS keychain that enforces a per-entry size limit like Windows.
+    #[derive(Default)]
+    struct MapBackend {
+        map: std::cell::RefCell<BTreeMap<String, String>>,
+    }
+
+    impl SecretBackend for MapBackend {
+        fn get(&self, account: &str) -> Result<Option<String>, Error> {
+            Ok(self.map.borrow().get(account).cloned())
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), Error> {
+            assert!(
+                value.len() <= 1100,
+                "entry of {} bytes would not fit a credential",
+                value.len()
+            );
+            self.map.borrow_mut().insert(account.into(), value.into());
+            Ok(())
+        }
+        fn remove(&self, account: &str) -> Result<(), Error> {
+            self.map.borrow_mut().remove(account);
+            Ok(())
+        }
+    }
+
+    fn big_session(host: &str, cookie_len: usize) -> Session {
+        let mut s = session(host);
+        s.cookies[0].value = "x".repeat(cookie_len);
+        s.cookies.push(SessionCookie {
+            name: "rtFa".into(),
+            value: "\u{e9}".repeat(cookie_len / 2),
+            domain: host.into(),
+            path: "/".into(),
+            expires: None,
+        });
+        s
+    }
+
+    #[test]
+    fn keychain_logic_round_trips_small_and_chunked_sessions() {
+        let b = MapBackend::default();
+        assert!(store_load(&b, "a.sharepoint.com").unwrap().is_none());
+        let small = session("a.sharepoint.com");
+        store_save(&b, &small).unwrap();
+        assert_eq!(store_load(&b, "A.SharePoint.com").unwrap().unwrap(), small);
+        assert_eq!(b.map.borrow().len(), 2, "one entry plus the index");
+
+        let big = big_session("b.sharepoint.com", 3500);
+        store_save(&b, &big).unwrap();
+        assert_eq!(store_load(&b, "b.sharepoint.com").unwrap().unwrap(), big);
+        assert!(b.map.borrow().contains_key("b.sharepoint.com#1"));
+        assert_eq!(read_hosts(&b).unwrap(), ["a.sharepoint.com", "b.sharepoint.com"]);
+
+        // Shrinking a session removes the stale chunks.
+        store_save(&b, &session("b.sharepoint.com")).unwrap();
+        assert!(!b.map.borrow().contains_key("b.sharepoint.com#1"));
+        assert_eq!(read_hosts(&b).unwrap().len(), 2);
+
+        store_delete(&b, "b.sharepoint.com").unwrap();
+        store_delete(&b, "b.sharepoint.com").unwrap();
+        assert!(store_load(&b, "b.sharepoint.com").unwrap().is_none());
+        assert_eq!(read_hosts(&b).unwrap(), ["a.sharepoint.com"]);
+        store_delete(&b, "a.sharepoint.com").unwrap();
+        assert!(
+            b.map.borrow().is_empty(),
+            "index entry removed with the last host"
+        );
+    }
+
+    #[test]
+    fn damaged_entries_are_reported_not_panicked() {
+        let b = MapBackend::default();
+        b.set("a.sharepoint.com", "garbage").unwrap();
+        assert!(matches!(store_load(&b, "a.sharepoint.com"), Err(Error::State(_))));
+        b.set("a.sharepoint.com", "3:{\"host\"").unwrap();
+        assert!(matches!(store_load(&b, "a.sharepoint.com"), Err(Error::State(_))));
+    }
+
+    #[test]
+    fn chunking_respects_char_boundaries() {
+        let text = "\u{20ac}".repeat(700); // 3 bytes each
+        let parts = split_chunks(&text);
+        assert!(parts.iter().all(|p| p.len() <= CHUNK_BYTES));
+        assert_eq!(parts.concat(), text);
+        assert_eq!(split_chunks(""), [""]);
+    }
+
+    /// Talks to the real OS keychain; run with `cargo test -- --ignored` on a desktop session.
+    #[test]
+    #[ignore = "uses the real OS keychain"]
+    fn os_keychain_round_trip() {
+        let host = format!("ampsync-test-{}.sharepoint.com", std::process::id());
+        let store = KeyringStore::new();
+        let s = big_session(&host, 3000);
+        store.save(&s).unwrap();
+        assert_eq!(store.load(&host).unwrap().unwrap(), s);
+        assert!(store.hosts().unwrap().contains(&host));
+        store.delete(&host).unwrap();
+        assert!(store.load(&host).unwrap().is_none());
+        assert!(!store.hosts().unwrap().contains(&host));
+    }
+
+    #[tokio::test]
+    async fn pasted_header_becomes_a_session() {
+        let url = Url::parse("https://contoso.sharepoint.com/").unwrap();
+        let p = PastedSignIn {
+            cookie_header: "Cookie: FedAuth=abc==; rtFa=def; \n x=1 ;novalue; =bad".into(),
+        };
+        let s = p.sign_in("Contoso.SharePoint.com", &url).await.unwrap();
+        assert_eq!(s.host, "contoso.sharepoint.com");
+        assert_eq!(s.method, SignInMethod::Pasted);
+        let names: Vec<_> = s
+            .cookies
+            .iter()
+            .map(|c| (c.name.as_str(), c.value.as_str()))
+            .collect();
+        assert_eq!(names, [("FedAuth", "abc=="), ("rtFa", "def"), ("x", "1")]);
+        assert!(
+            s.cookies
+                .iter()
+                .all(|c| c.domain == "contoso.sharepoint.com" && c.path == "/")
+        );
+
+        let quoted = PastedSignIn {
+            cookie_header: "  \"FedAuth=1\"  ".into(),
+        };
+        assert_eq!(quoted.sign_in("h", &url).await.unwrap().cookies.len(), 1);
+        for bad in ["", "   ", "garbage", "Cookie:"] {
+            let p = PastedSignIn {
+                cookie_header: bad.into(),
+            };
+            assert!(
+                matches!(p.sign_in("h", &url).await, Err(Error::State(_))),
+                "{bad:?}"
+            );
+        }
     }
 }

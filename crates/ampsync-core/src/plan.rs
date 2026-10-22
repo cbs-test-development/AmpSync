@@ -1,12 +1,18 @@
 //! What will happen before anything downloads: job description, relative paths, and the plan.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use futures::StreamExt;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::remote::{RemoteFile, RemoteRoot};
+use crate::link;
+use crate::names;
+use crate::remote::{Remote, RemoteEntry, RemoteFile, RemoteRoot};
+use crate::state::{FileRecord, FileStatus, StateDb};
 
 /// A path relative to the download root, `/`-separated on every platform.
 ///
@@ -180,6 +186,161 @@ pub struct Plan {
     pub totals: Totals,
 }
 
+/// Suffix of the file a download is written to before it is verified and renamed.
+pub(crate) const PART_SUFFIX: &str = ".ampsync-part";
+
+/// Compiled `include` / `exclude` globs. Matching is case-insensitive (SharePoint is) and runs on
+/// the `/`-separated relative path; `*` also crosses `/`, so `*.pdf` matches at any depth.
+#[derive(Debug)]
+pub(crate) struct Filters {
+    include: Option<GlobSet>,
+    exclude: Option<GlobSet>,
+}
+
+impl Filters {
+    pub(crate) fn new(include: &[String], exclude: &[String]) -> Result<Self, Error> {
+        fn build(patterns: &[String]) -> Result<Option<GlobSet>, Error> {
+            if patterns.is_empty() {
+                return Ok(None);
+            }
+            let mut b = GlobSetBuilder::new();
+            for p in patterns {
+                let glob = GlobBuilder::new(p)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|e| Error::State(format!("invalid pattern `{p}`: {e}")))?;
+                b.add(glob);
+            }
+            b.build()
+                .map(Some)
+                .map_err(|e| Error::State(format!("invalid patterns: {e}")))
+        }
+        Ok(Filters {
+            include: build(include)?,
+            exclude: build(exclude)?,
+        })
+    }
+
+    pub(crate) fn matches(&self, rel_path: &str) -> bool {
+        self.include.as_ref().is_none_or(|g| g.is_match(rel_path))
+            && !self.exclude.as_ref().is_some_and(|g| g.is_match(rel_path))
+    }
+}
+
+/// The relative path a file gets on this machine: unchanged except on Windows, where illegal
+/// characters and reserved names are replaced (the mapping is recorded in `state.db`).
+pub(crate) fn local_rel_path(rel: &RelPath) -> RelPath {
+    if cfg!(windows) {
+        names::sanitize_rel_path(rel)
+    } else {
+        rel.clone()
+    }
+}
+
+/// `dest` made absolute so `\\?\` long-path handling applies on Windows.
+pub(crate) fn absolute_dest(dest: &Path) -> PathBuf {
+    std::path::absolute(dest).unwrap_or_else(|_| dest.to_path_buf())
+}
+
+/// Final and part paths of a file (both long-path prefixed on Windows), ready for `std::fs`.
+pub(crate) fn local_paths(dest_abs: &Path, rel: &RelPath) -> (PathBuf, PathBuf) {
+    let final_path = local_rel_path(rel).to_path(dest_abs);
+    let mut part_name = final_path.file_name().unwrap_or_default().to_os_string();
+    part_name.push(PART_SUFFIX);
+    let part_path = final_path.with_file_name(part_name);
+    (names::long_path(&final_path), names::long_path(&part_path))
+}
+
+/// `name` differs between remote and local naming: the value to store as `local_name`.
+pub(crate) fn local_name_record(rel: &RelPath) -> Option<String> {
+    let local = local_rel_path(rel);
+    (local != *rel).then(|| local.as_str().to_string())
+}
+
+/// Hash as stored in `state.db` (algorithm-prefixed text).
+pub(crate) fn hash_text(file: &RemoteFile) -> Option<String> {
+    use crate::remote::RemoteHash;
+    file.hash.as_ref().map(|h| match h {
+        RemoteHash::QuickXor(v) => format!("quickxor:{v}"),
+        RemoteHash::Sha256(v) => format!("sha256:{v}"),
+    })
+}
+
+/// List the remote tree, apply the filters, compare with the destination and `state.db`.
+pub(crate) async fn build<R: Remote + ?Sized>(remote: &R, spec: &JobSpec) -> Result<Plan, Error> {
+    let filters = Filters::new(&spec.include, &spec.exclude)?;
+    let parsed = link::parse(&spec.source)?;
+    let root = remote.resolve(&parsed).await?;
+    let dest = absolute_dest(&spec.dest);
+    let db = StateDb::open(&dest)?;
+    let known: HashMap<RelPath, FileRecord> =
+        db.files()?.into_iter().map(|r| (r.rel_path.clone(), r)).collect();
+
+    let mut items = Vec::new();
+    let mut totals = Totals::default();
+    let mut walk = remote.walk(&root);
+    while let Some(entry) = walk.next().await {
+        let RemoteEntry::File(file) = entry? else {
+            continue;
+        };
+        if !filters.matches(file.rel_path.as_str()) {
+            continue;
+        }
+        let action = decide(&file, known.get(&file.rel_path), &db, &dest, spec.existing)?;
+        match action {
+            PlannedAction::SkipUnchanged => {
+                totals.skipped += 1;
+                totals.skipped_bytes += file.size;
+            }
+            PlannedAction::Resume { have } => {
+                totals.files += 1;
+                totals.bytes += file.size.saturating_sub(have);
+            }
+            PlannedAction::Download => {
+                totals.files += 1;
+                totals.bytes += file.size;
+            }
+        }
+        items.push(PlannedFile { file, action });
+    }
+    drop(walk);
+    Ok(Plan { root, items, totals })
+}
+
+fn decide(
+    file: &RemoteFile,
+    record: Option<&FileRecord>,
+    db: &StateDb,
+    dest: &Path,
+    existing: ExistingPolicy,
+) -> Result<PlannedAction, Error> {
+    let (final_path, part_path) = local_paths(dest, &file.rel_path);
+    let same_version = record.is_some_and(|r| r.etag == file.etag && r.size == file.size);
+
+    if existing == ExistingPolicy::SkipUnchanged
+        && same_version
+        && record.is_some_and(|r| r.status == FileStatus::Verified)
+        && std::fs::metadata(&final_path).is_ok_and(|m| m.is_file() && m.len() == file.size)
+    {
+        return Ok(PlannedAction::SkipUnchanged);
+    }
+
+    if same_version
+        && record.is_some_and(|r| r.status != FileStatus::Verified)
+        && std::fs::metadata(&part_path).is_ok_and(|m| m.is_file() && m.len() == file.size)
+    {
+        let have: u64 = db
+            .completed_ranges(&file.rel_path)?
+            .iter()
+            .map(|r| r.end.min(file.size).saturating_sub(r.start))
+            .sum();
+        if have > 0 {
+            return Ok(PlannedAction::Resume { have });
+        }
+    }
+    Ok(PlannedAction::Download)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +386,22 @@ mod tests {
         let s = JobSpec::new("link", "dest");
         assert_eq!(s.existing, ExistingPolicy::SkipUnchanged);
         assert!(!s.prune && s.include.is_empty() && s.exclude.is_empty());
+    }
+
+    #[test]
+    fn filters_are_case_insensitive_and_cross_directories() {
+        let f = Filters::new(&["*.pdf".into()], &["tmp/**".into()]).unwrap();
+        assert!(f.matches("a.PDF") && f.matches("x/y/a.pdf"));
+        assert!(!f.matches("a.txt") && !f.matches("tmp/a.pdf"));
+        let all = Filters::new(&[], &[]).unwrap();
+        assert!(all.matches("anything/at/all"));
+        assert!(Filters::new(&["[".into()], &[]).is_err());
+    }
+
+    #[test]
+    fn local_paths_put_the_part_file_next_to_the_file() {
+        let (fin, part) = local_paths(Path::new("dest"), &RelPath::new("a/b.txt").unwrap());
+        assert!(part.to_string_lossy().ends_with("b.txt.ampsync-part"));
+        assert_eq!(fin.parent(), part.parent());
     }
 }

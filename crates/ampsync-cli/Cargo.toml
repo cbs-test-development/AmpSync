@@ -17,8 +17,14 @@ webview = ["dep:wry", "dep:tao", "dep:webview2-com", "dep:windows-core"]
 [dependencies]
 ampsync-core.workspace = true
 clap = { version = "4", features = ["derive"] }
+directories.workspace = true
+futures.workspace = true
+indicatif = "0.18"
+rpassword = "7"
 serde_json.workspace = true
+time.workspace = true
 tokio.workspace = true
+url.workspace = true
 wry = { version = "0.57", optional = true }
 tao = { version = "0.37", optional = true }
 

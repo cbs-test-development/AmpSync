@@ -48,6 +48,9 @@ pub struct LoginArgs {
     /// Sign-in method; default tries webview, then Edge/Chrome, then paste
     #[arg(long, value_enum)]
     pub method: Option<Method>,
+    /// File containing a Cookie header to use with `--method paste` (instead of typing it)
+    #[arg(long, value_name = "FILE")]
+    pub cookie_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -81,8 +84,8 @@ pub struct GetArgs {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=16))]
     pub parallel: Option<u8>,
     /// Bandwidth limit in bytes per second; accepts suffixes such as 500K, 20M
-    #[arg(long, value_name = "RATE")]
-    pub limit: Option<String>,
+    #[arg(long, value_name = "RATE", value_parser = crate::human::parse_rate)]
+    pub limit: Option<u64>,
     /// Download files again even if they look unchanged
     #[arg(long)]
     pub redownload: bool,
@@ -136,7 +139,7 @@ mod tests {
         assert_eq!(g.include, ["*.pdf", "a/**"]);
         assert_eq!(g.exclude, ["tmp/**"]);
         assert_eq!(g.parallel, Some(8));
-        assert_eq!(g.limit.as_deref(), Some("20M"));
+        assert_eq!(g.limit, Some(20 * 1024 * 1024));
         assert!(g.redownload && g.prune && g.yes && g.json);
     }
 
@@ -155,6 +158,38 @@ mod tests {
             assert_eq!(l.method, Some(want));
         }
         assert!(Cli::try_parse_from(["ampsync", "login", "https://x", "--method", "nope"]).is_err());
+    }
+
+    #[test]
+    fn login_cookie_file_and_ls_depth() {
+        let cli = Cli::try_parse_from(["ampsync", "login", "https://x", "--cookie-file", "c.txt"]).unwrap();
+        let Command::Login(l) = cli.command else {
+            panic!("not login")
+        };
+        assert_eq!(l.cookie_file.as_deref(), Some(std::path::Path::new("c.txt")));
+        let cli = Cli::try_parse_from(["ampsync", "ls", "https://x", "--depth", "3"]).unwrap();
+        let Command::Ls(ls) = cli.command else {
+            panic!("not ls")
+        };
+        assert_eq!(ls.depth, Some(3));
+    }
+
+    #[test]
+    fn bad_limit_is_a_usage_error() {
+        let err = Cli::try_parse_from(["ampsync", "get", "u", "d", "--limit", "fast"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(Cli::try_parse_from(["ampsync", "get", "u", "d", "--limit", "500K"]).is_ok());
+    }
+
+    #[test]
+    fn missing_arguments_are_usage_errors() {
+        for args in [
+            vec!["ampsync"],
+            vec!["ampsync", "get", "only-url"],
+            vec!["ampsync", "logout"],
+        ] {
+            assert_eq!(Cli::try_parse_from(args).unwrap_err().exit_code(), 2);
+        }
     }
 
     #[test]

@@ -1,8 +1,23 @@
 //! `ampsync` command-line interface.
+//!
+//! Output conventions: results go to stdout, progress and messages to stderr. Exit codes are
+//! listed in `exit`. Ctrl+C stops a download cleanly (exit code 1); a second press quits at once.
 
 mod cli;
 mod commands;
 mod exit;
+mod get;
+mod human;
+mod paths;
+mod progress;
+mod session_check;
+mod signin;
+#[cfg(feature = "webview")]
+mod signin_webview;
+#[cfg(not(feature = "webview"))]
+#[path = "signin_webview_stub.rs"]
+mod signin_webview;
+mod tree;
 
 use std::process::ExitCode;
 
@@ -19,7 +34,7 @@ async fn main() -> ExitCode {
         Command::Logout(a) => commands::logout(a).await,
         Command::Sessions => commands::sessions().await,
         Command::Ls(a) => commands::ls(a).await,
-        Command::Get(a) => commands::get(a).await,
+        Command::Get(a) => get::get(a).await,
     };
     ExitCode::from(code)
 }
