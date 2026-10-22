@@ -10,6 +10,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
+use crate::engine::VerifiedBy;
 use crate::link;
 use crate::names;
 use crate::remote::{Remote, RemoteEntry, RemoteFile, RemoteRoot};
@@ -181,7 +182,7 @@ pub struct Totals {
 
 /// The full result of listing and comparing: nothing has been downloaded yet.
 ///
-/// A plan keeps the destination folder locked (`<dest>/.ampsync/lock`) until it is dropped or
+/// A plan keeps the destination folder locked (a lock file in the job's app-data directory) until it is dropped or
 /// handed to `Engine::start`, which moves the lock into the job. While it is held, planning or
 /// running another download into the same folder fails with `Error::DestinationBusy`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -305,18 +306,22 @@ pub(crate) fn hash_text(file: &RemoteFile) -> Option<String> {
 }
 
 /// List the remote tree, apply the filters, compare with the destination and `state.db`.
-pub(crate) async fn build<R: Remote + ?Sized>(remote: &R, spec: &JobSpec) -> Result<Plan, Error> {
+pub(crate) async fn build<R: Remote + ?Sized>(
+    remote: &R,
+    spec: &JobSpec,
+    data_dir: Option<&Path>,
+) -> Result<Plan, Error> {
     let filters = Filters::new(&spec.include, &spec.exclude)?;
     let dest = absolute_dest(&spec.dest);
     let lock = {
-        let dest = dest.clone();
-        tokio::task::spawn_blocking(move || DestLock::acquire(&dest))
+        let (dest, data_dir) = (dest.clone(), data_dir.map(Path::to_path_buf));
+        tokio::task::spawn_blocking(move || DestLock::acquire(&dest, data_dir.as_deref()))
             .await
             .map_err(|e| Error::State(format!("background task failed: {e}")))??
     };
     let parsed = link::parse(&spec.source)?;
     let root = remote.resolve(&parsed).await?;
-    let db = StateDb::open(&dest)?;
+    let db = StateDb::open_in(data_dir, &dest)?;
     let known: HashMap<RelPath, FileRecord> =
         db.files()?.into_iter().map(|r| (r.rel_path.clone(), r)).collect();
 
@@ -374,6 +379,27 @@ fn decide(
         return Ok(PlannedAction::SkipUnchanged);
     }
 
+    // No record at all (a copied folder, deleted state): trust a local file whose size and
+    // modification time equal the remote's. The engine sets the mtime from the remote after the
+    // rename, so a finished download always satisfies this. Remember the file as verified.
+    if existing == ExistingPolicy::SkipUnchanged
+        && record.is_none()
+        && local_matches_remote(&final_path, file)
+    {
+        db.upsert_file(&FileRecord {
+            rel_path: file.rel_path.clone(),
+            size: file.size,
+            etag: file.etag.clone(),
+            hash: hash_text(file),
+            status: FileStatus::Verified,
+            bytes_done: file.size,
+            verified_by: Some(VerifiedBy::SizeAndMtime),
+            error: None,
+            local_name: local_name_record(&file.rel_path),
+        })?;
+        return Ok(PlannedAction::SkipUnchanged);
+    }
+
     if same_version
         && record.is_some_and(|r| r.status != FileStatus::Verified)
         && std::fs::metadata(&part_path).is_ok_and(|m| m.is_file() && m.len() == file.size)
@@ -388,6 +414,28 @@ fn decide(
         }
     }
     Ok(PlannedAction::Download)
+}
+
+/// Slack when comparing modification times (FAT stores 2-second steps).
+const MTIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The local file has the remote's size and (within [`MTIME_SLACK`]) its modification time.
+fn local_matches_remote(path: &Path, file: &RemoteFile) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() != file.size {
+        return false;
+    }
+    let Ok(local) = meta.modified() else {
+        return false;
+    };
+    let remote = std::time::SystemTime::from(file.modified);
+    let diff = match local.duration_since(remote) {
+        Ok(d) => d,
+        Err(e) => e.duration(),
+    };
+    diff <= MTIME_SLACK
 }
 
 #[cfg(test)]

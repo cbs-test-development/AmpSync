@@ -1,4 +1,5 @@
-//! SQLite job state in `<dest>/.ampsync/state.db` (D7).
+//! SQLite job state in `<data dir>/jobs/<key>/state.db` (D7). `<key>` identifies the destination
+//! folder (see [`crate::appdirs`]); nothing is stored inside the destination itself.
 //!
 //! Tables:
 //! - `job`: the `JobSpec` and `RemoteRoot` as JSON plus created/updated timestamps (one row).
@@ -53,7 +54,7 @@ pub struct FileRecord {
     pub local_name: Option<String>,
 }
 
-/// Exclusive advisory lock on `<dest>/.ampsync/lock`, held from planning to the end of a job so
+/// Exclusive advisory lock on `<data dir>/jobs/<key>/lock`, held from planning to the end of a job so
 /// two AmpSync processes (or two jobs) never write into one destination at the same time. The OS
 /// releases it when the value is dropped or the process dies, so a crash never leaves it stuck.
 #[derive(Debug)]
@@ -64,9 +65,10 @@ pub(crate) struct DestLock {
 
 impl DestLock {
     /// Take the lock for `dest` (already absolute), or `Error::DestinationBusy` when it is held.
-    pub(crate) fn acquire(dest: &Path) -> Result<DestLock, Error> {
-        let dir = crate::names::long_path(&dest.join(".ampsync"));
-        std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+    /// `data_dir` overrides the per-user data directory (tests).
+    pub(crate) fn acquire(dest: &Path, data_dir: Option<&Path>) -> Result<DestLock, Error> {
+        let base = crate::appdirs::resolve_data_dir(data_dir)?;
+        let dir = crate::names::long_path(&crate::appdirs::ensure_job_dir(&base, dest)?);
         let path = dir.join("lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -143,6 +145,7 @@ fn verified_by_str(v: VerifiedBy) -> &'static str {
     match v {
         VerifiedBy::Hash => "hash",
         VerifiedBy::SizeAndEtag => "size_and_etag",
+        VerifiedBy::SizeAndMtime => "size_and_mtime",
     }
 }
 
@@ -150,6 +153,7 @@ fn parse_verified_by(s: &str) -> Option<VerifiedBy> {
     match s {
         "hash" => Some(VerifiedBy::Hash),
         "size_and_etag" => Some(VerifiedBy::SizeAndEtag),
+        "size_and_mtime" => Some(VerifiedBy::SizeAndMtime),
         _ => None,
     }
 }
@@ -195,10 +199,68 @@ pub(crate) fn merge_ranges(mut v: Vec<Range<u64>>) -> Vec<Range<u64>> {
     out
 }
 
+/// Move `<dest>/.ampsync/state.db` (written by builds before job state moved to the app data
+/// directory) into `state_dir`, then remove the old folder if nothing else is in it. Best effort: a
+/// failure is logged and the job starts with fresh state (files are then re-verified by size and
+/// modification time, see `plan`).
+fn migrate_legacy_state(dest: &Path, state_dir: &Path) {
+    let old_dir = crate::names::long_path(&dest.join(".ampsync"));
+    let old_db = old_dir.join("state.db");
+    if !old_db.is_file() {
+        return;
+    }
+    let new_db = crate::names::long_path(state_dir).join("state.db");
+    let result: Result<(), Error> = (|| {
+        if !new_db.exists() {
+            // Fold the write-ahead log into the main file so one file carries everything.
+            if let Ok(conn) = Connection::open(&old_db) {
+                let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+                let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+            }
+            let tmp = new_db.with_extension("db.migrating");
+            std::fs::copy(&old_db, &tmp).map_err(|e| Error::io(&tmp, e))?;
+            std::fs::rename(&tmp, &new_db).map_err(|e| Error::io(&new_db, e))?;
+        }
+        for name in ["state.db", "state.db-wal", "state.db-shm", "lock"] {
+            let path = old_dir.join(name);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::io(&path, e)),
+            }
+        }
+        let _ = std::fs::remove_dir(&old_dir); // only succeeds when empty
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!(
+            "could not move the old job state out of {}: {e}",
+            old_dir.display()
+        );
+    }
+}
+
 impl StateDb {
-    /// Open (creating if needed) `<dest>/.ampsync/state.db`, enable WAL, create/upgrade tables.
+    /// Open (creating if needed) the state database of the job that downloads into `dest`, in the
+    /// per-user data directory (`<data dir>/jobs/<key>/state.db`). A `<dest>/.ampsync/state.db`
+    /// left by an older build is moved there first.
     pub fn open(dest: &Path) -> Result<Self, Error> {
-        let dir = crate::names::long_path(&dest.join(".ampsync"));
+        Self::open_in(None, dest)
+    }
+
+    /// Like [`StateDb::open`] with an explicit data directory (`None` = the per-user default, which
+    /// `AMPSYNC_DATA_DIR` overrides).
+    pub fn open_in(data_dir: Option<&Path>, dest: &Path) -> Result<Self, Error> {
+        let base = crate::appdirs::resolve_data_dir(data_dir)?;
+        let dir = crate::appdirs::ensure_job_dir(&base, dest)?;
+        migrate_legacy_state(dest, &dir);
+        Self::open_at(&dir)
+    }
+
+    /// Open (creating if needed) `<state_dir>/state.db`, enable WAL, create/upgrade tables. Tests use
+    /// this with a temporary directory so they never touch the real app data.
+    pub fn open_at(state_dir: &Path) -> Result<Self, Error> {
+        let dir = crate::names::long_path(state_dir);
         std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
         let path = dir.join("state.db");
         let conn = Connection::open(&path).map_err(db_err)?;
@@ -570,7 +632,7 @@ mod tests {
     fn open_creates_wal_database_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let db = StateDb::open(dir.path()).unwrap();
+            let db = StateDb::open_at(dir.path()).unwrap();
             db.upsert_file(&record("keep", 1)).unwrap();
             let mode: String = db
                 .lock()
@@ -578,9 +640,102 @@ mod tests {
                 .unwrap();
             assert_eq!(mode.to_lowercase(), "wal");
         }
-        assert!(dir.path().join(".ampsync").join("state.db").is_file());
-        let db = StateDb::open(dir.path()).unwrap();
+        assert!(dir.path().join("state.db").is_file());
+        let db = StateDb::open_at(dir.path()).unwrap();
         assert!(db.file(&rel("keep")).unwrap().is_some());
+    }
+
+    #[test]
+    fn open_in_keeps_state_in_the_data_dir_and_nothing_in_the_destination() {
+        let data = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        {
+            let db = StateDb::open_in(Some(data.path()), dest.path()).unwrap();
+            db.upsert_file(&record("a", 1)).unwrap();
+        }
+        let job = crate::appdirs::job_dir(data.path(), dest.path());
+        assert!(job.join("state.db").is_file());
+        assert!(job.join("dest.txt").is_file());
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
+        let db = StateDb::open_in(Some(data.path()), dest.path()).unwrap();
+        assert!(db.file(&rel("a")).unwrap().is_some());
+        // A different destination gets its own state.
+        let other = tempfile::tempdir().unwrap();
+        let db = StateDb::open_in(Some(data.path()), other.path()).unwrap();
+        assert!(db.file(&rel("a")).unwrap().is_none());
+    }
+
+    #[test]
+    fn state_from_older_builds_is_moved_out_of_the_destination() {
+        let data = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let old = dest.path().join(".ampsync");
+        {
+            let db = StateDb::open_at(&old).unwrap();
+            db.upsert_file(&record("old.txt", 7)).unwrap();
+            db.mark_verified(&rel("old.txt"), VerifiedBy::SizeAndEtag)
+                .unwrap();
+        }
+        std::fs::write(old.join("lock"), b"").unwrap();
+
+        let db = StateDb::open_in(Some(data.path()), dest.path()).unwrap();
+        let r = db.file(&rel("old.txt")).unwrap().expect("record migrated");
+        assert_eq!((r.status, r.size), (FileStatus::Verified, 7));
+        assert!(!old.exists(), "the old .ampsync folder is gone");
+        assert!(
+            crate::appdirs::job_dir(data.path(), dest.path())
+                .join("state.db")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn old_folder_with_other_files_is_kept_but_state_is_removed() {
+        let data = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let old = dest.path().join(".ampsync");
+        StateDb::open_at(&old)
+            .unwrap()
+            .upsert_file(&record("x", 1))
+            .unwrap();
+        std::fs::write(old.join("note.txt"), b"mine").unwrap();
+        StateDb::open_in(Some(data.path()), dest.path()).unwrap();
+        assert!(old.join("note.txt").is_file());
+        assert!(!old.join("state.db").exists());
+    }
+
+    #[test]
+    fn existing_new_state_wins_over_a_stale_old_one() {
+        let data = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        {
+            let db = StateDb::open_in(Some(data.path()), dest.path()).unwrap();
+            db.upsert_file(&record("new", 1)).unwrap();
+        }
+        let old = dest.path().join(".ampsync");
+        StateDb::open_at(&old)
+            .unwrap()
+            .upsert_file(&record("stale", 1))
+            .unwrap();
+        let db = StateDb::open_in(Some(data.path()), dest.path()).unwrap();
+        assert!(db.file(&rel("new")).unwrap().is_some());
+        assert!(db.file(&rel("stale")).unwrap().is_none());
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn size_and_mtime_round_trips() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.upsert_file(&record("f", 3)).unwrap();
+        db.mark_verified(&rel("f"), VerifiedBy::SizeAndMtime).unwrap();
+        assert_eq!(
+            db.file(&rel("f")).unwrap().unwrap().verified_by,
+            Some(VerifiedBy::SizeAndMtime)
+        );
+        assert_eq!(
+            serde_json::to_string(&VerifiedBy::SizeAndMtime).unwrap(),
+            "\"size_and_mtime\""
+        );
     }
 
     #[test]

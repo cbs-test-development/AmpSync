@@ -12,7 +12,7 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D4 | Zero config for users. The tenant host is taken from the pasted URL. Sessions live in the OS keychain, keyed by host. Settings are edited in the GUI and saved to `settings.toml` in the per-user config dir. | Non-developers must never edit a file. |
 | D5 | No hardcoded tenants, sites, URLs or company names anywhere in code. | Public, cross-org repo. |
 | D6 | Files are written to `<name>.ampsync-part`, downloaded in parallel byte ranges, verified (QuickXorHash when available, else size + unchanged eTag), then atomically renamed. | Corruption-proof, resumable. |
-| D7 | Job state lives in SQLite (`<dest>/.ampsync/state.db`). | Survives crashes and reboots; lets a rerun resume. |
+| D7 | Job state lives in SQLite in the per-user app data dir: `<data_local_dir>/jobs/<key>/state.db`, where `<key>` is the hex of the first 16 bytes of SHA-256 over the canonical destination path (Windows: case-folded, no `\\?\`). Nothing of AmpSync stays in the download destination once a job is done. | Survives crashes and reboots; lets a rerun resume; keeps shared, zipped and code folders clean. |
 | D8 | Throttling: honour `Retry-After` on 429/503 globally (all lanes pause), exponential backoff with jitter otherwise. User-Agent `NONISV|AmpSync|AmpSync/<version>`. | Microsoft guidance. |
 | D9 | Expired session pauses the job (never fails it) and emits `Event::AuthExpired`. | 80 GB jobs outlive sessions. |
 | D10 | Platforms: Windows x64 and Ubuntu x64. No macOS in v1. No code signing, no auto-update, no telemetry. | Agreed scope. |
@@ -181,8 +181,8 @@ Tables: `job` (spec, root, created/updated), `file` (rel_path PK, size, etag, ha
 
 ```rust
 pub struct Settings {
-    pub parallel_files: u8,            // default 4, 1..=16
-    pub range_size: u64,               // default 8 MiB
+    pub parallel_files: u8,            // default 6, 1..=16
+    pub range_size: u64,               // default 16 MiB (keeps a fast download under SharePoint's ~3000 requests / 5 min per user)
     pub large_file_threshold: u64,     // files above this get parallel ranges; default 64 MiB
     pub bandwidth_limit: Option<u64>,  // bytes/s, shared across lanes
     pub max_retries: u32,              // per range; default 8
@@ -210,7 +210,7 @@ pub enum Event {
     FileStarted { rel_path: RelPath, size: u64, lane: u8 },
     Progress { bytes_done: u64, bytes_total: u64, rate_bps: u64 }, // throttled to ~4 Hz
     LaneProgress { lane: u8, rel_path: RelPath, offset: u64, size: u64 },
-    FileVerified { rel_path: RelPath, by: VerifiedBy },             // Hash | SizeAndEtag
+    FileVerified { rel_path: RelPath, by: VerifiedBy },             // Hash | SizeAndEtag | SizeAndMtime
     FileSkipped { rel_path: RelPath },
     FileFailed { rel_path: RelPath, error: String, will_retry: bool },
     Throttled { retry_after: Duration },
@@ -236,9 +236,18 @@ The code in `crates/ampsync-core` is now the source of truth for exact types. Ad
 - `auth::check_session(&Session, &site_url) -> SessionStatus { Valid, Expired, Unknown }` and `Remote::probe()`. Only `Expired` rejects a session; `Unknown` (e.g. 403 on a restricted site) keeps it. Probes go to the link's own site, not the tenant root.
 - On `AuthExpired` for one file the engine probes the session: still `Valid` ⇒ that file fails with 403 and the job continues; otherwise the job pauses.
 - Listing, resolve and stat go through `remote::RetryPolicy` (honours `Retry-After`, bounded backoff).
-- `<dest>/.ampsync/lock` is held (`File::try_lock`) from plan until the job ends; a second process gets `Error::DestinationBusy`. Before rename, recorded ranges must cover the whole file.
+- `<data_local_dir>/jobs/<key>/lock` is held (`File::try_lock`) from plan until the job ends; a second process gets `Error::DestinationBusy`. Before rename, recorded ranges must cover the whole file.
 - Plan-time skips are reported only as counts on `Event::Planned { skipped, skipped_bytes }`.
 - The Edge/Chrome fallback talks CDP over `--remote-debugging-pipe` / `--remote-debugging-io-pipes`; no TCP port is opened.
+
+### Job state outside the destination (as built)
+
+- Module `appdirs`: `data_dir()` (`ProjectDirs::from("", "", "AmpSync").data_local_dir()`, Windows `%LOCALAPPDATA%\AmpSync\data`; the env var `AMPSYNC_DATA_DIR` replaces it), `config_dir()`, `webview_cache_dir()`, `job_key(dest)`, `job_dir(data_dir, dest)`. A job directory holds `state.db`, `lock` and `dest.txt` (the destination path, for humans).
+- `StateDb::open(dest)` resolves the job directory; `StateDb::open_in(Some(data_dir), dest)` and `StateDb::open_at(state_dir)` are for callers and tests that must not touch the real app data. `Tuning::data_dir` does the same for the engine; the integration tests set it to a temporary directory.
+- Migration: a `<dest>/.ampsync/state.db` from older builds is moved to the job directory on first open and the old folder is removed when empty.
+- Part files stay next to their target (`<name>.ampsync-part`, same volume, atomic rename). When a job ends without being cancelled, no part file is left in the folders it covers, except the part file of a failed download with recorded ranges (resumable; the next successful run removes it).
+- No state record for a file: plan treats a local file as `SkipUnchanged` when its size equals the remote size and its mtime equals the remote `modified` (within 2 s; the engine sets the mtime after the rename) and records it as `VerifiedBy::SizeAndMtime`. A copied or moved destination therefore skips everything.
+- `purge::purge_all() -> Result<PurgeReport, Error>` (for uninstall and "sign out of everything") deletes every keychain session and the host index, the config dir, the data dir (job state, `signin-profile`, `queue.json`, `update-check.json`) and the desktop WebView cache `<local data>/io.github.ampsync.desktop`. Best effort, symlinks are never followed, download destinations are never touched. `purge_with(&PurgeTargets, &dyn SessionStore)` takes injected locations for tests.
 
 ## `ampsync-cli`
 
@@ -249,6 +258,7 @@ ampsync sessions
 ampsync ls <url> [--depth N]
 ampsync get <url> <dest> [--include GLOB]... [--exclude GLOB]... [--parallel N]
                          [--limit RATE] [--redownload] [--prune] [--yes] [--json]
+ampsync purge [--yes]          # delete all sign-ins, settings and app data; downloads are kept
 ```
 Exit codes: 0 ok, 1 error, 2 usage, 3 auth expired (rerun resumes), 4 some files failed. `--json` emits one `Event` per line for scripting. The CLI's webview sign-in uses `wry`/`tao` directly behind a `webview` cargo feature (on by default) so headless builds can opt out.
 

@@ -62,7 +62,7 @@ export type EngineEvent =
   | { type: "file_started"; rel_path: string; size: number; lane: number }
   | { type: "progress"; bytes_done: number; bytes_total: number; rate_bps: number }
   | { type: "lane_progress"; lane: number; rel_path: string; offset: number; size: number }
-  | { type: "file_verified"; rel_path: string; by: "hash" | "size_and_etag" }
+  | { type: "file_verified"; rel_path: string; by: "hash" | "size_and_etag" | "size_and_mtime" }
   | { type: "file_failed"; rel_path: string; error: string; will_retry: boolean }
   | { type: "throttled"; retry_after_ms: number }
   | { type: "auth_expired"; host: string }

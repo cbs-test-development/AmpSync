@@ -89,6 +89,7 @@ ampsync get "<link>" ./projects --include "*.pdf" --exclude "archive/**" --paral
 | `ampsync login <url> [--method webview\|edge\|chrome\|paste]` | Sign in and store the session |
 | `ampsync logout <host>` | Forget the session for a host, e.g. `contoso.sharepoint.com` |
 | `ampsync sessions` | List stored sessions |
+| `ampsync purge [--yes]` | Delete every saved sign-in, the settings and all AmpSync app data (downloaded files are kept) |
 | `ampsync ls <url> [--depth N]` | List a remote folder |
 | `ampsync get <url> <dest> [options]` | Download. Options: `--include`, `--exclude`, `--parallel`, `--limit`, `--redownload`, `--prune`, `--yes`, `--json` |
 
@@ -110,6 +111,10 @@ Exit codes: `0` success, `1` error, `2` bad usage, `3` sign-in expired (sign in 
 **Does it work on a Mac?** Not yet.
 
 **Will it change or delete anything on SharePoint?** No. It is download-only.
+
+**Does AmpSync leave files in my download folder?** No. Only the downloaded files are there; the job's progress is kept in AmpSync's own app data folder (`%LOCALAPPDATA%\AmpSync` on Windows), so you can zip, share or commit the folder as it is. Copy it somewhere else and run the same link against the new location and unchanged files are recognised and skipped.
+
+**How do I remove everything AmpSync stored?** Run `ampsync purge` (or uninstall and follow [Removing everything](docs/user-guide.md#removing-everything)). It deletes the saved sign-ins, settings and app data, and never touches your downloads.
 
 <details>
 <summary><strong>My company blocks the sign-in window</strong></summary>

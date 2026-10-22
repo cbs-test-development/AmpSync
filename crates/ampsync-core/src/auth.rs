@@ -315,6 +315,13 @@ impl SessionStore for KeyringStore {
     }
 }
 
+impl KeyringStore {
+    /// Remove the host index entry itself (used by `purge`, after every session is deleted).
+    pub(crate) fn remove_index(&self) -> Result<(), Error> {
+        locked(|| OsKeychain.remove(INDEX_ACCOUNT))
+    }
+}
+
 /// In-memory store for tests and for the `--method paste` flow without a keychain.
 #[derive(Debug, Default)]
 pub struct MemoryStore {

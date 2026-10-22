@@ -86,26 +86,19 @@ Settings save automatically.
 
 ## Where your files and data live
 
-**Your downloaded files** are in the folder you chose. Inside it AmpSync keeps a small hidden folder:
+**Your downloaded files** are in the folder you chose, and only the files. Once a download finishes, AmpSync leaves nothing behind in that folder, so you can share it, zip it or put it under version control as it is. While a file is still downloading it sits next to its final name with the suffix `.ampsync-part`; it is renamed to its real name only after it has been verified, and any leftover `.ampsync-part` file is removed when the download completes. (If a file fails part-way, its partial copy is kept so the next run can continue it.)
 
-```
-<destination>/.ampsync/state.db     the job's progress (SQLite)
-<destination>/<file>.ampsync-part   a file that is still downloading
-```
-
-`state.db` is what lets a rerun resume: it records which pieces of which files are done. Keep the `.ampsync` folder if you want to continue or refresh the download later; delete it only if you want AmpSync to forget the job (files you already downloaded are kept, and will be checked again on the next run).
-
-Partly downloaded files carry the `.ampsync-part` suffix and are renamed to their real name only after they have been verified.
+**The job's progress** (which pieces of which files are done) is kept in AmpSync's own app data folder, one small folder per destination (`jobs\<id>` inside the app data folder below, with a `dest.txt` that says which destination it belongs to). That is what lets a rerun resume. If you copy or move a finished download somewhere else and run the same link against the new location, AmpSync recognises files whose size and modified time match SharePoint and skips them, without downloading anything again. Old versions kept a hidden `.ampsync` folder inside the destination; AmpSync moves that into the app data folder the next time it runs there.
 
 > [!NOTE]
-> Windows does not allow some characters in file names (`< > : " | ? *`, and names ending in a dot or space). AmpSync replaces them with a visible lookalike and remembers the original name in `state.db`.
+> Windows does not allow some characters in file names (`< > : " | ? *`, and names ending in a dot or space). AmpSync replaces them with a visible lookalike and remembers the original name in its job state.
 
 **AmpSync's own data** is in per-user folders:
 
 | What | Windows | Ubuntu |
 |------|---------|--------|
 | Settings (`settings.toml`) | `%APPDATA%\AmpSync\config` | `~/.config/ampsync` |
-| App data: queue, sign-in window profile (`signin-profile`) | `%LOCALAPPDATA%\AmpSync\data` | `~/.local/share/ampsync` |
+| App data: each job's progress (`jobs`), queue, sign-in window profile (`signin-profile`) | `%LOCALAPPDATA%\AmpSync\data` | `~/.local/share/ampsync` |
 | The app window's own WebView cache | `%LOCALAPPDATA%\io.github.ampsync.desktop` | `~/.local/share/io.github.ampsync.desktop` |
 | Sign-in sessions | Windows Credential Manager | Secret Service (keyring) |
 
@@ -114,6 +107,14 @@ Partly downloaded files carry the `.ampsync-part` suffix and are renamed to thei
 Run the same link and destination again at any time. AmpSync lists the folder, skips files that are unchanged, resumes partly downloaded files, and downloads new or changed files. Local files that no longer exist on SharePoint are left alone unless you use `--prune` on the command line.
 
 ## Removing everything
+
+AmpSync keeps everything in the folders listed above and in the system keychain; your download folders hold nothing of AmpSync. The simplest way to remove it all is the purge command, which deletes every saved sign-in, the settings, the job progress, the queue, the sign-in window's profile and the app window's cache (downloaded files are not touched):
+
+```
+ampsync purge        # asks first; add --yes to skip the question
+```
+
+Close the AmpSync window before running it. The uninstaller does not remove these per-user files by itself, so run `ampsync purge` before you uninstall, or do it by hand:
 
 1. In **Sign-ins**, choose **Sign out** for every site. This deletes the stored session and the sign-in window's profile.
 2. Uninstall AmpSync (Windows: *Settings, Apps*; Ubuntu: `sudo apt remove ampsync` for the .deb, or delete the AppImage). The portable `.exe` is just a file; delete it.
@@ -131,7 +132,7 @@ Run the same link and destination again at any time. AmpSync lists the folder, s
    rm -rf ~/.config/ampsync ~/.local/share/ampsync ~/.local/share/io.github.ampsync.desktop
    ```
 
-4. Optionally delete the downloaded files and the hidden `.ampsync` folder inside each destination.
+4. Optionally delete the downloaded files. (A destination downloaded with an older version may still have a hidden `.ampsync` folder; it is safe to delete.)
 
 If you used the command line, also run `ampsync sessions` and `ampsync logout <host>` for anything listed.
 

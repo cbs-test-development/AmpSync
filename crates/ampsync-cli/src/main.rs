@@ -35,6 +35,7 @@ async fn main() -> ExitCode {
         Command::Sessions => commands::sessions().await,
         Command::Ls(a) => commands::ls(a).await,
         Command::Get(a) => get::get(a).await,
+        Command::Purge(a) => commands::purge(a).await,
     };
     ExitCode::from(code)
 }

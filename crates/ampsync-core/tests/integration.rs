@@ -47,8 +47,25 @@ fn settings() -> Settings {
     }
 }
 
+/// Job state of every test goes here, never into the real per-user data directory.
+fn data_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ampsync-test-data");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    })
+}
+
+/// The state database of the job that downloads into `dest`.
+fn state_db(dest: &Path) -> StateDb {
+    StateDb::open_in(Some(data_dir()), dest).unwrap()
+}
+
 fn tuning() -> Tuning {
     Tuning {
+        data_dir: Some(data_dir().to_path_buf()),
         backoff_base: Duration::from_millis(5),
         backoff_max: Duration::from_millis(40),
         progress_interval: Duration::from_millis(20),
@@ -464,8 +481,11 @@ async fn downloads_a_tree_and_verifies_every_file() {
         assert_eq!(last_progress.0, last_progress.1);
         assert_eq!(last_progress.0, summary.bytes);
 
+        // Nothing of AmpSync stays in the destination: only the downloaded files.
+        assert!(!dest.path().join(".ampsync").exists());
+        assert!(no_part_files(dest.path()));
         // State database.
-        let db = StateDb::open(dest.path()).unwrap();
+        let db = state_db(dest.path());
         for f in db.files().unwrap() {
             assert_eq!(f.status, FileStatus::Verified, "{}", f.rel_path);
             assert_eq!(f.verified_by, Some(VerifiedBy::SizeAndEtag));
@@ -658,7 +678,7 @@ async fn transient_server_errors_are_retried_then_fail_after_max_retries() {
             })
         ));
         assert!(!exists(dest2.path(), "f.bin"));
-        let db = StateDb::open(dest2.path()).unwrap();
+        let db = state_db(dest2.path());
         assert_eq!(
             db.file(&rel("f.bin")).unwrap().unwrap().status,
             FileStatus::Failed
@@ -778,7 +798,7 @@ async fn etag_change_mid_download_is_detected_and_the_file_refetched() {
             Event::FileFailed { error, will_retry: true, .. } if error.contains("changed")
         )));
         assert_eq!(fake.downloads().len(), 6, "3 ranges, then all 3 again");
-        let db = StateDb::open(dest.path()).unwrap();
+        let db = state_db(dest.path());
         assert_eq!(db.file(&rel("doc.bin")).unwrap().unwrap().etag, "\"v2\"");
     })
     .await;
@@ -826,12 +846,9 @@ async fn a_server_that_ignores_range_fails_the_file_without_writing_it() {
             summary.failures
         );
         assert!(!exists(dest.path(), "big.bin") && !exists(dest.path(), "ok.txt"));
-        // The part file holds only zeros: ignored-range bodies were never written.
-        let part = dest.path().join("big.bin.ampsync-part");
-        if part.exists() {
-            assert!(std::fs::read(part).unwrap().iter().all(|b| *b == 0));
-        }
-        let db = StateDb::open(dest.path()).unwrap();
+        // Nothing was recorded, so the half-written part file is not left behind.
+        assert!(no_part_files(dest.path()));
+        let db = state_db(dest.path());
         assert!(db.completed_ranges(&rel("big.bin")).unwrap().is_empty());
     })
     .await;
@@ -869,7 +886,7 @@ async fn cancel_then_rerun_fetches_only_the_missing_ranges() {
         assert!(!exists(dest.path(), "big.bin"));
         assert!(dest.path().join("big.bin.ampsync-part").exists());
         {
-            let db = StateDb::open(dest.path()).unwrap();
+            let db = state_db(dest.path());
             assert_eq!(db.completed_ranges(&rel("big.bin")).unwrap(), vec![0..3 * step]);
         }
 
@@ -890,6 +907,153 @@ async fn cancel_then_rerun_fetches_only_the_missing_ranges() {
         assert_eq!(fetched, expected, "only the missing ranges were requested");
         assert_eq!(read(dest.path(), "big.bin"), big);
         assert!(no_part_files(dest.path()));
+    })
+    .await;
+}
+
+/// Copy every file of `from` into `to`, keeping modification times (as a file manager would).
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if src.is_dir() {
+            copy_tree(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+            let modified = std::fs::metadata(&src).unwrap().modified().unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&dst)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copied_destination_is_skipped_entirely_without_any_state() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        fake.add_file(&key("sub/b.txt"), data(2, 40));
+        fake.add_file(&key("big.bin"), data(3, 300 * KIB));
+        let dest = tempfile::tempdir().unwrap();
+        let e = engine(&fake);
+        run(&e, spec(dest.path())).await;
+
+        // A fresh location: no state record exists for any of these files.
+        let copy = tempfile::tempdir().unwrap();
+        copy_tree(dest.path(), copy.path());
+        fake.clear_log();
+        let plan = e.plan(&spec(copy.path())).await.unwrap();
+        assert!(
+            plan.items
+                .iter()
+                .all(|i| i.action == PlannedAction::SkipUnchanged),
+            "{:?}",
+            plan.items.iter().map(|i| &i.action).collect::<Vec<_>>()
+        );
+        assert_eq!((plan.totals.files, plan.totals.skipped), (0, 3));
+        drop(plan);
+        let (summary, _) = run(&e, spec(copy.path())).await;
+        assert_eq!((summary.downloaded, summary.skipped, summary.bytes), (0, 3, 0));
+        assert!(fake.downloads().is_empty(), "zero downloads");
+
+        // The skips were remembered, so later runs are plain state lookups.
+        let db = state_db(copy.path());
+        let records = db.files().unwrap();
+        assert_eq!(records.len(), 3);
+        for r in records {
+            assert_eq!(r.status, FileStatus::Verified);
+            assert_eq!(r.verified_by, Some(VerifiedBy::SizeAndMtime));
+        }
+        assert!(!copy.path().join(".ampsync").exists());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_state_a_size_or_time_mismatch_downloads_again() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("same.txt"), data(1, 30));
+        fake.add_file(&key("short.txt"), data(2, 40));
+        fake.add_file(&key("touched.txt"), data(3, 50));
+        let dest = tempfile::tempdir().unwrap();
+        let e = engine(&fake);
+        run(&e, spec(dest.path())).await;
+        let copy = tempfile::tempdir().unwrap();
+        copy_tree(dest.path(), copy.path());
+        std::fs::write(copy.path().join("short.txt"), data(2, 10)).unwrap();
+        // A file someone saved later (new mtime, same size) is not assumed to be the download.
+        let touched = std::fs::OpenOptions::new()
+            .write(true)
+            .open(copy.path().join("touched.txt"))
+            .unwrap();
+        touched.set_modified(std::time::SystemTime::now()).unwrap();
+        drop(touched);
+
+        let plan = e.plan(&spec(copy.path())).await.unwrap();
+        let action = |p: &str| {
+            plan.items
+                .iter()
+                .find(|i| i.file.rel_path.as_str() == p)
+                .unwrap()
+                .action
+        };
+        assert_eq!(action("same.txt"), PlannedAction::SkipUnchanged);
+        assert_eq!(action("short.txt"), PlannedAction::Download);
+        assert_eq!(action("touched.txt"), PlannedAction::Download);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_left_in_the_destination_by_older_builds_is_migrated() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        let dest = tempfile::tempdir().unwrap();
+        let e = engine(&fake);
+        run(&e, spec(dest.path())).await;
+
+        // Recreate the old layout: state.db inside <dest>/.ampsync, nothing in the data dir.
+        let job_dir = ampsync_core::appdirs::job_dir(data_dir(), dest.path());
+        let old = dest.path().join(".ampsync");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::copy(job_dir.join("state.db"), old.join("state.db")).unwrap();
+        std::fs::remove_dir_all(&job_dir).unwrap();
+
+        let plan = e.plan(&spec(dest.path())).await.unwrap();
+        assert_eq!(plan.items[0].action, PlannedAction::SkipUnchanged);
+        drop(plan);
+        assert!(!old.exists(), "the destination is clean again");
+        let rec = state_db(dest.path()).file(&rel("a.txt")).unwrap().unwrap();
+        assert_eq!(
+            rec.verified_by,
+            Some(VerifiedBy::SizeAndEtag),
+            "the old record came along"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_job_leaves_no_part_files_in_its_folders() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        fake.add_file(&key("sub/b.txt"), data(2, 40));
+        let dest = tempfile::tempdir().unwrap();
+        // Leftovers from earlier interrupted runs, including one for a file no longer planned.
+        std::fs::create_dir_all(dest.path().join("sub")).unwrap();
+        std::fs::write(dest.path().join("sub").join("gone.bin.ampsync-part"), b"stale").unwrap();
+        std::fs::write(dest.path().join("a.txt.ampsync-part"), b"stale").unwrap();
+        let (summary, _) = run(&engine(&fake), spec(dest.path())).await;
+        assert_eq!((summary.downloaded, summary.failed), (2, 0));
+        assert!(no_part_files(dest.path()));
+        assert_eq!(read(dest.path(), "a.txt"), data(1, 30));
     })
     .await;
 }
@@ -945,7 +1109,7 @@ async fn names_that_windows_cannot_store_are_downloaded_under_safe_names() {
         let dest = tempfile::tempdir().unwrap();
         let (summary, _) = run(&engine(&fake), spec(dest.path())).await;
         assert_eq!((summary.downloaded, summary.failed), (4, 0));
-        let db = StateDb::open(dest.path()).unwrap();
+        let db = state_db(dest.path());
         for (i, n) in names.iter().enumerate() {
             let r = rel(n);
             let local = if cfg!(windows) {
@@ -1037,7 +1201,15 @@ async fn prune_removes_only_stale_files_inside_the_job_scope() {
             "outside the include/exclude scope"
         );
         assert!(exists(dest.path(), "keep.txt") && exists(dest.path(), "sub/also.txt"));
-        assert!(dest.path().join(".ampsync").join("state.db").exists());
+        assert!(
+            !dest.path().join(".ampsync").exists(),
+            "nothing of AmpSync in the destination"
+        );
+        assert!(
+            ampsync_core::appdirs::job_dir(data_dir(), dest.path())
+                .join("state.db")
+                .exists()
+        );
     })
     .await;
 }
@@ -1212,7 +1384,7 @@ async fn a_forbidden_file_fails_alone_while_the_session_stays_valid() {
         assert_eq!(read(dest.path(), "ok2.bin"), data(3, 300 * KIB));
         assert!(!exists(dest.path(), "secret.bin"));
         assert!(fake.count(|l| *l == Logged::Probe) >= 1);
-        let db = StateDb::open(dest.path()).unwrap();
+        let db = state_db(dest.path());
         assert_eq!(
             db.file(&rel("secret.bin")).unwrap().unwrap().status,
             FileStatus::Failed
@@ -1317,9 +1489,9 @@ async fn another_process_holding_the_lock_file_blocks_planning() {
         let fake = Fake::start().await;
         fake.add_file(&key("a.txt"), data(1, 30));
         let dest = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dest.path().join(".ampsync")).unwrap();
+        let job_dir = ampsync_core::appdirs::ensure_job_dir(data_dir(), dest.path()).unwrap();
         // Same effect as a second AmpSync process: an independent handle holds the lock.
-        let foreign = std::fs::File::create(dest.path().join(".ampsync").join("lock")).unwrap();
+        let foreign = std::fs::File::create(job_dir.join("lock")).unwrap();
         foreign.lock().unwrap();
         assert!(matches!(
             engine(&fake).plan(&spec(dest.path())).await,
@@ -1387,10 +1559,7 @@ impl Remote for LosesRanges {
     }
     async fn stat(&self, file: &RemoteFile) -> Result<RemoteFile, Error> {
         if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            StateDb::open(&self.dest)
-                .unwrap()
-                .reset_file(&file.rel_path)
-                .unwrap();
+            state_db(&self.dest).reset_file(&file.rel_path).unwrap();
         }
         self.inner.stat(file).await
     }

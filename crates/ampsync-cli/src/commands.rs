@@ -1,9 +1,10 @@
 //! Subcommand implementations. Each returns the process exit code (see `exit`).
 
 use std::future::Future;
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal, Write};
 
 use ampsync_core::Error;
+use ampsync_core::PurgeReport;
 use ampsync_core::auth::{KeyringStore, Session, SessionStore, SignInMethod};
 use ampsync_core::link::{self, LinkKind, ParsedLink};
 use ampsync_core::remote::{ClassicRemote, Remote, RemoteEntry};
@@ -13,7 +14,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget};
 use time::macros::format_description;
 use url::Url;
 
-use crate::cli::{LoginArgs, LogoutArgs, LsArgs, Method};
+use crate::cli::{LoginArgs, LogoutArgs, LsArgs, Method, PurgeArgs};
 use crate::exit::{self, Failure};
 use crate::session_check::{self, SessionStatus, check, host_root, site_url_for};
 use crate::signin::{self, Request};
@@ -160,6 +161,58 @@ pub async fn logout(args: LogoutArgs) -> u8 {
     .await
 }
 
+/// `ampsync purge [--yes]`: delete every sign-in, the settings and all app data. Downloaded files
+/// and folders are never touched.
+pub async fn purge(args: PurgeArgs) -> u8 {
+    run(async {
+        if !args.yes {
+            if !stdin_is_terminal() {
+                return Err(Failure::usage(
+                    "this removes all saved sign-ins, settings and app data; run it interactively or pass --yes",
+                ));
+            }
+            eprintln!("This removes every saved sign-in, your settings, and AmpSync's app data");
+            eprintln!("(partial-download progress, sign-in window data). Downloaded files are kept.");
+            if !confirm("Remove everything?") {
+                eprintln!("Nothing was removed.");
+                return Ok(exit::OK);
+            }
+        }
+        let report = ampsync_core::purge_all().map_err(|e| Failure::from_core(&e, ""))?;
+        for line in render_purge_report(&report) {
+            println!("{line}");
+        }
+        Ok(if report.errors.is_empty() { exit::OK } else { exit::ERROR })
+    })
+    .await
+}
+
+fn confirm(question: &str) -> bool {
+    eprint!("{question} [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Human-readable lines for a purge result.
+pub fn render_purge_report(r: &PurgeReport) -> Vec<String> {
+    let mut lines = vec![format!("Removed {} saved sign-in entries.", r.keychain_entries)];
+    if r.removed.is_empty() {
+        lines.push("No AmpSync folders were found.".to_string());
+    } else {
+        lines.push("Removed folders:".to_string());
+        lines.extend(r.removed.iter().map(|p| format!("  {}", p.display())));
+    }
+    if !r.errors.is_empty() {
+        lines.push("Some things could not be removed (close AmpSync and try again):".to_string());
+        lines.extend(r.errors.iter().map(|e| format!("  {e}")));
+    }
+    lines
+}
+
 /// One row of the `sessions` table.
 pub type Row = [String; 4];
 
@@ -304,6 +357,27 @@ mod tests {
             normalize_host("https://Contoso.sharepoint.com/sites/a?x=1"),
             "contoso.sharepoint.com"
         );
+    }
+
+    #[test]
+    fn purge_report_lists_folders_and_errors() {
+        let report = PurgeReport {
+            removed: vec!["/data/AmpSync".into()],
+            keychain_entries: 3,
+            errors: vec!["/x: busy".into()],
+        };
+        let text = render_purge_report(&report).join(
+            "
+",
+        );
+        assert!(text.contains("Removed 3 saved sign-in entries."));
+        assert!(text.contains("AmpSync"));
+        assert!(text.contains("/x: busy"));
+        let empty = render_purge_report(&PurgeReport::default()).join(
+            "
+",
+        );
+        assert!(empty.contains("No AmpSync folders were found."));
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub enum Command {
     Ls(LsArgs),
     /// Download a remote folder (re-running resumes and skips unchanged files)
     Get(GetArgs),
+    /// Remove everything AmpSync stores: sign-ins, settings and app data (downloads are kept)
+    Purge(PurgeArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -66,6 +68,13 @@ pub struct LsArgs {
     /// How many folder levels to list (default: 1)
     #[arg(long)]
     pub depth: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+pub struct PurgeArgs {
+    /// Do not ask for confirmation
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -172,6 +181,21 @@ mod tests {
             panic!("not ls")
         };
         assert_eq!(ls.depth, Some(3));
+    }
+
+    #[test]
+    fn purge_takes_an_optional_yes() {
+        let Command::Purge(p) = Cli::try_parse_from(["ampsync", "purge"]).unwrap().command else {
+            panic!("not purge")
+        };
+        assert!(!p.yes);
+        let Command::Purge(p) = Cli::try_parse_from(["ampsync", "purge", "--yes"])
+            .unwrap()
+            .command
+        else {
+            panic!("not purge")
+        };
+        assert!(p.yes);
     }
 
     #[test]

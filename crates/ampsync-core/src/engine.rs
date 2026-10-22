@@ -19,8 +19,12 @@
 //!   `Event::AuthExpired` then `Event::Paused`, and wait for `JobHandle::replace_session` /
 //!   `resume` / `cancel`. A file refused again right after a new session arrived fails instead
 //!   of pausing a second time.
-//! - Only one AmpSync process may use a destination: `<dest>/.ampsync/lock` is held from `plan`
-//!   to the end of the job (`Error::DestinationBusy` otherwise).
+//! - Only one AmpSync process may use a destination: `<data dir>/jobs/<key>/lock` is held from
+//!   `plan` to the end of the job (`Error::DestinationBusy` otherwise). Job state lives in the same
+//!   per-user directory, never inside the destination ([`crate::appdirs`]).
+//! - When a job ends without being cancelled, no `.ampsync-part` file is left in the folders it
+//!   covers, except the partial file of a failed download that has recorded ranges (the next
+//!   successful run removes it).
 //! - Before the rename, the bytes recorded as downloaded must add up to the file size; if they do
 //!   not, the part file is reset and the file retried once.
 //! - Windows: use `\\?\` long paths ([`crate::names::long_path`]); replace illegal characters with
@@ -59,6 +63,8 @@ pub enum VerifiedBy {
     Hash,
     /// Size matched and `stat()` showed the eTag unchanged (D18).
     SizeAndEtag,
+    /// No state was recorded for the file; size and modification time equal the remote's.
+    SizeAndMtime,
 }
 
 /// A file that did not complete.
@@ -154,7 +160,7 @@ pub enum Event {
     Failed {
         error: String,
     },
-    /// Terminal: `JobHandle::cancel` was honoured. `.ampsync-part` files and `state.db` are kept.
+    /// Terminal: `JobHandle::cancel` was honoured. `.ampsync-part` files and the job state are kept.
     Cancelled,
 }
 
@@ -176,6 +182,9 @@ pub struct Tuning {
     pub write_buffer: usize,
     /// Retry policy for listing and metadata requests (`Remote::set_retry_policy`).
     pub retry: RetryPolicy,
+    /// Directory that holds job state (`jobs/<key>/`). `None` uses the per-user data directory
+    /// (`AMPSYNC_DATA_DIR` overrides it); tests point this at a temporary directory.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for Tuning {
@@ -188,6 +197,7 @@ impl Default for Tuning {
             rename_delay: Duration::from_millis(100),
             write_buffer: 1024 * 1024,
             retry: RetryPolicy::default(),
+            data_dir: None,
         }
     }
 }
@@ -222,9 +232,10 @@ impl<R: Remote + 'static> Engine<R> {
 
     /// List the remote tree (`Remote::resolve` + `Remote::walk`), apply `include`/`exclude`
     /// globs, compare with the destination and `state.db`, and decide an action per file.
-    /// Downloads nothing and writes nothing outside `<dest>/.ampsync/`.
+    /// Downloads nothing and writes nothing into the destination; job state goes to the per-user
+    /// data directory.
     pub async fn plan(&self, spec: &JobSpec) -> Result<Plan, Error> {
-        plan::build(self.remote.as_ref(), spec).await
+        plan::build(self.remote.as_ref(), spec, self.tuning.data_dir.as_deref()).await
     }
 
     /// Start transferring `plan` in the background. Must be called inside a tokio runtime.
@@ -289,7 +300,7 @@ impl JobHandle {
         self.ctl.resume();
     }
 
-    /// Abort as soon as possible. `.ampsync-part` files and `state.db` are kept so a rerun
+    /// Abort as soon as possible. `.ampsync-part` files and the job state are kept so a rerun
     /// resumes. `wait` then returns `Err(Error::Cancelled)`.
     pub fn cancel(&self) {
         self.ctl.cancel();
@@ -602,16 +613,22 @@ async fn run_job_inner(
     let started = Instant::now();
     let dest = plan::absolute_dest(&spec.dest);
     // The plan normally carries the destination lock; otherwise take it now.
+    let data_dir = tuning.data_dir.clone();
     let held = match plan.lock.take() {
         Some(l) if l.dest() == dest => l,
         _ => {
-            let dest = dest.clone();
-            blocking(move || DestLock::acquire(&dest)).await?
+            let (dest, data_dir) = (dest.clone(), data_dir.clone());
+            blocking(move || DestLock::acquire(&dest, data_dir.as_deref())).await?
         }
     };
     let state = {
         let dest = dest.clone();
-        blocking(move || StateDb::open(&dest)).await?
+        blocking(move || {
+            // The destination is the user's folder: create it, but put nothing else in it.
+            std::fs::create_dir_all(names::long_path(&dest)).map_err(|e| Error::io(&dest, e))?;
+            StateDb::open_in(data_dir.as_deref(), &dest)
+        })
+        .await?
     };
     {
         let (state, spec, root) = (state.clone(), spec.clone(), plan.root.clone());
@@ -689,6 +706,24 @@ async fn run_job_inner(
         match blocking(move || prune(&dest, &spec, &plan_items)).await {
             Ok(n) => tracing::info!("pruned {n} local files"),
             Err(e) => tracing::warn!("prune failed: {e}"),
+        }
+    }
+
+    {
+        let (state, dest, spec2, items) = (
+            job.state.clone(),
+            job.dest.clone(),
+            spec.clone(),
+            plan.items
+                .iter()
+                .map(|i| i.file.rel_path.clone())
+                .collect::<Vec<_>>(),
+        );
+        let failed_paths: Vec<RelPath> = failures.iter().map(|f| f.rel_path.clone()).collect();
+        match blocking(move || remove_part_files(&state, &dest, &spec2, &items, &failed_paths)).await {
+            Ok(n) if n > 0 => tracing::info!("removed {n} leftover part files"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("part file cleanup failed: {e}"),
         }
     }
 
@@ -1477,6 +1512,69 @@ fn rename_with_retry(from: &Path, to: &Path, attempts: u32, delay: Duration) -> 
     }
 }
 
+/// Delete the `.ampsync-part` files in the folders a finished job covers (inside the include /
+/// exclude scope), so nothing of AmpSync stays in the destination. The part file of a failed file
+/// that has recorded ranges is kept: it is resumable and the next successful run removes it.
+/// Returns the number of files removed.
+fn remove_part_files(
+    state: &StateDb,
+    dest: &Path,
+    spec: &JobSpec,
+    planned: &[RelPath],
+    failed: &[RelPath],
+) -> Result<u64, Error> {
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy().to_string();
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    };
+    let filters = Filters::new(&spec.include, &spec.exclude)?;
+    let mut keep: HashSet<String> = HashSet::new();
+    for rel in failed {
+        if !state.completed_ranges(rel)?.is_empty() {
+            keep.insert(norm(&plan::local_paths(dest, rel).1));
+        }
+    }
+    // Each folder that holds a planned file, with the local relative prefix of its contents.
+    let mut dirs: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for rel in planned {
+        let local = plan::local_rel_path(rel);
+        let prefix = local.parent().map(|p| p.as_str().to_string()).unwrap_or_default();
+        let dir = plan::local_paths(dest, rel).0.parent().map(Path::to_path_buf);
+        if let Some(dir) = dir {
+            dirs.entry(prefix).or_insert(dir);
+        }
+    }
+    let mut removed = 0u64;
+    for (prefix, dir) in dirs {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(final_name) = name.strip_suffix(plan::PART_SUFFIX) else {
+                continue;
+            };
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let final_rel = if prefix.is_empty() {
+                final_name.to_string()
+            } else {
+                format!("{prefix}/{final_name}")
+            };
+            let path = entry.path();
+            if !filters.matches(&final_rel) || keep.contains(&norm(&path)) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!("cannot remove {}: {e}", path.display()),
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Delete local files inside the job's scope (matching the include/exclude globs) that are not part
 /// of the plan, plus leftover part files, then remove directories left empty. Returns files removed.
 fn prune(dest: &Path, spec: &JobSpec, planned: &[RelPath]) -> Result<u64, Error> {
@@ -1533,6 +1631,73 @@ fn prune(dest: &Path, spec: &JobSpec, planned: &[RelPath]) -> Result<u64, Error>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn part_files_are_swept_except_resumable_failures() {
+        let dest = tempfile::tempdir().unwrap();
+        let rel = |s: &str| RelPath::new(s).unwrap();
+        let touch = |p: &str| {
+            let path = dest.path().join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            path
+        };
+        let resumable = touch("sub/resumable.bin.ampsync-part");
+        let dead = touch("sub/dead.bin.ampsync-part");
+        let stray = touch("sub/stray.bin.ampsync-part");
+        let root_stray = touch("root.bin.ampsync-part");
+        let excluded = touch("sub/skip.tmp.ampsync-part");
+        let elsewhere = touch("other/unrelated.bin.ampsync-part");
+        let real_file = touch("sub/keep.txt");
+
+        let state = StateDb::open_in_memory().unwrap();
+        for (name, ranges) in [("sub/resumable.bin", true), ("sub/dead.bin", false)] {
+            state
+                .upsert_file(&FileRecord {
+                    rel_path: rel(name),
+                    size: 100,
+                    etag: "e".into(),
+                    hash: None,
+                    status: FileStatus::Failed,
+                    bytes_done: 0,
+                    verified_by: None,
+                    error: Some("boom".into()),
+                    local_name: None,
+                })
+                .unwrap();
+            if ranges {
+                state.add_range(&rel(name), 0..10).unwrap();
+            }
+        }
+        let mut spec = JobSpec::new("link", dest.path());
+        spec.exclude = vec!["*.tmp".into()];
+        let planned = [
+            rel("sub/resumable.bin"),
+            rel("sub/dead.bin"),
+            rel("root.bin"),
+            rel("sub/keep.txt"),
+        ];
+        let failed = [rel("sub/resumable.bin"), rel("sub/dead.bin")];
+        let n = remove_part_files(&state, dest.path(), &spec, &planned, &failed).unwrap();
+
+        assert_eq!(n, 3);
+        assert!(
+            resumable.exists(),
+            "a failed file with recorded ranges stays resumable"
+        );
+        assert!(!dead.exists() && !stray.exists() && !root_stray.exists());
+        assert!(excluded.exists(), "outside the include/exclude scope");
+        assert!(
+            elsewhere.exists(),
+            "folders the job does not cover are left alone"
+        );
+        assert!(real_file.exists());
+
+        // A clean run removes the resumable leftover as well.
+        let n = remove_part_files(&state, dest.path(), &spec, &planned, &[]).unwrap();
+        assert_eq!(n, 1);
+        assert!(!resumable.exists());
+    }
 
     #[test]
     fn events_serialise_tagged() {
