@@ -88,6 +88,8 @@ class Store {
   toastText = $state<string | null>(null);
   tourOpen = $state(false);
   closePrompt = $state(false);
+  /** Whether a download was running when the close prompt opened. */
+  closeActive = $state(false);
   /** Host of the sign-in window that is open right now, if any. */
   signInOpen = $state<string | null>(null);
   ready = $state(false);
@@ -302,7 +304,10 @@ class Store {
     await on<{ host: string; state: string }>("signin-state", (p) => {
       this.signInOpen = p.state === "window_open" ? p.host : null;
     });
-    await on<null>("close-requested", () => (this.closePrompt = true));
+    await on<boolean>("close-requested", (active) => {
+      this.closeActive = active;
+      this.closePrompt = true;
+    });
     await on<UpdateInfo | null>("update-available", (u) => (this.update = u));
 
     const [settings, queue, info, contributors, update] = await Promise.all([

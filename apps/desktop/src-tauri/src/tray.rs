@@ -91,15 +91,17 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
     if state.quitting.load(Ordering::SeqCst) {
         return;
     }
-    if !state.queue.has_active() {
-        // Nothing running: just quit.
+    let behavior = state.settings().close_behavior;
+    if !state.queue.has_active() && behavior == CloseBehavior::Pause {
+        // Nothing running and the user chose "pause": just quit.
         state.quitting.store(true, Ordering::SeqCst);
         return;
     }
+    // Until the user picks a remembered choice (behavior Ask), every close asks, idle or not.
     api.prevent_close();
-    match state.settings().close_behavior {
+    match behavior {
         CloseBehavior::Ask => {
-            let _ = app.emit("close-requested", ());
+            let _ = app.emit("close-requested", state.queue.has_active());
             let _ = window.show();
             let _ = window.set_focus();
         }
