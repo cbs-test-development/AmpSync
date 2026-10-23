@@ -4,6 +4,7 @@
   import { duration, num, rate, size, sizeParts } from "../core/format";
   import type { QueueItem } from "../core/types";
   import Chart from "../parts/Chart.svelte";
+  import NotifyPrompt from "../parts/NotifyPrompt.svelte";
 
   const MB = 1024 * 1024;
 
@@ -116,6 +117,8 @@
     }
   }
 </script>
+
+<NotifyPrompt />
 
 {#if job && job.status === "needs_sign_in"}
   <div class="alert" role="alert">

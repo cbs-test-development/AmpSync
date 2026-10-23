@@ -4,15 +4,25 @@
 //! refresh in a hidden window with AmpSync's own profile. Only when that fails and a queued job
 //! needs the host does the sign-in window open, and it opens before any job starts.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ampsync_core::Error;
 use tauri::{AppHandle, Manager, Url};
 
 use crate::AppState;
 use crate::signin::{Validity, site_url_of, validate};
 
+/// The launch-time check has answered for every saved sign-in (the startup splash waits for it).
+static CHECKED: AtomicBool = AtomicBool::new(false);
+
+pub fn checked() -> bool {
+    CHECKED.load(Ordering::SeqCst)
+}
+
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         check_all(&app, true).await;
+        CHECKED.store(true, Ordering::SeqCst);
         app.state::<AppState>().queue.open_gate();
     });
 }

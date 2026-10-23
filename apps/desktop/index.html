@@ -3,11 +3,153 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
     <link rel="icon" type="image/png" href="/icon.png" />
     <title>AmpSync</title>
+    <style>
+      /* Startup splash (F7, D25). Plain HTML and CSS so it paints before the app bundle runs; the
+         window itself stays hidden until src/splash.ts says this first frame is ready. The colours
+         repeat the tokens of src/app.css on purpose: the splash must not depend on that file. */
+      html { background: #0f1216; }
+      @media (prefers-color-scheme: light) { html:not([data-theme="dark"]) { background: #e9ecef; } }
+      html[data-theme="light"] { background: #e9ecef; }
+
+      #splash {
+        --bg: #0f1216; --fg: #d8dde5; --muted: #8a93a2; --signal: #f0a43a; --grid: #222831;
+        --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+        --f-body: "IBM Plex Sans", system-ui, "Segoe UI", sans-serif;
+        --f-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+        --k: 1.25; /* the sequence is stretched to fill the first 3 s */
+      }
+      @media (prefers-color-scheme: light) {
+        html:not([data-theme="dark"]) #splash { --bg: #e9ecef; --fg: #1a1f27; --muted: #5a6371; --signal: #b46a08; --grid: #e2e6ea; }
+      }
+      html[data-theme="light"] #splash { --bg: #e9ecef; --fg: #1a1f27; --muted: #5a6371; --signal: #b46a08; --grid: #e2e6ea; }
+
+      #splash {
+        position: fixed; inset: 0; z-index: 9999; display: grid; grid-template-rows: 1fr auto; overflow: hidden;
+        background-color: var(--bg); color: var(--fg); font: 14px/1.5 var(--f-body); cursor: default; user-select: none;
+        background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+        background-size: 28px 28px; background-position: center;
+      }
+      #splash.hidden { display: none; }
+      /* If nothing ever takes the splash over (a script failed), it still gets out of the way. */
+      #splash:not(.live) { animation: sp-out .3s 8s ease-in forwards; }
+      #splash.lift { pointer-events: none; }
+      #splash::after {
+        /* vignette so the grid fades toward the edges */
+        content: ""; position: absolute; inset: 0; pointer-events: none;
+        background: radial-gradient(ellipse at center, transparent 30%, var(--bg) 78%);
+      }
+      #splash .center { position: relative; z-index: 1; display: grid; place-items: center; align-content: center; gap: 18px; }
+      #splash .mark { width: clamp(84px, 14vw, 128px); height: auto; overflow: visible; }
+      #splash .wordmark {
+        font: 600 clamp(28px, 4.4vw, 42px)/1 var(--f-display); letter-spacing: .02em; margin: 0; display: flex; gap: .01em;
+      }
+      #splash .wordmark span { display: inline-block; }
+      #splash .status { font: 12px var(--f-mono); color: var(--muted); display: grid; gap: 8px; justify-items: center; min-height: 34px; }
+      #splash .hairline { width: 168px; height: 2px; background: var(--grid); border-radius: 1px; overflow: hidden; position: relative; }
+      #splash .hairline i { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--signal); }
+      #splash .foot {
+        position: relative; z-index: 1; display: flex; justify-content: space-between; align-items: center; gap: 12px;
+        flex-wrap: wrap; padding: 14px 18px; font: 11px var(--f-mono); color: var(--muted);
+      }
+      #splash .credit { display: flex; align-items: center; gap: 8px; }
+      #splash .credit[hidden] { display: none; }
+      #splash .avatars { display: flex; }
+      #splash .avatars b {
+        width: 18px; height: 18px; border-radius: 3px; display: grid; place-items: center; margin-left: -4px; overflow: hidden;
+        font: 600 9px var(--f-display); color: #1a1206; background: var(--signal); border: 1px solid var(--bg);
+      }
+      #splash .avatars b:first-child { margin-left: 0; }
+      #splash .avatars img { width: 100%; height: 100%; display: block; }
+      #splash .credit em { font-style: normal; color: var(--fg); }
+
+      /* Animation (runs once the page adds .play, when the window has been shown) */
+      #splash .seg { transform-box: fill-box; transform-origin: center; opacity: 0; }
+      #splash .base { stroke-dasharray: 40; stroke-dashoffset: 40; }
+      #splash.play .seg { animation: sp-drop calc(.38s * var(--k)) cubic-bezier(.2, .9, .3, 1.25) forwards; animation-delay: calc(var(--d) * var(--k) * 1s); }
+      #splash.play .base { animation: sp-draw calc(.5s * var(--k)) calc(.55s * var(--k)) cubic-bezier(.6, 0, .2, 1) forwards; }
+      #splash.play .pulse { animation: sp-pulse calc(.9s * var(--k)) calc(1.05s * var(--k)) ease-out forwards; }
+      #splash .wordmark span { opacity: 0; transform: translateY(6px); }
+      #splash.play .wordmark span { animation: sp-rise calc(.32s * var(--k)) ease-out forwards; animation-delay: calc((.85s + var(--i) * 35ms) * var(--k)); }
+      #splash .status > * { opacity: 0; }
+      #splash.play .status > * { animation: sp-fade calc(.3s * var(--k)) calc(1.2s * var(--k)) ease-out forwards; }
+      #splash.play .hairline i { animation: sp-fill calc(1.1s * var(--k)) calc(1.25s * var(--k)) cubic-bezier(.4, 0, .2, 1) forwards; }
+      #splash .foot { opacity: 0; }
+      #splash.play .foot { animation: sp-fade calc(.5s * var(--k)) calc(1.35s * var(--k)) ease-out forwards; }
+      /* Still waiting after the sequence ended: the line breathes instead of sitting finished. */
+      #splash.wait .hairline i { width: 100%; animation: sp-breathe 1.6s ease-in-out infinite; }
+      #splash.lift .center { animation: sp-liftc .45s cubic-bezier(.6, 0, .2, 1) forwards; }
+      #splash.lift { animation: sp-out .5s .1s ease-in forwards; }
+
+      @keyframes sp-drop { from { opacity: 0; transform: translateY(-26px) scaleY(1.4); } 70% { opacity: 1; } to { opacity: 1; transform: none; } }
+      @keyframes sp-draw { to { stroke-dashoffset: 0; } }
+      @keyframes sp-pulse { 0% { opacity: .55; r: 0; } 100% { opacity: 0; r: 34; } }
+      @keyframes sp-rise { to { opacity: 1; transform: none; } }
+      @keyframes sp-fade { to { opacity: 1; } }
+      @keyframes sp-fill { to { width: 100%; } }
+      @keyframes sp-breathe { 50% { opacity: .35; } }
+      @keyframes sp-liftc { to { transform: translateY(-14px) scale(.96); } }
+      @keyframes sp-out { to { opacity: 0; visibility: hidden; } }
+
+      /* Reduced motion (the setting, or the OS preference): everything visible at once, then a plain 300 ms fade. */
+      #splash.calm .seg, #splash.calm .wordmark span, #splash.calm .status > *, #splash.calm .foot { opacity: 1 !important; transform: none !important; animation: none !important; }
+      #splash.calm .base { stroke-dashoffset: 0 !important; animation: none !important; }
+      #splash.calm .hairline i { width: 100%; animation: none !important; }
+      #splash.calm .pulse { display: none; }
+      #splash.calm.lift .center { animation: none; }
+      #splash.calm.lift { animation: sp-out .3s ease-in forwards; }
+      @media (prefers-reduced-motion: reduce) {
+        #splash .seg, #splash .wordmark span, #splash .status > *, #splash .foot { opacity: 1; transform: none; }
+        #splash.play .seg, #splash.play .wordmark span, #splash.play .status > *, #splash.play .foot, #splash.play .base,
+        #splash.play .hairline i, #splash.play .pulse, #splash.lift .center, #splash.wait .hairline i { animation: none; }
+        #splash .base { stroke-dashoffset: 0; } #splash .hairline i { width: 100%; }
+      }
+    </style>
   </head>
   <body>
+    <div id="splash" role="img" aria-label="AmpSync is starting">
+      <div class="center">
+        <svg class="mark" viewBox="0 0 34 34" aria-hidden="true">
+          <circle class="pulse" cx="17" cy="25" r="0" fill="none" stroke="var(--signal)" stroke-width=".6" opacity="0" />
+          <!-- four lanes, each built from falling segments (lane heights match the app icon: 9, 12, 9, 12) -->
+          <g fill="var(--signal)">
+            <rect class="seg" x="6.8" y="15" width="2.4" height="2.5" rx="1.1" style="--d:0" />
+            <rect class="seg" x="6.8" y="12" width="2.4" height="2.5" rx="1.1" style="--d:.095" />
+            <rect class="seg" x="6.8" y="9" width="2.4" height="2.5" rx="1.1" style="--d:.19" />
+            <rect class="seg" x="11.8" y="18" width="2.4" height="2.5" rx="1.1" style="--d:.07" />
+            <rect class="seg" x="11.8" y="15" width="2.4" height="2.5" rx="1.1" style="--d:.165" />
+            <rect class="seg" x="11.8" y="12" width="2.4" height="2.5" rx="1.1" style="--d:.26" />
+            <rect class="seg" x="11.8" y="9" width="2.4" height="2.5" rx="1.1" style="--d:.355" />
+            <rect class="seg" x="16.8" y="15" width="2.4" height="2.5" rx="1.1" style="--d:.14" />
+            <rect class="seg" x="16.8" y="12" width="2.4" height="2.5" rx="1.1" style="--d:.235" />
+            <rect class="seg" x="16.8" y="9" width="2.4" height="2.5" rx="1.1" style="--d:.33" />
+            <rect class="seg" x="21.8" y="18" width="2.4" height="2.5" rx="1.1" style="--d:.21" />
+            <rect class="seg" x="21.8" y="15" width="2.4" height="2.5" rx="1.1" style="--d:.305" />
+            <rect class="seg" x="21.8" y="12" width="2.4" height="2.5" rx="1.1" style="--d:.4" />
+            <rect class="seg" x="21.8" y="9" width="2.4" height="2.5" rx="1.1" style="--d:.495" />
+          </g>
+          <path class="base" d="M7 25h20" stroke="var(--fg)" stroke-width="2.4" stroke-linecap="round" fill="none" pathLength="40" />
+        </svg>
+        <h1 class="wordmark" aria-label="AmpSync">
+          <span style="--i:0">A</span><span style="--i:1">m</span><span style="--i:2">p</span><span style="--i:3">S</span><span style="--i:4">y</span><span style="--i:5">n</span><span style="--i:6">c</span>
+        </h1>
+        <div class="status">
+          <span id="sp-status">starting</span>
+          <span class="hairline"><i></i></span>
+        </div>
+      </div>
+      <div class="foot">
+        <span id="sp-version"></span>
+        <span class="credit" id="sp-credit" hidden>
+          <span class="avatars" id="sp-faces" aria-hidden="true"></span>
+          <span>built by <em id="sp-name"></em><span id="sp-others"></span></span>
+        </span>
+      </div>
+    </div>
     <div id="app"></div>
+    <script type="module" src="/src/splash.ts"></script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

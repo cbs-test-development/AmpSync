@@ -340,6 +340,8 @@ class Store {
     });
     await on<UpdateInfo | null>("update-available", (u) => (this.update = u));
     await on<IncomingLink>("incoming-link", (p) => void this.receiveLink(p.text));
+    // A click on a finish, failure or sign-in notification: the backend has raised the window.
+    await on<{ kind: string }>("notification-click", () => this.go("transfers"));
 
     const [settings, queue, info, contributors, update] = await Promise.all([
       api.getSettings(),
