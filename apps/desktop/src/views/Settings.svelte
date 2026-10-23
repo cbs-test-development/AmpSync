@@ -1,7 +1,7 @@
 <script lang="ts">
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { app, type Theme } from "../core/store.svelte";
-  import { toCmdError } from "../core/api";
+  import { api, toCmdError } from "../core/api";
   import type { CloseBehavior } from "../core/types";
 
   const MB = 1024 * 1024;
@@ -52,6 +52,32 @@
     { id: "dark", label: "Dark" },
     { id: "light", label: "Light" },
   ];
+
+  let confirmRemove = $state(false);
+  let removing = $state(false);
+  let cancelBtn = $state<HTMLButtonElement>();
+
+  $effect(() => {
+    if (!confirmRemove) return;
+    cancelBtn?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !removing) confirmRemove = false;
+    };
+    addEventListener("keydown", onKey);
+    return () => removeEventListener("keydown", onKey);
+  });
+
+  async function removeAll() {
+    removing = true;
+    try {
+      // On success AmpSync closes, cleans up and opens again by itself.
+      await api.purgeEverything();
+    } catch (e) {
+      removing = false;
+      confirmRemove = false;
+      app.toast(toCmdError(e).message);
+    }
+  }
 
   const isWindows = $derived(app.info?.os === "windows");
 </script>
@@ -123,9 +149,38 @@
       </div>
     </div>
   </div>
+
+  <div class="panel danger-zone">
+    <div class="toggle">
+      <div><strong>Remove all AmpSync data</strong><p>Signs you out everywhere and deletes your settings, saved sign-ins and download history from this computer. Your downloaded files are not touched. AmpSync then restarts as if it was just installed.</p></div>
+      <button type="button" class="btn danger" id="remove-all" onclick={() => (confirmRemove = true)}>Remove all data</button>
+    </div>
+  </div>
+
+  {#if confirmRemove}
+    <div class="scrim">
+      <div class="dlg" role="alertdialog" aria-modal="true" aria-labelledby="rm-title" aria-describedby="rm-body">
+        <h3 id="rm-title">Remove all AmpSync data?</h3>
+        <p id="rm-body">This signs you out of every SharePoint site and deletes your settings, queue and download history. AmpSync closes and opens again from scratch. Files you already downloaded stay where they are. This cannot be undone.</p>
+        <div class="row">
+          <button type="button" class="btn ghost" bind:this={cancelBtn} disabled={removing} onclick={() => (confirmRemove = false)}>Cancel</button>
+          <button type="button" class="btn danger" disabled={removing} onclick={removeAll}>{removing ? "Removing…" : "Remove everything"}</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 {/if}
 
 <style>
+  .danger-zone { border-color: var(--crit); }
+  .scrim { position: fixed; inset: 0; z-index: 60; background: rgba(6, 8, 11, .62); display: grid; place-items: center; padding: 16px; }
+  .dlg {
+    width: min(460px, 100%); background: var(--raise); border: 1px solid var(--line); border-top: 2px solid var(--crit);
+    border-radius: 4px; padding: 16px 18px 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, .35);
+  }
+  .dlg h3 { margin: 0 0 6px; font: 600 17px/1.25 var(--f-display); }
+  .dlg p { margin: 0 0 14px; font-size: 13px; color: var(--muted); }
+  .dlg .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
   .toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
   .toggle:last-child { border-bottom: 0; }
   .toggle p { margin: 2px 0 0; font-size: 12px; color: var(--muted); max-width: 70ch; }

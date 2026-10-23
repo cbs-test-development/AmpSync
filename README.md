@@ -114,7 +114,7 @@ Exit codes: `0` success, `1` error, `2` bad usage, `3` sign-in expired (sign in 
 
 **Does AmpSync leave files in my download folder?** No. Only the downloaded files are there; the job's progress is kept in AmpSync's own app data folder (`%LOCALAPPDATA%\AmpSync` on Windows), so you can zip, share or commit the folder as it is. Copy it somewhere else and run the same link against the new location and unchanged files are recognised and skipped.
 
-**How do I remove everything AmpSync stored?** Run `ampsync purge` (or uninstall and follow [Removing everything](docs/user-guide.md#removing-everything)). It deletes the saved sign-ins, settings and app data, and never touches your downloads.
+**How do I remove everything AmpSync stored?** On Windows, the uninstaller has a box, ticked by default, that says "Also remove my sign-ins, settings and download history"; it also clears the Windows Credential Manager entries. Without uninstalling, use **Settings, Remove all data**, or run `ampsync purge` (portable `.exe`, AppImage, command line). On Ubuntu, `apt remove` cannot reach per-user data, so run `ampsync purge` or the Settings action first. Your downloaded files are never touched. Details: [Removing everything](docs/user-guide.md#removing-everything).
 
 <details>
 <summary><strong>My company blocks the sign-in window</strong></summary>

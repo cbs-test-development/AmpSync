@@ -564,3 +564,20 @@ pub fn close_decision(app: AppHandle, state: State<'_, AppState>, decision: Clos
 pub fn known_hosts(state: State<'_, AppState>) -> CmdResult<BTreeSet<String>> {
     Ok(state.store.hosts()?.into_iter().collect())
 }
+
+/// Settings > "Remove all AmpSync data". Closes every sign-in window, stops the queue, starts a
+/// detached copy of the app that waits for this process to exit, deletes everything (keychain
+/// sessions, settings, job state, sign-in profile, WebView cache) and starts AmpSync again. The
+/// purge cannot run in this process: the main window's WebView holds its profile folder open.
+#[tauri::command(rename_all = "snake_case")]
+pub fn purge_everything(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    let helper = crate::purge::spawn_restart_helper()
+        .map_err(|e| CmdError::new("error", format!("Could not start the cleanup: {e}")))?;
+    // Keep the pipe to the helper open until this process ends; that is its signal to go ahead.
+    std::mem::forget(helper);
+    state.quitting.store(true, std::sync::atomic::Ordering::SeqCst);
+    state.signin.cancel(&app);
+    state.queue.pause_for_exit(&app, false);
+    app.exit(0);
+    Ok(())
+}

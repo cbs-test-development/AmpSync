@@ -83,6 +83,7 @@ Settings save automatically.
 | Remember passwords in the sign-in window | Off by default. |
 | Use the Windows work account (Windows) | Single sign-on with the account Windows is signed in with. On by default. |
 | Replay the walkthrough | Shows the first-run tour again. |
+| Remove all AmpSync data | Signs out everywhere and deletes AmpSync's settings, sign-ins and history, then restarts it fresh. Your downloaded files stay. See [Removing everything](#removing-everything). |
 
 ## Where your files and data live
 
@@ -108,16 +109,24 @@ Run the same link and destination again at any time. AmpSync lists the folder, s
 
 ## Removing everything
 
-AmpSync keeps everything in the folders listed above and in the system keychain; your download folders hold nothing of AmpSync. The simplest way to remove it all is the purge command, which deletes every saved sign-in, the settings, the job progress, the queue, the sign-in window's profile and the app window's cache (downloaded files are not touched):
+AmpSync keeps its own files in a few per-user folders and your sign-ins in the system keychain; your download folders hold nothing of AmpSync. Removing everything deletes every saved sign-in, the settings, the job progress and download history, the queue, the sign-in window's profile and the app window's cache. **Downloaded files are never touched.** Pick whichever fits how you installed it:
 
-```
-ampsync purge        # asks first; add --yes to skip the question
-```
+- **Windows installer (uninstalling).** *Settings, Apps, AmpSync, Uninstall.* The uninstaller shows the box **Also remove my sign-ins, settings and download history (your downloaded files are not touched)**. It is **ticked by default**. Leave it ticked to remove everything, including the entries in Windows Credential Manager, or untick it to keep your sign-ins and settings for a later reinstall. If AmpSync is running, the uninstaller asks to close it first. Silent and update installs never remove your data. For scripted removal, run `uninstall.exe /S /REMOVEALL`.
+- **Without uninstalling (any install).** Open **Settings** and choose **Remove all data** under *Remove all AmpSync data*, then confirm. AmpSync signs you out everywhere, deletes its data, closes and starts again as if it was just installed (the walkthrough shows again).
+- **Portable `.exe`, AppImage, command line, or Ubuntu .deb.** Run:
 
-Close the AmpSync window before running it. The uninstaller does not remove these per-user files by itself, so run `ampsync purge` before you uninstall, or do it by hand:
+  ```
+  ampsync purge        # asks first; add --yes to skip the question
+  ```
+
+  Close the AmpSync window before running it.
+
+**Ubuntu .deb:** `sudo apt remove ampsync` cannot reach per-user data (it runs as root and cannot see each user's keyring and home folder), so it leaves your sign-ins and settings behind. Run `ampsync purge` or the Settings action **before** `apt remove`. The portable `.exe` is just a file; delete it after purging.
+
+If you prefer to do it by hand:
 
 1. In **Sign-ins**, choose **Sign out** for every site. This deletes the stored session and the sign-in window's profile.
-2. Uninstall AmpSync (Windows: *Settings, Apps*; Ubuntu: `sudo apt remove ampsync` for the .deb, or delete the AppImage). The portable `.exe` is just a file; delete it.
+2. Uninstall AmpSync (Windows: *Settings, Apps*; Ubuntu: `sudo apt remove ampsync` for the .deb, or delete the AppImage).
 3. Delete AmpSync's data folders if they still exist:
 
    **Windows** (PowerShell):

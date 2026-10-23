@@ -36,7 +36,10 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "languages": ["English"],
+        "template": "windows/installer.nsi",
+        "installerHooks": "windows/hooks.nsh"
       }
     },
     "linux": {

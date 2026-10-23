@@ -92,15 +92,17 @@ pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
         return;
     }
     let behavior = state.settings().close_behavior;
-    if !state.queue.has_active() && behavior == CloseBehavior::Pause {
+    let active = state.queue.has_active();
+    if !active && behavior == CloseBehavior::Pause {
         // Nothing running and the user chose "pause": just quit.
         state.quitting.store(true, Ordering::SeqCst);
         return;
     }
     // Until the user picks a remembered choice (behavior Ask), every close asks, idle or not.
+    // A remembered "pause and quit" still warns while a download is running.
     api.prevent_close();
     match behavior {
-        CloseBehavior::Ask => {
+        CloseBehavior::Ask | CloseBehavior::Pause => {
             let _ = app.emit("close-requested", state.queue.has_active());
             let _ = window.show();
             let _ = window.set_focus();

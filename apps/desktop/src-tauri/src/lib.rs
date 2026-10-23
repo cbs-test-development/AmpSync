@@ -5,6 +5,7 @@ mod commands;
 mod contributors;
 mod error;
 mod paths;
+mod purge;
 mod queue;
 mod signin;
 mod startup;
@@ -77,6 +78,13 @@ impl AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Uninstall / "remove all data" modes run before anything else exists: no window, no WebView
+    // profile open, no single-instance forwarding to a running copy.
+    if let Some(mode) = purge::mode_from_args(std::env::args_os()) {
+        purge::run(mode);
+        return;
+    }
+
     let settings = Settings::load().unwrap_or_else(|e| {
         tracing::warn!("settings could not be read, using defaults: {e}");
         Settings::default()
@@ -113,6 +121,7 @@ pub fn run() {
             commands::open_external,
             commands::close_decision,
             commands::known_hosts,
+            commands::purge_everything,
         ])
         .on_window_event(tray::on_window_event)
         .setup(|app| {

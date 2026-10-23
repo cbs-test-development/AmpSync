@@ -42,6 +42,7 @@ export const api = {
   contributors: () => invoke<ContributorList>("contributors"),
   getUpdate: () => invoke<UpdateInfo | null>("get_update"),
   openExternal: (url: string) => invoke<void>("open_external", { url }),
+  purgeEverything: () => invoke<void>("purge_everything"),
   closeDecision: (choice: "tray" | "pause", remember: boolean) =>
     invoke<void>("close_decision", { decision: { choice, remember } }),
 };
