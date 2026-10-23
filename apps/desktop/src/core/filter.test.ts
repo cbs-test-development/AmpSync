@@ -222,6 +222,13 @@ describe("toSpec", () => {
     expect(dayStart("yesterday")).toBe(0);
   });
 
+  it("gives a plain copy that can be posted to a worker even from reactive state", () => {
+    const reactive = new Proxy(["pdf"], {}); // stands in for a Svelte state proxy
+    const s = toSpec({ ...emptyState(), exts: reactive }, now);
+    expect(structuredClone(s).exts).toEqual(["pdf"]);
+    expect(() => structuredClone(reactive)).toThrow();
+  });
+
   it("passes the search text and ticked types through", () => {
     const s = toSpec({ ...emptyState(), query: "x*", exts: ["pdf"] }, now);
     expect([s.query, s.exts]).toEqual(["x*", ["pdf"]]);

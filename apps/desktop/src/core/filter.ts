@@ -262,5 +262,6 @@ export function toSpec(s: FilterState, now = Math.floor(Date.now() / 1000)): Fil
   if (s.modified === "7d") since = now - 7 * DAY;
   else if (s.modified === "30d") since = now - 30 * DAY;
   else if (s.modified === "since") since = dayStart(s.sinceDate);
-  return { query: s.query, exts: s.exts, minSize, maxSize, since };
+  // A copy: `s` may be a reactive proxy, which cannot be posted to a worker.
+  return { query: s.query, exts: [...s.exts], minSize, maxSize, since };
 }
