@@ -126,7 +126,7 @@ jobs:
       # -----------------------------------------------------------------------------------------
 
       - name: Build desktop bundles
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         with:
           projectPath: apps/desktop
           args: --bundles ${{ matrix.bundles }}
