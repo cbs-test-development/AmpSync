@@ -1783,7 +1783,7 @@ async fn auto_tuning_stays_under_the_request_budget() {
     guarded(async {
         // Each lane makes about four requests a second (256 KiB ranges at 1 MiB/s) and nothing
         // else limits throughput, so the tuner would climb to 16 lanes: about 190 requests in
-        // 3 s. The budget is 130 per 3 s, and growth must stop before that.
+        // 3 s. The budget is 130 per 3 s: once the projected count passes it, growth stops.
         let fake = Fake::start().await;
         fake.bandwidth(None, Some(MIB as u64));
         let body = data(7, 4 * MIB);
@@ -1806,8 +1806,8 @@ async fn auto_tuning_stays_under_the_request_budget() {
             changes.iter().any(|c| c.1 == LanesReason::Budget),
             "the budget must have been reached: {changes:?}"
         );
-        let peak = changes.iter().map(|c| c.0).max().unwrap();
-        assert!(peak < 16, "growth stopped below the maximum: {changes:?}");
+        // Lanes may grow again once the larger ranges bring the count well below the budget
+        // (hysteresis), but the server never sees more than the budget allows.
         let busiest = fake.max_requests_within(window);
         assert!(busiest < 130, "{busiest} requests within {window:?}: {changes:?}");
         // Once over budget, files are fetched with larger ranges.

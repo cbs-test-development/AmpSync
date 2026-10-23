@@ -98,7 +98,7 @@ If you quit AmpSync while it is waiting for space, the download goes back in the
 
 ## Parallel lanes: Auto
 
-A lane is one transfer running at the same time as the others. By default AmpSync is on **Auto**: it starts with 4 lanes and, every 10 seconds of active transfer, tries one more. If that did not make the download at least 5% faster it takes the lane back and waits a minute before trying again. When SharePoint asks it to slow down it halves the lanes and waits before adding any. It stays under about 80% of SharePoint's request limit for one user, using larger pieces for new files when it gets close. It never uses fewer than 2 lanes or more than 16.
+A lane is one transfer running at the same time as the others. By default AmpSync is on **Auto**: it starts with 4 lanes and tries one more at a time. A new lane stays only if the download is at least 5% faster for two 10-second stretches in a row; otherwise AmpSync takes it back and waits a minute before trying again, and longer (up to 8 minutes) each time in a row it did not help. When SharePoint asks it to slow down it halves the lanes and waits before adding any. It stays under about 80% of SharePoint's request limit for one user, using larger pieces for new files when it gets close. It never uses fewer than 2 lanes or more than 16.
 
 The **Parallel lanes** panel in Transfers is headed **Auto · 7 lanes** (or just **7 lanes** if you set a fixed number). Every lane is listed, in two columns once there are more than 8, so you can see what each is doing. A lane that is being taken away finishes its file first and is marked *closing*.
 

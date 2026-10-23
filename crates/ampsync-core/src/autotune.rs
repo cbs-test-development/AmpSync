@@ -2,7 +2,9 @@
 //!
 //! AIMD, evaluated once per window of active transfer: add a lane while throughput keeps
 //! improving, take it back (and hold) when it does not, halve on throttling (429/503), and stay
-//! under SharePoint's per-user request budget. [`Controller`] is a pure state machine driven with
+//! under SharePoint's per-user request budget. A new lane must beat the window before it twice in a
+//! row to be kept, and the hold after a lane that did not help doubles with every miss in a row, so
+//! window-to-window noise on a saturated link does not ratchet the count up over a long job. [`Controller`] is a pure state machine driven with
 //! explicit timestamps so it can be tested without a clock; the engine feeds it from its tuner task.
 
 use std::collections::VecDeque;
@@ -46,7 +48,9 @@ pub struct AutoTuneConfig {
     pub window: Duration,
     /// Relative throughput gain a new lane must bring to be kept. Default 0.05 (5%).
     pub min_gain: f64,
-    /// No growth for this long after a lane was taken back. Default 60 s.
+    /// No growth for this long after a lane was taken back. Default 60 s. Each further probe in a
+    /// row that does not help doubles it, up to 8 times as long, so noise on a saturated link
+    /// cannot ratchet the count upwards; a clear gain (twice `min_gain`) starts over.
     pub hold_no_gain: Duration,
     /// No growth for this long after the `Retry-After` wait that follows a throttle. Default 2 min.
     pub hold_throttled: Duration,
@@ -117,14 +121,27 @@ pub(crate) struct Change {
 /// Once over budget, stay there until the count falls to this fraction of the soft limit.
 const BUDGET_EXIT: f64 = 0.75;
 
+/// A lane being tried: `reference` is the throughput of the window before it was added, `first`
+/// the throughput of its first window once that beat the reference.
+#[derive(Debug, Clone, Copy)]
+struct Probe {
+    reference: f64,
+    first: Option<f64>,
+}
+
+/// The hold after a probe that did not help grows to at most `hold_no_gain << MAX_HOLD_DOUBLINGS`.
+const MAX_HOLD_DOUBLINGS: u32 = 3;
+
 pub(crate) struct Controller {
     cfg: AutoTuneConfig,
     lanes: usize,
-    /// Throughput of the window before the last lane was added, while that probe is judged.
-    probe_reference: Option<f64>,
+    /// The lane being tried, while it is judged.
+    probe: Option<Probe>,
     hold_until: Option<Instant>,
     guard_until: Option<Instant>,
     over_budget: bool,
+    /// Probes in a row that were taken back (lengthens the next hold).
+    misses: u32,
 }
 
 impl Controller {
@@ -132,10 +149,11 @@ impl Controller {
         Controller {
             lanes: cfg.initial_lanes(),
             cfg,
-            probe_reference: None,
+            probe: None,
             hold_until: None,
             guard_until: None,
             over_budget: false,
+            misses: 0,
         }
     }
 
@@ -162,15 +180,38 @@ impl Controller {
             self.over_budget = false;
         }
 
-        if let Some(reference) = self.probe_reference.take() {
-            let improved = throughput > 0.0 && throughput >= reference * (1.0 + self.cfg.min_gain);
-            if !improved && self.lanes > min {
-                self.lanes -= 1;
-                self.hold_until = Some(now + self.cfg.hold_no_gain);
-                return Some(Change {
-                    lanes: self.lanes,
-                    reason: LanesReason::NoGain,
-                });
+        if let Some(probe) = self.probe.take() {
+            let gain = self.cfg.min_gain;
+            let improved = throughput > 0.0 && throughput >= probe.reference * (1.0 + gain);
+            match (improved, probe.first) {
+                (false, _) if self.lanes > min => {
+                    self.lanes -= 1;
+                    let hold = self.cfg.hold_no_gain * (1 << self.misses.min(MAX_HOLD_DOUBLINGS));
+                    self.misses += 1;
+                    self.hold_until = Some(now + hold);
+                    return Some(Change {
+                        lanes: self.lanes,
+                        reason: LanesReason::NoGain,
+                    });
+                }
+                (false, _) => {}
+                // One good window can be luck: keep the lane and judge it once more.
+                (true, None) => {
+                    self.probe = Some(Probe {
+                        first: Some(throughput),
+                        ..probe
+                    });
+                    return entered_budget.then_some(Change {
+                        lanes: self.lanes,
+                        reason: LanesReason::Budget,
+                    });
+                }
+                // Kept. A clear gain in both windows also forgives earlier misses.
+                (true, Some(first)) => {
+                    if first.min(throughput) >= probe.reference * (1.0 + 2.0 * gain) {
+                        self.misses = 0;
+                    }
+                }
             }
         }
         if entered_budget {
@@ -182,7 +223,10 @@ impl Controller {
         if self.over_budget || self.lanes >= max || self.hold_until.is_some_and(|h| now < h) {
             return None;
         }
-        self.probe_reference = Some(throughput);
+        self.probe = Some(Probe {
+            reference: throughput,
+            first: None,
+        });
         self.lanes += 1;
         Some(Change {
             lanes: self.lanes,
@@ -193,7 +237,7 @@ impl Controller {
     /// A request was answered 429/503 with this `Retry-After`.
     pub(crate) fn on_throttle(&mut self, now: Instant, retry_after: Duration) -> Option<Change> {
         let (min, _) = self.cfg.bounds();
-        self.probe_reference = None;
+        self.probe = None;
         let until = now + retry_after + self.cfg.hold_throttled;
         if self.hold_until.is_none_or(|h| until > h) {
             self.hold_until = Some(until);
@@ -291,12 +335,16 @@ mod tests {
         let mut c = Controller::new(cfg);
         // The link saturates at 9 lanes of 2 MB/s.
         let trace = simulate(&mut c, Instant::now(), 120, 2.0 * MB, 18.0 * MB, window);
-        assert_eq!(trace[..5], [5, 6, 7, 8, 9], "one lane per window while it helps");
+        assert_eq!(
+            trace[..9],
+            [5, 5, 6, 6, 7, 7, 8, 8, 9],
+            "one lane per two windows while it helps"
+        );
         assert!(
             trace.iter().all(|l| *l <= 10),
             "one probe above the optimum at most: {trace:?}"
         );
-        assert!(trace[10..].iter().all(|l| (9..=10).contains(l)), "{trace:?}");
+        assert!(trace[20..].iter().all(|l| (9..=10).contains(l)), "{trace:?}");
         assert_eq!(*trace.iter().max().unwrap(), 10);
     }
 
@@ -335,11 +383,91 @@ mod tests {
     }
 
     #[test]
+    fn noise_on_a_saturated_link_does_not_ratchet_the_lanes_up() {
+        let cfg = AutoTuneConfig::default();
+        let window = cfg.window;
+        let mut c = Controller::new(cfg);
+        let mut rng = fastrand::Rng::with_seed(7);
+        let t0 = Instant::now();
+        // 6 lanes of 2 MB/s fill the link, and every window is off by up to 5% either way. An hour.
+        let mut trace = Vec::new();
+        for i in 1..=360u32 {
+            let ideal = (c.lanes() as f64 * 2.0 * MB).min(12.0 * MB);
+            c.on_window(t0 + window * i, ideal * (0.95 + rng.f64() * 0.1), 0);
+            trace.push(c.lanes());
+        }
+        let peak = *trace.iter().max().unwrap();
+        assert!((6..=8).contains(&peak), "peaked at {peak}: {trace:?}");
+        let above = trace[60..].iter().filter(|l| **l > 7).count();
+        assert!(
+            above * 10 < 300,
+            "{above} of 300 windows more than one lane above: {trace:?}"
+        );
+    }
+
+    #[test]
+    fn misses_in_a_row_lengthen_the_hold_up_to_eight_times() {
+        let cfg = AutoTuneConfig::default();
+        let (window, hold) = (cfg.window, cfg.hold_no_gain);
+        let mut c = Controller::new(cfg);
+        let t0 = Instant::now();
+        // Already saturated: every probe misses. Record when each probe starts.
+        let mut probes = Vec::new();
+        for i in 1..=400u32 {
+            let now = t0 + window * i;
+            if let Some(Change {
+                reason: LanesReason::ProbeUp,
+                ..
+            }) = c.on_window(now, 40.0 * MB, 0)
+            {
+                probes.push(now);
+            }
+        }
+        // Between two probes: the probe's own window, then the hold.
+        let holds: Vec<Duration> = probes.windows(2).map(|w| w[1] - w[0] - window).collect();
+        assert!(holds.len() >= 5, "{holds:?}");
+        assert!(holds[0] >= hold && holds[0] < hold + window, "{holds:?}");
+        assert!(holds[1] >= hold * 2 && holds[2] >= hold * 4, "{holds:?}");
+        assert!(holds.iter().all(|h| *h < hold * 8 + window), "capped: {holds:?}");
+    }
+
+    #[test]
+    fn a_clear_gain_forgives_earlier_misses() {
+        let cfg = AutoTuneConfig::default();
+        let (window, hold) = (cfg.window, cfg.hold_no_gain);
+        let mut c = Controller::new(cfg);
+        let mut now = Instant::now();
+        let mut step = |c: &mut Controller, tput: f64| {
+            now += window;
+            (now, c.on_window(now, tput, 0).map(|c| c.reason))
+        };
+        // Two misses in a row: the next hold would be four times the base.
+        assert_eq!(step(&mut c, 40.0 * MB).1, Some(LanesReason::ProbeUp));
+        assert_eq!(step(&mut c, 40.0 * MB).1, Some(LanesReason::NoGain));
+        while step(&mut c, 40.0 * MB).1.is_none() {}
+        assert_eq!(step(&mut c, 40.0 * MB).1, Some(LanesReason::NoGain));
+        while step(&mut c, 40.0 * MB).1.is_none() {}
+        // The probe that just started brings +25% twice: kept, and the misses are forgiven.
+        assert_eq!(step(&mut c, 50.0 * MB).1, None);
+        assert_eq!(step(&mut c, 50.0 * MB).1, Some(LanesReason::ProbeUp));
+        let (missed_at, r) = step(&mut c, 50.0 * MB);
+        assert_eq!(r, Some(LanesReason::NoGain));
+        let next = loop {
+            let (t, r) = step(&mut c, 50.0 * MB);
+            if r.is_some() {
+                break t;
+            }
+        };
+        assert!(next - missed_at <= hold + window, "back to the base hold");
+    }
+
+    #[test]
     fn a_gain_of_exactly_the_threshold_counts() {
         let mut c = Controller::new(AutoTuneConfig::default());
         let t = Instant::now();
         c.on_window(t, 100.0, 0);
-        let up = c.on_window(t + Duration::from_secs(10), 105.0, 0);
+        assert_eq!(c.on_window(t + Duration::from_secs(10), 105.0, 0), None);
+        let up = c.on_window(t + Duration::from_secs(20), 105.0, 0);
         assert_eq!(up.map(|c| (c.lanes, c.reason)), Some((6, LanesReason::ProbeUp)));
     }
 
@@ -349,11 +477,11 @@ mod tests {
         let (window, hold) = (cfg.window, cfg.hold_throttled);
         let mut c = Controller::new(cfg);
         let t0 = Instant::now();
-        for i in 1..=8 {
+        for i in 1..=16 {
             c.on_window(t0 + window * i, 100.0 * MB * f64::from(i), 0);
         }
         assert_eq!(c.lanes(), 12);
-        let now = t0 + window * 9;
+        let now = t0 + window * 17;
         let retry = Duration::from_secs(5);
         assert_eq!(
             c.on_throttle(now, retry),
@@ -420,7 +548,7 @@ mod tests {
         let mut c = Controller::new(AutoTuneConfig::default());
         let t = Instant::now();
         for i in 1..=40 {
-            c.on_window(t + Duration::from_secs(10 * i), 1e6 * (i as f64), 0);
+            c.on_window(t + Duration::from_secs(10 * i), 1e6 * 1.2f64.powi(i as i32), 0);
         }
         assert_eq!(c.lanes(), 16, "at most 16 lanes however much it helps");
         let cfg = AutoTuneConfig {
