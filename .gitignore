@@ -31,3 +31,6 @@ desktop.ini
 # Local design mockups and planning notes (kept out of the repo)
 /design/
 /docs/plans/
+
+# Local agent worktrees
+/.claude/

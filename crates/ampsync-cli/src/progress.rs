@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 
+use ampsync_core::autotune::LanesReason;
 use ampsync_core::engine::Event;
 use ampsync_core::plan::RelPath;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -46,6 +47,10 @@ pub struct Display {
     files_total: u64,
     files_done: u64,
     interactive: bool,
+    /// The last lane change shown, so the same one is never printed twice in a row.
+    last_lanes: Option<(u8, LanesReason)>,
+    /// A disk-full message was just shown; the `Paused` that follows it adds nothing.
+    after_disk_full: bool,
 }
 
 impl Display {
@@ -72,6 +77,32 @@ impl Display {
             files_total,
             files_done: 0,
             interactive,
+            last_lanes: None,
+            after_disk_full: false,
+        }
+    }
+
+    /// Text to print for the events that are only a message (no bar changes), or `None` when
+    /// there is nothing to say. `RangeDone` is deliberately silent: it is for `--json` consumers
+    /// (one event per range, thousands per big file).
+    fn message_for(&mut self, event: &Event) -> Option<String> {
+        let disk_full_before = std::mem::take(&mut self.after_disk_full);
+        match event {
+            Event::LanesChanged { lanes, reason } => {
+                if self.last_lanes == Some((*lanes, *reason)) {
+                    return None;
+                }
+                self.last_lanes = Some((*lanes, *reason));
+                Some(human::lanes_line(*lanes, *reason))
+            }
+            // `get` prints the disk-full line itself (it knows the volume); the `Paused` that the
+            // engine sends right after it is not worth a second line.
+            Event::DiskFull { .. } => {
+                self.after_disk_full = true;
+                None
+            }
+            Event::Paused => (!disk_full_before).then(|| "Paused.".to_string()),
+            _ => None,
         }
     }
 
@@ -112,8 +143,13 @@ impl Display {
     }
 
     pub fn on_event(&mut self, event: &Event) {
+        if let Some(text) = self.message_for(event) {
+            self.say(&text);
+        }
         match event {
-            Event::FileStarted { rel_path, size, lane } => {
+            Event::FileStarted {
+                rel_path, size, lane, ..
+            } => {
                 self.lane_of.insert(rel_path.clone(), *lane);
                 self.sizes.insert(rel_path.clone(), *size);
                 self.lane_bar(*lane)
@@ -167,7 +203,6 @@ impl Display {
             Event::AuthExpired { host } => {
                 self.say(&format!("Sign-in expired for {host}; transfers are paused."))
             }
-            Event::Paused => self.say("Paused."),
             Event::Resumed => self.say("Resumed."),
             Event::Failed { error } => self.say(&format!("Download stopped: {error}")),
             // Plan-time skips arrive as counts in `Planned`, not as per-file events.
@@ -215,6 +250,43 @@ mod tests {
         let long = lane_line(0, &"x/".repeat(60), 0, 0);
         assert!(long.contains("..."), "{long}");
         assert!(long.contains("100%"), "{long}");
+    }
+
+    #[test]
+    fn lane_changes_are_shown_once_in_plain_words() {
+        let mut d = Display::new(1, 1);
+        let change = |lanes, reason| Event::LanesChanged { lanes, reason };
+        let first = d.message_for(&change(5, LanesReason::ProbeUp)).unwrap();
+        assert_eq!(first, "auto: 5 lanes (throughput still rising)");
+        // The same change again is not repeated; a different one is.
+        assert_eq!(d.message_for(&change(5, LanesReason::ProbeUp)), None);
+        assert!(d.message_for(&change(5, LanesReason::NoGain)).is_some());
+        assert!(d.message_for(&change(6, LanesReason::ProbeUp)).is_some());
+    }
+
+    #[test]
+    fn range_done_is_never_printed() {
+        let mut d = Display::new(1, 1);
+        let e = Event::RangeDone {
+            rel_path: RelPath::new("a/b.bin").unwrap(),
+            index: 0,
+            count: 10,
+        };
+        assert_eq!(d.message_for(&e), None);
+    }
+
+    #[test]
+    fn paused_after_disk_full_is_not_announced_twice() {
+        let mut d = Display::new(1, 1);
+        assert_eq!(d.message_for(&Event::Paused).as_deref(), Some("Paused."));
+        let full = Event::DiskFull {
+            path: "x".into(),
+            needed: 1,
+            free: 0,
+        };
+        assert_eq!(d.message_for(&full), None);
+        assert_eq!(d.message_for(&Event::Paused), None);
+        assert_eq!(d.message_for(&Event::Paused).as_deref(), Some("Paused."));
     }
 
     #[test]

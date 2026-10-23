@@ -24,6 +24,7 @@ base64 = { workspace = true }
 [dependencies]
 ampsync-core = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
@@ -37,7 +38,11 @@ tracing = { workspace = true }
 directories = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 percent-encoding = { workspace = true }
+tauri-plugin-notification = "2"
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
 windows-core = "0.62"
+winreg = "0.56"
+tauri-winrt-notification = "0.8"

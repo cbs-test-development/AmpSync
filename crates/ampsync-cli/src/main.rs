@@ -17,6 +17,7 @@ mod signin_webview;
 #[cfg(not(feature = "webview"))]
 #[path = "signin_webview_stub.rs"]
 mod signin_webview;
+mod space;
 mod tree;
 
 use std::process::ExitCode;

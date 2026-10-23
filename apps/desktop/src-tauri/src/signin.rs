@@ -172,6 +172,7 @@ impl SignInCoordinator {
             return Err(Error::AuthExpired { host: host.into() });
         }
         self.interactive_open.store(true, Ordering::SeqCst);
+        crate::notify::send(app, &crate::notify::Trigger::SignInNeeded { host: host.into() });
         let _ = app.emit(
             "signin-state",
             serde_json::json!({ "host": host, "state": "window_open" }),

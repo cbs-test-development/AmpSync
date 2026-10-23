@@ -11,13 +11,14 @@ use ampsync_core::SessionStatus;
 use ampsync_core::auth::Session;
 use ampsync_core::engine::{Engine, Event, Summary};
 use ampsync_core::link::{self, ParsedLink};
-use ampsync_core::plan::JobSpec;
+use ampsync_core::plan::{ExistingPolicy, JobSpec};
 use ampsync_core::remote::ClassicRemote;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::AppState;
+use crate::notify::{self, Trigger};
 use crate::paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +31,8 @@ pub enum ItemStatus {
     Paused,
     /// The job is paused until the user signs in again.
     NeedsSignIn,
+    /// The destination disk is full (D21): paused until the user frees space and retries.
+    NeedsSpace,
     Done,
     Failed,
     Cancelled,
@@ -97,6 +100,88 @@ pub struct QueueItem {
     pub summary: Option<SummaryLite>,
 }
 
+/// What the frontend receives for a queue item: everything except the explicit file list
+/// (`JobSpec::files`, D20), which can be megabytes for a large selection. The frontend only needs
+/// to know how many files there are.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueItemView {
+    pub id: u64,
+    pub title: String,
+    pub path_label: String,
+    pub host: String,
+    pub spec: SpecView,
+    pub est_files: u64,
+    pub est_bytes: u64,
+    pub status: ItemStatus,
+    pub error: Option<String>,
+    pub summary: Option<SummaryLite>,
+}
+
+/// `JobSpec` without `files`; `file_count` is the length of that list (absent when the job uses
+/// globs).
+#[derive(Debug, Clone, Serialize)]
+pub struct SpecView {
+    pub source: String,
+    pub dest: PathBuf,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub existing: ExistingPolicy,
+    pub prune: bool,
+    pub file_count: Option<usize>,
+}
+
+impl QueueItem {
+    pub fn view(&self) -> QueueItemView {
+        QueueItemView {
+            id: self.id,
+            title: self.title.clone(),
+            path_label: self.path_label.clone(),
+            host: self.host.clone(),
+            spec: SpecView {
+                source: self.spec.source.clone(),
+                dest: self.spec.dest.clone(),
+                include: self.spec.include.clone(),
+                exclude: self.spec.exclude.clone(),
+                existing: self.spec.existing,
+                prune: self.spec.prune,
+                file_count: self.spec.files.as_ref().map(Vec::len),
+            },
+            est_files: self.est_files,
+            est_bytes: self.est_bytes,
+            status: self.status,
+            error: self.error.clone(),
+            summary: self.summary.clone(),
+        }
+    }
+}
+
+/// The status a restart would restore an item to: a job that was mid-run (or waiting for the
+/// user to sign in or free space) goes back in line.
+fn persisted_status(s: ItemStatus) -> ItemStatus {
+    match s {
+        ItemStatus::Running | ItemStatus::Preparing | ItemStatus::NeedsSignIn | ItemStatus::NeedsSpace => {
+            ItemStatus::Queued
+        }
+        other => other,
+    }
+}
+
+/// A fingerprint of what `queue.json` would say, without reading the file list (which never
+/// changes after an item is added). Equal fingerprints mean writing the file again would change
+/// nothing a restart can see, so the write is skipped: moves between preparing, running and the
+/// two waiting-for-the-user states all restore as "queued".
+fn persist_fingerprint(items: &[QueueItem]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for it in items {
+        let mut v = it.view();
+        v.status = persisted_status(v.status);
+        // `view` leaves the list out; its length stands in for it.
+        serde_json::to_string(&v).unwrap_or_default().hash(&mut h);
+    }
+    h.finish()
+}
+
 pub enum Ctl {
     Pause,
     Resume,
@@ -120,7 +205,8 @@ pub struct Queue {
     inner: Mutex<Inner>,
     /// Held across snapshot, write, rename and event, so concurrent publishes cannot interleave
     /// or let an older snapshot overwrite a newer one. Always taken before `inner`, never after.
-    persist: Mutex<()>,
+    /// Holds the fingerprint of what is on disk (see [`persist_fingerprint`]).
+    persist: Mutex<Option<u64>>,
     wake: Notify,
     gate: watch::Sender<bool>,
 }
@@ -132,7 +218,7 @@ impl Queue {
                 next_id: 1,
                 ..Inner::default()
             }),
-            persist: Mutex::new(()),
+            persist: Mutex::new(None),
             wake: Notify::new(),
             gate: watch::channel(false).0,
         }
@@ -149,24 +235,30 @@ impl Queue {
             return;
         };
         for it in &mut items {
-            if matches!(
-                it.status,
-                ItemStatus::Running | ItemStatus::Preparing | ItemStatus::NeedsSignIn
-            ) {
-                it.status = ItemStatus::Queued;
-            }
+            it.status = persisted_status(it.status);
         }
         let mut g = self.lock();
         g.next_id = items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
         g.items = items;
     }
 
-    pub fn snapshot(&self) -> Vec<QueueItem> {
-        self.lock().items.clone()
+    /// The queue as the frontend sees it (no file lists).
+    pub fn snapshot(&self) -> Vec<QueueItemView> {
+        self.lock().items.iter().map(QueueItem::view).collect()
     }
 
-    pub fn item(&self, id: u64) -> Option<QueueItem> {
-        self.lock().items.iter().find(|i| i.id == id).cloned()
+    /// Just the status (cheap: `item` copies the whole file list).
+    pub fn status_of(&self, id: u64) -> Option<ItemStatus> {
+        self.lock().items.iter().find(|i| i.id == id).map(|i| i.status)
+    }
+
+    /// Just the title, for notifications.
+    pub fn title_of(&self, id: u64) -> Option<String> {
+        self.lock()
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.title.clone())
     }
 
     /// Hosts that have work waiting (used by the launch-time sign-in check).
@@ -198,6 +290,13 @@ impl Queue {
             .map(|p| crate::commands::start_url(&p))
     }
 
+    /// Status of the job that is running right now, if any (for the taskbar and tray progress).
+    pub fn current_status(&self) -> Option<ItemStatus> {
+        let g = self.lock();
+        let id = g.current.as_ref()?.id;
+        g.items.iter().find(|i| i.id == id).map(|i| i.status)
+    }
+
     pub fn has_active(&self) -> bool {
         let g = self.lock();
         g.current.is_some()
@@ -215,26 +314,42 @@ impl Queue {
     }
 
     fn publish(&self, app: &AppHandle) {
-        let _persist = self.persist.lock().unwrap_or_else(|p| p.into_inner());
-        let snap = {
-            let mut g = self.lock();
-            // Keep only the most recent finished jobs.
-            let finished: Vec<u64> = g
-                .items
-                .iter()
-                .filter(|i| i.status.is_finished())
-                .map(|i| i.id)
-                .collect();
-            if finished.len() > 20 {
-                let drop_ids: Vec<u64> = finished[..finished.len() - 20].to_vec();
-                g.items.retain(|i| !drop_ids.contains(&i.id));
+        {
+            let mut saved = self.persist.lock().unwrap_or_else(|p| p.into_inner());
+            let (views, to_write) = {
+                let mut g = self.lock();
+                // Keep only the most recent finished jobs.
+                let finished: Vec<u64> = g
+                    .items
+                    .iter()
+                    .filter(|i| i.status.is_finished())
+                    .map(|i| i.id)
+                    .collect();
+                if finished.len() > 20 {
+                    let drop_ids: Vec<u64> = finished[..finished.len() - 20].to_vec();
+                    g.items.retain(|i| !drop_ids.contains(&i.id));
+                }
+                let views: Vec<QueueItemView> = g.items.iter().map(QueueItem::view).collect();
+                // Rewrite `queue.json` (which carries the whole file lists) only when what a restart
+                // would see has changed, not for every move between running and waiting states.
+                let fingerprint = persist_fingerprint(&g.items);
+                let to_write =
+                    (*saved != Some(fingerprint)).then(|| (fingerprint, serialize_queue(&g.items)));
+                (views, to_write)
+            };
+            if let Some((fingerprint, bytes)) = to_write {
+                match bytes
+                    .map_err(std::io::Error::other)
+                    .and_then(|b| write_queue(&paths::queue_file(), &b))
+                {
+                    Ok(()) => *saved = Some(fingerprint),
+                    Err(e) => tracing::warn!("could not save the download queue: {e}"),
+                }
             }
-            g.items.clone()
-        };
-        if let Err(e) = save_queue(&paths::queue_file(), &snap) {
-            tracing::warn!("could not save the download queue: {e}");
+            let _ = app.emit("queue-changed", &views);
         }
-        let _ = app.emit("queue-changed", &snap);
+        // Taskbar and tray follow the running job (after the persist lock is released).
+        crate::progress::sync(app);
     }
 
     fn set_status(&self, app: &AppHandle, id: u64, status: ItemStatus, error: Option<String>) {
@@ -333,7 +448,7 @@ impl Queue {
 
     /// Put a finished or failed job back in line (a rerun resumes and skips what is saved).
     pub fn retry(&self, app: &AppHandle, id: u64) {
-        let ok = self.item(id).is_some_and(|i| i.status.is_finished());
+        let ok = self.status_of(id).is_some_and(ItemStatus::is_finished);
         if ok {
             {
                 let mut g = self.lock();
@@ -368,10 +483,7 @@ impl Queue {
         {
             let mut g = self.lock();
             for it in &mut g.items {
-                if matches!(
-                    it.status,
-                    ItemStatus::Running | ItemStatus::Preparing | ItemStatus::NeedsSignIn
-                ) {
+                if persisted_status(it.status) == ItemStatus::Queued && it.status != ItemStatus::Queued {
                     it.status = if mark_paused {
                         ItemStatus::Paused
                     } else {
@@ -399,13 +511,17 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_extension("json.bak")
 }
 
-fn save_queue(path: &Path, items: &[QueueItem]) -> std::io::Result<()> {
-    let text = serde_json::to_string_pretty(items).map_err(std::io::Error::other)?;
+fn serialize_queue(items: &[QueueItem]) -> Result<Vec<u8>, serde_json::Error> {
+    // Compact: a selection of 100k files makes this file megabytes, and nobody edits it by hand.
+    serde_json::to_vec(items)
+}
+
+fn write_queue(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)?;
+    std::fs::write(&tmp, bytes)?;
     if path.exists() {
         // The file on disk is the last thing this function (or `load_queue`) vouched for.
         if let Err(e) = std::fs::copy(path, backup_path(path)) {
@@ -413,6 +529,11 @@ fn save_queue(path: &Path, items: &[QueueItem]) -> std::io::Result<()> {
         }
     }
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+fn save_queue(path: &Path, items: &[QueueItem]) -> std::io::Result<()> {
+    write_queue(path, &serialize_queue(items).map_err(std::io::Error::other)?)
 }
 
 fn parse_queue(path: &Path) -> Result<Vec<QueueItem>, String> {
@@ -537,12 +658,31 @@ async fn run_item(app: &AppHandle, id: u64) {
                 }
             }
             queue.set_status(app, id, ItemStatus::Done, None);
+            notify::send(
+                app,
+                &Trigger::Finished {
+                    title: item.title.clone(),
+                    files: summary.downloaded + summary.skipped,
+                    failed: summary.failed,
+                },
+            );
         }
         Ok(None) => {} // paused or cancelled: status already set
-        Err(Error::Cancelled) => queue.set_status(app, id, ItemStatus::Cancelled, None),
-        Err(e) => queue.set_status(app, id, ItemStatus::Failed, Some(failure_text(&e))),
+        Err(Error::Cancelled) => {
+            queue.set_status(app, id, ItemStatus::Cancelled, None);
+            notify::send(app, &Trigger::Cancelled);
+        }
+        Err(e) => {
+            crate::progress::failed(app);
+            queue.set_status(app, id, ItemStatus::Failed, Some(failure_text(&e)));
+            notify::send(
+                app,
+                &Trigger::Failed {
+                    title: item.title.clone(),
+                },
+            );
+        }
     }
-    crate::tray::update_tooltip(app, None);
 }
 
 /// `Ok(Some)` finished, `Ok(None)` stopped by the user with the status already recorded.
@@ -610,13 +750,14 @@ async fn run_item_inner(
                 ev = events.recv() => match ev {
                     Ok(ev) => {
                         let _ = app.emit("job-event", JobEvent { job_id: id, event: ev.clone() });
+                        crate::progress::on_event(app, &ev);
                         match &ev {
-                            Event::Progress { bytes_done, bytes_total, .. } => {
-                                let pct = if *bytes_total > 0 { Some(*bytes_done as f64 / *bytes_total as f64) } else { None };
-                                crate::tray::update_tooltip(app, pct);
+                            Event::DiskFull { .. } => {
+                                // `Paused` follows; the job waits for space, not for the user.
+                                queue.set_status(app, id, ItemStatus::NeedsSpace, None);
                             }
                             Event::Paused => {
-                                if queue.item(id).is_some_and(|i| i.status != ItemStatus::NeedsSignIn) {
+                                if queue.status_of(id).is_some_and(|s| !matches!(s, ItemStatus::NeedsSignIn | ItemStatus::NeedsSpace)) {
                                     queue.set_status(app, id, ItemStatus::Paused, None);
                                 }
                             }
@@ -711,7 +852,11 @@ async fn acquire(
                 }
             }
             Err(e) => {
+                crate::progress::failed(app);
                 queue.set_status(app, id, ItemStatus::Failed, Some(failure_text(&e)));
+                if let Some(title) = queue.title_of(id) {
+                    notify::send(app, &Trigger::Failed { title });
+                }
                 return Outcome::Stop;
             }
         }
@@ -843,6 +988,89 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(parse_queue(&path).unwrap().len(), 200);
+    }
+
+    fn item_with_files(id: u64, n: usize) -> QueueItem {
+        let mut it = item(id, "big");
+        it.spec.files = Some(
+            (0..n)
+                .map(|i| ampsync_core::plan::RelPath::new(format!("folder/sub/file-{i}.bin")).unwrap())
+                .collect(),
+        );
+        it
+    }
+
+    #[test]
+    fn the_frontend_view_leaves_the_file_list_out_but_counts_it() {
+        let view = item_with_files(1, 5000).view();
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(
+            json["spec"].get("files").is_none(),
+            "the list must not reach the frontend"
+        );
+        assert_eq!(json["spec"]["file_count"], 5000);
+        assert!(serde_json::to_string(&view).unwrap().len() < 2_000);
+        // A glob-based job has no list and no count.
+        assert!(serde_json::to_value(item(2, "globs").view()).unwrap()["spec"]["file_count"].is_null());
+    }
+
+    #[test]
+    fn queue_json_still_keeps_the_file_list_for_resuming_after_a_restart() {
+        let dir = temp_dir("files");
+        let path = dir.join("queue.json");
+        save_queue(&path, &[item_with_files(1, 300)]).unwrap();
+        let loaded = load_queue(&path).unwrap();
+        assert_eq!(loaded[0].spec.files.as_ref().map(Vec::len), Some(300));
+        assert_eq!(
+            loaded[0].spec.files.as_ref().unwrap()[299].as_str(),
+            "folder/sub/file-299.bin"
+        );
+    }
+
+    #[test]
+    fn progress_and_waiting_state_changes_do_not_rewrite_queue_json() {
+        let mut items = vec![item_with_files(1, 100), item(2, "next")];
+        let queued = persist_fingerprint(&items);
+        // Queued -> preparing -> running -> waiting for sign-in or space: a restart restores
+        // all of them as "queued", so none of them is worth writing again.
+        for s in [
+            ItemStatus::Preparing,
+            ItemStatus::Running,
+            ItemStatus::NeedsSignIn,
+            ItemStatus::NeedsSpace,
+        ] {
+            items[0].status = s;
+            assert_eq!(persist_fingerprint(&items), queued, "{s:?}");
+        }
+        // These are visible after a restart, so they are written.
+        items[0].status = ItemStatus::Paused;
+        let paused = persist_fingerprint(&items);
+        assert_ne!(paused, queued);
+        items[0].status = ItemStatus::Done;
+        assert_ne!(persist_fingerprint(&items), paused);
+        items[0].status = ItemStatus::Queued;
+        items[1].title = "renamed".into();
+        assert_ne!(persist_fingerprint(&items), queued);
+    }
+
+    #[test]
+    fn jobs_waiting_for_space_come_back_queued_after_a_restart() {
+        let dir = temp_dir("space");
+        let path = dir.join("queue.json");
+        let mut a = item(1, "full disk");
+        a.status = ItemStatus::NeedsSpace;
+        save_queue(&path, &[a]).unwrap();
+        let q = Queue::new();
+        q.restore(&path);
+        assert_eq!(q.snapshot()[0].status, ItemStatus::Queued);
+    }
+
+    #[test]
+    fn the_new_status_serializes_in_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ItemStatus::NeedsSpace).unwrap(),
+            "\"needs_space\""
+        );
     }
 
     #[test]

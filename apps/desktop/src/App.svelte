@@ -3,6 +3,7 @@
   import { app } from "./core/store.svelte";
   import { api } from "./core/api";
   import type { ViewId } from "./core/types";
+  import { READY_EVENT } from "./core/splash";
   import Transfers from "./views/Transfers.svelte";
   import NewDownload from "./views/NewDownload.svelte";
   import SignIns from "./views/SignIns.svelte";
@@ -10,6 +11,7 @@
   import About from "./views/About.svelte";
   import Tour from "./parts/Tour.svelte";
   import ClosePrompt from "./parts/ClosePrompt.svelte";
+  import LinkDrop from "./parts/LinkDrop.svelte";
 
   const titles: Record<ViewId, string> = {
     transfers: "Transfers",
@@ -20,10 +22,14 @@
   };
 
   onMount(() => {
-    app.init().catch((e) => console.error("start-up failed", e));
+    app
+      .init()
+      .catch((e) => console.error("start-up failed", e))
+      // The startup splash leaves once the app has its state (or has given up trying).
+      .finally(() => window.dispatchEvent(new Event(READY_EVENT)));
   });
 
-  const pending = $derived(app.queue.filter((q) => ["queued", "preparing", "running", "paused", "needs_sign_in"].includes(q.status)).length);
+  const pending = $derived(app.queue.filter((q) => ["queued", "preparing", "running", "paused", "needs_sign_in", "needs_space"].includes(q.status)).length);
 
   const chip = $derived.by(() => {
     const s = app.sessions;
@@ -78,6 +84,15 @@
       </div>
     </header>
 
+    {#if app.notice}
+      <div class="notice" role="status">
+        <span>{app.notice}</span>
+        <button type="button" onclick={() => app.setNotice(null)} aria-label="Dismiss this message">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" /></svg>
+        </button>
+      </div>
+    {/if}
+
     <div class="scroll">
       <section class="view fill" hidden={app.view !== "transfers"} data-view="transfers"><Transfers /></section>
       <section class="view" hidden={app.view !== "new"} data-view="new"><NewDownload /></section>
@@ -94,6 +109,7 @@
 
 {#if app.tourOpen}<Tour />{/if}
 {#if app.closePrompt}<ClosePrompt />{/if}
+<LinkDrop />
 
 <style>
   .app {
@@ -142,6 +158,16 @@
   }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
   .dot.bad { background: var(--crit); }
+  .notice {
+    flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 22px;
+    border-bottom: 1px solid var(--line); border-left: 3px solid var(--signal); background: var(--raise); font-size: 13px;
+  }
+  .notice button {
+    flex: none; width: 24px; height: 24px; display: grid; place-items: center; background: none; border: 0;
+    border-radius: 3px; color: var(--muted); cursor: pointer;
+  }
+  .notice button:hover { color: var(--fg); background: var(--panel); }
+  .notice svg { width: 12px; height: 12px; }
   .view[hidden] { display: none !important; }
   .toast {
     position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 70; max-width: min(560px, calc(100vw - 32px));

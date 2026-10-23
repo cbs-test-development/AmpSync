@@ -1,11 +1,15 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api, on, toCmdError } from "../core/api";
   import { app } from "../core/store.svelte";
+  import { checkSpace, needsText, notEnoughText } from "../core/diskspace";
   import { joinPath, num, size } from "../core/format";
-  import { TreeModel } from "../core/selection";
-  import type { CmdError, PlanTree, Resolved } from "../core/types";
+  import { emptyState, extensionStats, isActive, toSpec, type ExtStat, type FilterResult, type FilterState } from "../core/filter";
+  import { FilterRunner } from "../core/filterRunner";
+  import { selectionToSpec, TreeModel } from "../core/selection";
+  import type { CmdError, DiskSpace, PlanTree, Resolved } from "../core/types";
+  import FilterBar from "../parts/FilterBar.svelte";
   import FolderTree from "../parts/FolderTree.svelte";
   import SignInForm from "../parts/SignInForm.svelte";
 
@@ -22,22 +26,128 @@
   let existing = $state<"skip_unchanged" | "redownload">("skip_unchanged");
   let adding = $state(false);
 
+  // Filter bar: its state, the runner that applies it to the listing, and the latest result.
+  let filter = $state<FilterState>(emptyState());
+  let runner = $state.raw<FilterRunner | null>(null);
+  let stats = $state.raw<ExtStat[]>([]);
+  let result = $state.raw<FilterResult | null>(null);
+  /** Bumped when the selection changed outside the tree (Select / Clear matching). */
+  let treeVersion = $state(0);
+  let runSeq = 0;
+
+  const spec = $derived(toSpec(filter));
+  const filtering = $derived(isActive(spec));
+
+  $effect(() => {
+    const s = spec;
+    const r = runner;
+    const token = ++runSeq;
+    if (!r || !isActive(s)) {
+      result = null;
+      return;
+    }
+    // A newer change makes an older answer stale; only the latest one is shown.
+    void r.run(s).then((res) => {
+      if (token === runSeq) result = res;
+    });
+  });
+
+  function startFilter(t: PlanTree) {
+    runner?.dispose();
+    runner = new FilterRunner(t);
+    stats = extensionStats(t);
+    filter = emptyState();
+    result = null;
+  }
+
+  function stopFilter() {
+    runner?.dispose();
+    runner = null;
+    stats = [];
+    filter = emptyState();
+    result = null;
+  }
+
   $effect(() => {
     // Pre-fill from Settings once, and again when the default changes while the field is empty.
     const d = app.settings?.default_dest;
     if (d && !saveTo) saveTo = d;
   });
 
+  $effect(() => {
+    // A link from Ctrl+V, a drop or the tray (see `app.receiveLink`): fill the field and list it.
+    const incoming = app.incoming;
+    if (!incoming) return;
+    untrack(() => {
+      app.incoming = null;
+      if (phase === "working") {
+        app.setNotice("AmpSync is still opening a folder. Paste the link again when it has finished.");
+        return;
+      }
+      link = incoming.link;
+      void openFolder();
+    });
+  });
+
+  // Free space on the destination's volume (F3). The figure that goes against it is the size of the
+  // current selection: the picker does not know which files are already on disk (that is only
+  // found out when the download starts), so with "Skip if unchanged" the real need can be lower.
+  let space = $state<DiskSpace | null>(null);
+  let spaceSeq = 0;
+
+  async function readSpace(dest: string): Promise<DiskSpace | null> {
+    const token = ++spaceSeq;
+    try {
+      const s = await api.diskSpace(dest);
+      if (token === spaceSeq) space = s;
+      return s;
+    } catch {
+      // Not a path yet, or a drive that is not there: nothing to compare against.
+      if (token === spaceSeq) space = null;
+      return null;
+    }
+  }
+
+  $effect(() => {
+    // Look again whenever the destination changes (after a short pause for typing).
+    const dest = saveTo.trim();
+    if (!dest) {
+      spaceSeq++;
+      space = null;
+      return;
+    }
+    const t = setTimeout(() => void readSpace(dest), 250);
+    return () => clearTimeout(t);
+  });
+
   onMount(() => {
     let off: (() => void) | undefined;
     void on<{ files: number; bytes: number }>("listing-progress", (p) => (listing = p)).then((u) => (off = u));
-    return () => off?.();
+    // Someone may have freed space while the window was in the background.
+    const refocus = () => {
+      const dest = untrack(() => saveTo.trim());
+      if (dest) void readSpace(dest);
+    };
+    window.addEventListener("focus", refocus);
+    return () => {
+      off?.();
+      window.removeEventListener("focus", refocus);
+    };
   });
+
+  onDestroy(() => runner?.dispose());
 
   const sel = $derived(selected);
 
   function syncSelection() {
     if (model) selected = model.selected;
+  }
+
+  function setMatching(value: boolean) {
+    if (!model || !result) return;
+    model.setMatching(0, model.n, value, result.match);
+    syncSelection();
+    treeVersion++;
   }
 
   async function openFolder() {
@@ -51,11 +161,13 @@
     tree = null;
     model = null;
     resolved = null;
+    stopFilter();
     listing = { files: 0, bytes: 0 };
     try {
       resolved = await api.resolve(text);
       tree = await api.plan(text);
       model = new TreeModel(tree);
+      startFilter(tree);
       syncSelection();
       phase = "ready";
       await app.refreshSessions();
@@ -88,13 +200,24 @@
     }
   });
 
-  const canAdd = $derived(phase === "ready" && sel.files > 0 && saveTo.trim() !== "" && !adding);
+  const room = $derived(space ? checkSpace(sel.bytes, space.free) : null);
+  const roomShort = $derived(room !== null && !room.ok);
+  const canAdd = $derived(phase === "ready" && sel.files > 0 && saveTo.trim() !== "" && !adding && !roomShort);
 
   async function addToQueue() {
     if (!resolved || !tree || !model) return;
     adding = true;
     try {
-      const f = model.filters();
+      // Space may have changed since the last look: check once more before committing.
+      const fresh = await readSpace(saveTo.trim());
+      if (fresh) {
+        const c = checkSpace(sel.bytes, fresh.free);
+        if (!c.ok) {
+          app.toast(notEnoughText(c.shortBy, fresh.volume));
+          return;
+        }
+      }
+      const picked = selectionToSpec(model);
       const ahead = app.queue.filter((q) => ["queued", "running", "preparing", "needs_sign_in"].includes(q.status));
       const where = joinPath(saveTo.trim(), resolved.display_name);
       const trail = resolved.server_relative_path.split("/").filter(Boolean).join(" › ");
@@ -102,8 +225,9 @@
         source: link.trim(),
         save_to: saveTo.trim(),
         folder_name: resolved.display_name,
-        include: f.include,
-        exclude: f.exclude,
+        include: picked.include,
+        exclude: picked.exclude,
+        files: picked.files,
         existing,
         title: `${resolved.site_name} · ${resolved.display_name}`,
         path_label: `${resolved.host} › ${trail} → ${where}`,
@@ -115,6 +239,7 @@
       tree = null;
       model = null;
       resolved = null;
+      stopFilter();
       link = "";
       app.go("transfers");
     } catch (e) {
@@ -196,13 +321,27 @@
     {#if !model || model.n === 0}
       <p class="placeholder">This folder is empty.</p>
     {:else}
+      <FilterBar bind:filter {stats} active={filtering} {result} onselect={() => setMatching(true)} onclear={() => setMatching(false)} />
+      {#if result && result.count === 0}
+        <p class="placeholder">No file matches this filter. Loosen it, or reset the filters.</p>
+      {/if}
       {#key model}
-        <FolderTree {model} onchange={syncSelection} />
+        <FolderTree {model} onchange={syncSelection} filter={result} version={treeVersion} />
       {/key}
     {/if}
     <div class="foot-bar">
-      <span class="total">{size(sel.bytes)} <small>· {num(sel.files)} {sel.files === 1 ? "file" : "files"} selected</small></span>
-      <span class="meta">Untick anything you don't need. Folders open to show their files.</span>
+      <span class="figures">
+        <span class="total">{size(sel.bytes)} <small>· {num(sel.files)} {sel.files === 1 ? "file" : "files"} selected</small></span>
+        {#if sel.files > 0}
+          <span class="needs" class:short={roomShort}>{needsText(sel.bytes, space?.free ?? null, space?.volume ?? "")}</span>
+        {/if}
+        {#if result}
+          <span class="match" aria-live="polite">{num(result.count)} {result.count === 1 ? "file matches" : "files match"} <small>· {size(result.totalBytes)}</small></span>
+        {/if}
+      </span>
+      <span class="meta">
+        {#if result}Ticking a folder here changes only its matching files.{:else}Untick anything you don't need. Folders open to show their files.{/if}
+      </span>
     </div>
   {:else}
     <p class="placeholder">Open a folder above and its subfolders show up here with their sizes, so you can untick what you don't need.</p>
@@ -231,7 +370,11 @@
     </div>
   </div>
   <div class="foot-bar">
-    <span class="note">Nothing on your computer is deleted.</span>
+    {#if roomShort && room && space}
+      <span class="note short" role="alert">{notEnoughText(room.shortBy, space.volume)}</span>
+    {:else}
+      <span class="note">Nothing on your computer is deleted.</span>
+    {/if}
     <button type="button" class="btn primary" onclick={addToQueue} disabled={!canAdd}>Add to queue</button>
   </div>
 </div>
@@ -241,6 +384,11 @@
   .resolved span b { color: var(--fg); font-weight: 500; }
   .placeholder { margin: 0; padding: 22px 14px; color: var(--muted); font-size: 13px; }
   .total { font: 500 15px var(--f-mono); }
-  .total small { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .total small, .match small { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .figures { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 22px; }
+  .match { font: 500 13px var(--f-mono); color: var(--signal); }
   .note { font-size: 13px; color: var(--muted); }
+  .note.short { color: var(--crit); }
+  .needs { font: 500 13px var(--f-mono); color: var(--muted); }
+  .needs.short { color: var(--crit); }
 </style>

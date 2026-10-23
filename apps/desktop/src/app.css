@@ -78,7 +78,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* Transfers: fixed header and readouts, the last row takes what is left and its panels scroll. */
 .view.fill { overflow: hidden; display: flex; flex-direction: column; }
 .view.fill > * { flex: none; min-width: 0; }
-.view.fill > .fill-row { flex: 1 1 0; min-height: 0; }
+.view.fill > .fill-row { flex: 1 1 0; min-height: 100px; }
+/* The row above it (speed chart and lanes) is as tall as its content, and gives way before the file list does. */
+.view.fill > .mid { flex: 0 1 auto; min-height: 0; }
 
 .panel { border: 1px solid var(--line); border-radius: 4px; background: var(--bg); min-width: 0; }
 .panel.col { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }

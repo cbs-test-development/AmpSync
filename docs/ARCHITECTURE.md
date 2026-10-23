@@ -24,6 +24,12 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D18 | Probe result (real tenant, 2026-10-22): with cookies, `/_api/v2.0/*` returns 403 and `SP.OAuth.Token/Acquire` returns 400, so no QuickXorHash. Classic REST listing works; `/_layouts/15/download.aspx?UniqueId=` honours Range (206); `GetFileByServerRelativePath/$value` ignores Range. v1 ships `ClassicRemote` only; verification is exact size + eTag unchanged (re-`stat` after download). `V2Remote` stays a documented extension point, not implemented. | Measured, not assumed. |
 | D14 | Commits and PRs carry only human authors: no bot or AI-tool co-author trailers or "generated with" lines. | The contributor list shows people. |
 | D12 | Contributors list is generated from the GitHub API at build time; repo slug comes from `AMPSYNC_REPO` / `GITHUB_REPOSITORY`, never hardcoded. | Forks show their own contributors; works offline. |
+| D20 | `JobSpec.files` is an optional explicit list of files. The picker sends globs when 50 patterns or fewer describe the selection, otherwise the list. `include` / `exclude` still apply on top, and the usual skip and resume rules hold. | Filtered selections (v1.1 search) scatter across the tree. |
+| D21 | `Plan.bytes_needed` is the bytes still to download (skipped files and ranges already on disk excluded; equal to `totals.bytes`). `free_space(dest)` (the `fs4` crate) reports the space on the destination's volume, using the nearest existing parent. A write that fails with disk full (`StorageFull`, `ENOSPC`, Windows 112 / 39) pauses the job like `AuthExpired`, emits `Event::DiskFull { path, needed, free }`, and never fails the job or deletes finished or partial work; `resume` retries. | Big jobs fill disks; a full disk must be recoverable, not a pile of failed files. |
+| D22 | Parallel downloads are tuned automatically by default (`Settings.auto_tune`, true); `parallel_files` is the fixed value when it is off. AIMD per 10 s of active transfer: start 4 lanes, bounds 2 to 16; +1 lane, kept only if throughput beats the window before it by at least 5% in two windows in a row, else taken back with a hold of 60 s that doubles with every miss in a row (up to 8 min; a clear gain of 10% resets it), so noise cannot ratchet the count up; halve (minimum 2) on 429/503 and hold 2 min after the `Retry-After` wait; above 2,400 requests per rolling 5 minutes (80% of SharePoint's ~3,000) stop adding lanes and use 32 MiB ranges for files started from then on. Lanes change mid-job without losing or repeating work (`Event::LanesChanged { lanes, reason }`). | The best lane count depends on the link and the tenant; a fixed number is wrong somewhere. |
+| D23 | `Settings.notify_on_finish: Option<bool>`; `None` means the user has not been asked yet (the key is absent from `settings.toml`). The desktop asks once, at the first download, and notifies only while the window is unfocused. | Notifications are opt-in. |
+| D24 | `Event::RangeDone { rel_path, index, count }` is sent once per range of a file split into ranges; `Event::FileStarted` carries `done_ranges` (ranges already on disk when resuming). Ranges lie on a fixed grid of the file's range size, so indices are stable across resumes. | Drives the fill map for big files. |
+| D25 | `Settings.splash: SplashMode` with `on` (default), `reduced`, `off`. The desktop implements the behaviour. | Startup animation is a preference. |
 
 ## Layout
 
@@ -168,7 +174,9 @@ pub struct JobSpec {
     pub existing: ExistingPolicy,       // SkipUnchanged (default) | Redownload
     pub prune: bool,                    // CLI only; default false
 }
-pub struct Plan { pub root: RemoteRoot, pub items: Vec<PlannedFile>, pub totals: Totals }
+pub struct Plan { pub root: RemoteRoot, pub items: Vec<PlannedFile>, pub totals: Totals,
+                  pub bytes_needed: u64 }   // D21: bytes still to download, == totals.bytes
+pub fn free_space(dest: &Path) -> io::Result<u64>;  // D21: also `ampsync_core::free_space`
 pub enum PlannedAction { Download, Resume { have: u64 }, SkipUnchanged }
 ```
 
@@ -180,7 +188,9 @@ Tables: `job` (spec, root, created/updated), `file` (rel_path PK, size, etag, ha
 
 ```rust
 pub struct Settings {
-    pub parallel_files: u8,            // default 6, 1..=16
+    pub parallel_files: u8,            // default 6, 1..=16; the fixed lane count when auto_tune is off
+    pub auto_tune: bool,               // default true (D22): lanes chosen by the engine, 2..=16
+    // application fields: notify_on_finish: Option<bool> (D23), splash: SplashMode (D25)
     pub range_size: u64,               // default 16 MiB (keeps a fast download under SharePoint's ~3000 requests / 5 min per user)
     pub large_file_threshold: u64,     // files above this get parallel ranges; default 64 MiB
     pub bandwidth_limit: Option<u64>,  // bytes/s, shared across lanes
@@ -206,7 +216,7 @@ impl JobHandle {
 
 pub enum Event {
     Planned { files: u64, bytes: u64, skipped: u64 },
-    FileStarted { rel_path: RelPath, size: u64, lane: u8 },
+    FileStarted { rel_path: RelPath, size: u64, lane: u8, done_ranges: Vec<u32> }, // D24
     Progress { bytes_done: u64, bytes_total: u64, rate_bps: u64 }, // throttled to ~4 Hz
     LaneProgress { lane: u8, rel_path: RelPath, offset: u64, size: u64 },
     FileVerified { rel_path: RelPath, by: VerifiedBy },             // Hash | SizeAndEtag | SizeAndMtime
@@ -214,13 +224,16 @@ pub enum Event {
     FileFailed { rel_path: RelPath, error: String, will_retry: bool },
     Throttled { retry_after: Duration },
     AuthExpired { host: String },                                   // job is now paused
+    DiskFull { path: String, needed: u64, free: u64 },              // job is now paused (D21)
+    RangeDone { rel_path: RelPath, index: u32, count: u32 },        // once per range of a ranged file (D24)
+    LanesChanged { lanes: u8, reason: LanesReason },                // probe_up | no_gain | throttled | budget (D22)
     Paused, Resumed,
     Finished(Summary),
 }
 ```
 
 Engine rules:
-- Files ≤ `large_file_threshold` are one request each; larger files are split into `range_size` ranges spread across lanes. Total in-flight requests never exceed `parallel_files`.
+- Files ≤ `large_file_threshold` are one request each; larger files are split into `range_size` ranges spread across lanes. Total in-flight requests never exceed the lane count (`parallel_files`, or the tuned count with `auto_tune`; see D22). A lane that is taken away finishes its current range or file first.
 - Each range is written with positional writes into the preallocated `.ampsync-part`; completed ranges are recorded in `state.db` so a restart only fetches missing ranges.
 - After the last byte: verify hash if present, else size + `stat()` eTag unchanged. Then rename over the destination. On mismatch: delete the part file and retry the file once, then `FileFailed`.
 - Windows: use `\\?\` long paths; replace characters illegal on Windows (`<>:"|?*` and trailing dots/spaces) with a visible substitute and record the mapping in `state.db`.
@@ -256,14 +269,28 @@ ampsync logout <host>
 ampsync sessions
 ampsync ls <url> [--depth N]
 ampsync get <url> <dest> [--include GLOB]... [--exclude GLOB]... [--parallel N]
-                         [--limit RATE] [--redownload] [--prune] [--yes] [--json]
+                         [--limit RATE] [--redownload] [--prune] [--ignore-space] [--yes] [--json]
 ampsync purge [--yes]          # delete all sign-ins, settings and app data; downloads are kept
 ```
-Exit codes: 0 ok, 1 error, 2 usage, 3 auth expired (rerun resumes), 4 some files failed. `--json` emits one `Event` per line for scripting. The CLI's webview sign-in uses `wry`/`tao` directly behind a `webview` cargo feature (on by default) so headless builds can opt out.
+Exit codes: 0 ok, 1 error, 2 usage, 3 auth expired (rerun resumes), 4 some files failed. `--json` emits one `Event` per line for scripting.
+
+`get` v1.1 behaviour (D21, D22): after planning it compares `Plan.bytes_needed + 1 GiB` with `free_space(dest)` and refuses with exit 1 and the shortfall unless `--ignore-space`; `--parallel N` sets `auto_tune = false` (there is no `--auto`; omitting `--parallel` is automatic). On `Event::DiskFull` the job is already paused: the CLI re-checks `free_space` every 15 s (and on Enter at a terminal) and calls `resume()` when the rest fits plus the margin, or at least 1 GiB more is free than when the disk filled up; free space that never grew does not retry by itself. The same loop runs under `--json`, which passes every event through unchanged; `range_done` is only ever printed there. The CLI's webview sign-in uses `wry`/`tao` directly behind a `webview` cargo feature (on by default) so headless builds can opt out.
 
 ## `ampsync-desktop`
 
-Tauri 2 commands mirror the engine (`resolve`, `plan`, `enqueue`, `pause`, `resume`, `cancel`, `sign_in`, `sign_out`, `sessions`, `get_settings`, `set_settings`, `contributors`). Engine events are forwarded to the frontend as Tauri events. A queue runs jobs one at a time. The frontend has the views Transfers, New download, Sign-ins, Settings, About, plus the first-run walkthrough (steps defined as data: target selector, view to show, title, body), skippable at any step and replayable from Settings.
+Tauri 2 commands mirror the engine (`resolve`, `plan`, `enqueue`, `pause`, `resume`, `cancel`, `sign_in`, `sign_out`, `sessions`, `get_settings`, `set_settings`, `contributors`), plus `parse_link` and `disk_space` (below). Engine events are forwarded to the frontend as Tauri events. A queue runs jobs one at a time. The frontend has the views Transfers, New download, Sign-ins, Settings, About, plus the first-run walkthrough (steps defined as data: target selector, view to show, title, body), skippable at any step and replayable from Settings.
+
+### Desktop additions in v1.1
+
+- `plan` returns `PlanTree` as flat parallel arrays (`names`, `parents`, `dirs`, `sizes`, `modified`). `modified` is the last-modified time of each file in unix seconds (0 for folders), so the picker's date filter runs in the frontend with no extra requests.
+- `parse_link(text) -> ParsedLinkInfo { host, kind, link }` classifies pasted, dropped or clipboard text (Safe Links wrappers removed, the first SharePoint folder link in running text) and fails with a short plain message for anything else. The frontend never guesses what a string is.
+- `disk_space(dest) -> { free, volume }` (D21) wraps `ampsync_core::free_space`, which walks up to the nearest existing parent, and names the volume for people: a drive letter (`D:`) or share on Windows, the mount point from `/proc/self/mountinfo` on Linux. It makes no network call and runs on a blocking thread, since a disconnected network drive can stall. The picker compares `free` with the selection's size plus a 1 GB margin (the plan's `bytes_needed` is only known once a job starts, so the picker uses selected bytes and the real need can be lower when files are skipped); the Transfers banner polls it while a job waits for space.
+- Queue items sent to the frontend (`queue-changed`, `get_queue`) are `QueueItemView`: the job's `spec` without `files` (D20), plus `spec.file_count`. A 100k-file selection makes `files` megabytes, which the frontend never needs. `queue.json` still holds the full list, so a restart resumes, and is rewritten only when what a restart would see changes (a fingerprint of the persisted statuses and fields); moves between preparing, running, needs-sign-in and needs-space all restore as queued and cause no write.
+- `ItemStatus::NeedsSpace` (`needs_space`) is set on `Event::DiskFull` and left on `Resumed`; `Paused` does not overwrite it. A restart restores it as queued.
+- Frontend events: `lanes_changed` marks the speed chart and sets the lane count shown (the job starts at 4 under auto-tuning with no event; lane slots 0 to 15 are stable). `range_done` and `file_started.done_ranges` feed per-file range maps (`core/fillmap.ts`, plain typed arrays kept outside Svelte's reactivity); a second `file_started` for a path restarts its map; the map redraws once per animation frame however many events arrived. The range size is taken from the settings and corrected by the first `range_done` count (double range size after the request budget was hit).
+
+Desktop extras (v1.1): the taskbar progress bar and a tray progress ring (progress.rs, redrawn at most every 2 s); opt-in notifications decided by a pure function ( On Windows, toasts are shown directly under the bundle identifier as AppUserModelID, registered per user under `HKCU\Software\Classes\AppUserModelId` before the first toast (the portable exe has no shortcut to carry it, and the plugin falls back to PowerShell's ID for `target\release` builds); `purge_all` removes the key.
+otify.rs, D23: window unfocused, user opted in, only finished / failed / sign-in needed); and the startup splash (D25): the main window is created hidden, index.html paints the splash, splash_info reports the mode, the sign-in check state and the credit line from the build-time contributor list, and show_window (or a 5 s fallback timer) shows the window.
 
 ## Testing
 

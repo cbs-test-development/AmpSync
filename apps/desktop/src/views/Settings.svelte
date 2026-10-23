@@ -2,7 +2,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { app, type Theme } from "../core/store.svelte";
   import { api, toCmdError } from "../core/api";
-  import type { CloseBehavior } from "../core/types";
+  import type { CloseBehavior, SplashMode } from "../core/types";
 
   const MB = 1024 * 1024;
   const caps = [
@@ -41,11 +41,18 @@
     }
   }
 
-  function step(delta: number) {
-    if (!s) return;
-    const next = Math.min(16, Math.max(1, s.parallel_files + delta));
-    void app.saveSettings({ parallel_files: next });
+  // "Files at the same time": Auto (AmpSync tunes it) or a fixed number from 1 to 16.
+  const parallelValue = $derived(s?.auto_tune === false ? String(s.parallel_files) : "auto");
+  function setParallel(v: string) {
+    if (v === "auto") void app.saveSettings({ auto_tune: true });
+    else void app.saveSettings({ auto_tune: false, parallel_files: Number(v) });
   }
+
+  const splashModes: { id: SplashMode; label: string }[] = [
+    { id: "on", label: "On" },
+    { id: "reduced", label: "Reduced motion" },
+    { id: "off", label: "Off" },
+  ];
 
   const themes: { id: Theme; label: string }[] = [
     { id: "system", label: "System" },
@@ -94,13 +101,12 @@
         </div>
       </div>
       <div>
-        <span class="label" id="par-label">Files at the same time</span>
-        <div class="stepper" role="group" aria-labelledby="par-label">
-          <button type="button" aria-label="Fewer" onclick={() => step(-1)} disabled={s.parallel_files <= 1}>−</button>
-          <output aria-live="polite">{s.parallel_files}</output>
-          <button type="button" aria-label="More" onclick={() => step(1)} disabled={s.parallel_files >= 16}>+</button>
-        </div>
-        <p class="hint">Applies to the next download that starts.</p>
+        <label class="label" for="s-par">Files at the same time</label>
+        <select class="field" id="s-par" value={parallelValue} onchange={(e) => setParallel(e.currentTarget.value)}>
+          <option value="auto">Auto (recommended)</option>
+          {#each Array.from({ length: 16 }, (_, i) => i + 1) as n}<option value={String(n)}>{n}</option>{/each}
+        </select>
+        <p class="hint">{s.auto_tune ? "AmpSync adds downloads while your connection keeps up and backs off when SharePoint asks it to slow down." : "Always this many, whatever the connection does."} Applies to the next download that starts.</p>
       </div>
       <div>
         <label class="label" for="s-cap">Speed limit</label>
@@ -121,6 +127,10 @@
   </div>
 
   <div class="panel">
+    <div class="toggle">
+      <div><strong>Notify when downloads finish</strong><p>A notification when a download finishes, stops with an error, or needs you to sign in, shown only while AmpSync's window is in the background.</p></div>
+      <span class="switch"><input type="checkbox" aria-label="Notify when downloads finish" checked={s.notify_on_finish === true} onchange={(e) => app.saveSettings({ notify_on_finish: e.currentTarget.checked })} /><i></i></span>
+    </div>
     <div class="toggle">
       <div><strong>Use my Windows work account</strong><p>{isWindows ? "Signs in with the account you use to log in to Windows when your company allows it, so there's often no prompt. Takes effect the next time AmpSync starts." : "Windows only."}</p></div>
       <span class="switch"><input type="checkbox" aria-label="Use my Windows work account" checked={s.use_windows_account} disabled={!isWindows} onchange={(e) => app.saveSettings({ use_windows_account: e.currentTarget.checked })} /><i></i></span>
@@ -145,6 +155,14 @@
       <div class="theme-switch" role="group" aria-label="Theme">
         {#each themes as t}
           <button type="button" aria-pressed={app.theme === t.id} onclick={() => app.setTheme(t.id)}>{t.label}</button>
+        {/each}
+      </div>
+    </div>
+    <div class="toggle">
+      <div><strong>Startup animation</strong><p>The short animation when AmpSync opens. Reduced motion shows a still logo and fades out; Off goes straight to the app. A click or any key skips it, and your system's reduce-motion setting is respected.</p></div>
+      <div class="theme-switch" role="group" aria-label="Startup animation">
+        {#each splashModes as m}
+          <button type="button" aria-pressed={s.splash === m.id} onclick={() => app.saveSettings({ splash: m.id })}>{m.label}</button>
         {/each}
       </div>
     </div>
@@ -193,12 +211,7 @@
   .switch input:checked + i::after { transform: translateX(16px); background: var(--signal-ink); }
   .switch input:focus-visible + i { outline: 2px solid var(--signal); outline-offset: 2px; }
   .switch input:disabled + i { opacity: .5; }
-  .stepper { display: flex; align-items: center; border: 1px solid var(--line); border-radius: 4px; width: max-content; }
-  .stepper button { background: none; border: 0; width: 32px; height: 32px; cursor: pointer; color: var(--muted); font-size: 16px; }
-  .stepper button:hover:not(:disabled) { color: var(--fg); }
-  .stepper button:disabled { opacity: .4; cursor: default; }
-  .stepper output { min-width: 34px; text-align: center; font: 500 14px var(--f-mono); }
-  .theme-switch { display: flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .theme-switch { display: flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; flex: none; }
   .theme-switch button { background: none; border: 0; padding: 4px 12px; cursor: pointer; font-size: 12px; color: var(--muted); }
   .theme-switch button[aria-pressed="true"] { background: var(--raise); color: var(--fg); }
   @media (prefers-reduced-motion: reduce) {

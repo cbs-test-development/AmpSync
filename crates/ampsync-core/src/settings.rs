@@ -26,12 +26,29 @@ pub enum CloseBehavior {
     Pause,
 }
 
+/// How the startup splash plays (D25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplashMode {
+    /// Full animation.
+    #[default]
+    On,
+    /// Static mark and name with a short fade; also what `On` becomes under the OS reduce-motion
+    /// preference.
+    Reduced,
+    /// No splash; the window shows when ready.
+    Off,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     // --- engine ---
-    /// Maximum simultaneous requests / files. Default 4, valid 1..=16.
+    /// Simultaneous requests / files when `auto_tune` is off. Valid 1..=16.
     pub parallel_files: u8,
+    /// Let the engine choose the number of simultaneous requests (D22). Default on; when off,
+    /// `parallel_files` is used as a fixed value.
+    pub auto_tune: bool,
     /// Size of one byte-range request. Default 8 MiB.
     pub range_size: u64,
     /// Files above this size are split into parallel ranges. Default 64 MiB.
@@ -55,12 +72,19 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_dest: Option<PathBuf>,
     pub close_behavior: CloseBehavior,
+    /// Notify when a download finishes, fails or needs sign-in while the window is not focused
+    /// (D23). `None` = the user has not been asked yet; it is left out of the file in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_on_finish: Option<bool>,
+    /// Startup animation (D25).
+    pub splash: SplashMode,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             parallel_files: 6,
+            auto_tune: true,
             range_size: 16 * MIB,
             large_file_threshold: 64 * MIB,
             bandwidth_limit: None,
@@ -71,6 +95,8 @@ impl Default for Settings {
             use_windows_account: true,
             default_dest: None,
             close_behavior: CloseBehavior::Ask,
+            notify_on_finish: None,
+            splash: SplashMode::On,
         }
     }
 }
@@ -152,6 +178,9 @@ mod tests {
         assert!(s.use_windows_account);
         assert_eq!(s.default_dest, None);
         assert_eq!(s.close_behavior, CloseBehavior::Ask);
+        assert!(s.auto_tune);
+        assert_eq!(s.notify_on_finish, None);
+        assert_eq!(s.splash, SplashMode::On);
     }
 
     #[test]
@@ -171,6 +200,62 @@ mod tests {
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path).unwrap(), s);
+    }
+
+    #[test]
+    fn notify_on_finish_round_trips_all_three_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        for state in [None, Some(true), Some(false)] {
+            let s = Settings {
+                notify_on_finish: state,
+                ..Settings::default()
+            };
+            s.save_to(&path).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.contains("notify_on_finish"), state.is_some(), "{text}");
+            assert_eq!(Settings::load_from(&path).unwrap().notify_on_finish, state);
+        }
+    }
+
+    #[test]
+    fn splash_and_auto_tune_round_trip_and_use_snake_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        for mode in [SplashMode::On, SplashMode::Reduced, SplashMode::Off] {
+            let s = Settings {
+                splash: mode,
+                auto_tune: false,
+                ..Settings::default()
+            };
+            s.save_to(&path).unwrap();
+            assert_eq!(Settings::load_from(&path).unwrap(), s);
+        }
+        std::fs::write(
+            &path,
+            "splash = \"reduced\"
+auto_tune = false
+notify_on_finish = false
+",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path).unwrap();
+        assert_eq!(s.splash, SplashMode::Reduced);
+        assert!(!s.auto_tune);
+        assert_eq!(s.notify_on_finish, Some(false));
+        assert_eq!(
+            serde_json::to_string(&SplashMode::Reduced).unwrap(),
+            "\"reduced\""
+        );
+        // A file from before v1.1 gets the new defaults.
+        std::fs::write(
+            &path,
+            "tour_seen = true
+",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path).unwrap();
+        assert!(s.auto_tune && s.notify_on_finish.is_none() && s.splash == SplashMode::On);
     }
 
     #[test]

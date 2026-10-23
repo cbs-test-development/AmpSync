@@ -16,6 +16,24 @@ export function sizeParts(bytes: number): [string, string] {
   return [num(bytes, 0), "B"];
 }
 
+/** A short size for sentences: three digits or at most one decimal ("6.3 GB", "31.2 GB", "112 GB", "40 MB"). */
+export function sizeBrief(bytes: number): string {
+  const units: [number, string][] = [[KB, "KB"], [MB, "MB"], [GB, "GB"], [TB, "TB"]];
+  let at = -1;
+  units.forEach(([f], i) => {
+    if (bytes >= f) at = i;
+  });
+  if (at < 0) return `${num(Math.max(0, bytes), 0)} B`;
+  let v = bytes / units[at][0];
+  // 1023.96 MB would print as 1,024 MB: show it as the next unit up instead.
+  if (Math.round(v) >= 1024 && at < units.length - 1) {
+    at++;
+    v = bytes / units[at][0];
+  }
+  const digits = v >= 100 || at === 0 ? 0 : 1;
+  return `${v.toLocaleString("en-US", { maximumFractionDigits: digits })} ${units[at][1]}`;
+}
+
 export function size(bytes: number): string {
   const [v, u] = sizeParts(bytes);
   return `${v} ${u}`;

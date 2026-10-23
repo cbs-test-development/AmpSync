@@ -1,10 +1,12 @@
 //! An in-process fake SharePoint: classic REST listing, `download.aspx` byte ranges, sharing-link
 //! redirects, and switchable misbehaviour (429, 500, expired session, changing eTags, ignored
-//! Range, hanging requests). Every request is logged so tests can assert what was fetched.
+//! Range, hanging requests) and a bandwidth model (a shared link plus a per-connection cap).
+//! Every request is logged so tests can assert what was fetched.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use ampsync_core::auth::{Session, SessionCookie, SignInMethod};
 use axum::Router;
@@ -12,6 +14,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
+use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use serde_json::json;
 use time::OffsetDateTime;
@@ -51,7 +54,7 @@ pub enum Logged {
 }
 
 struct FFile {
-    data: Vec<u8>,
+    data: Bytes,
     etag: String,
     id: String,
 }
@@ -76,11 +79,29 @@ struct Inner {
     page_size: Option<usize>,
     api_failures: std::collections::VecDeque<u16>,
     forbidden: HashSet<String>,
+    // bandwidth model and what it observed
+    bandwidth: Option<Bandwidth>,
+    active: usize,
+    peak: usize,
+    trace: Vec<(Duration, usize)>,
+    download_times: Vec<Duration>,
 }
+
+/// Download bodies are paced: each connection gets `min(per_conn, total / active connections)`
+/// bytes per second. Either limit may be absent.
+#[derive(Clone, Copy)]
+struct Bandwidth {
+    total: Option<u64>,
+    per_conn: Option<u64>,
+}
+
+/// Bytes sent per paced write.
+const CHUNK: usize = 16 * 1024;
 
 pub struct Fake {
     pub origin: Url,
     inner: Mutex<Inner>,
+    epoch: Instant,
 }
 
 impl Fake {
@@ -90,6 +111,7 @@ impl Fake {
         let fake = Arc::new(Fake {
             origin: Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
             inner: Mutex::new(Inner::default()),
+            epoch: Instant::now(),
         });
         fake.lock().accepted.insert(COOKIE_OLD.to_string());
         let app = Router::new().fallback(handle).with_state(fake.clone());
@@ -119,7 +141,14 @@ impl Fake {
         g.next_id += 1;
         let id = format!("00000000-0000-0000-0000-{:012x}", g.next_id);
         let etag = format!("\"{{{id}}},1\"");
-        g.files.insert(key.to_string(), FFile { data, etag, id });
+        g.files.insert(
+            key.to_string(),
+            FFile {
+                data: Bytes::from(data),
+                etag,
+                id,
+            },
+        );
     }
 
     pub fn add_folder(&self, path: &str) {
@@ -130,7 +159,7 @@ impl Fake {
     pub fn replace_file(&self, key: &str, data: Vec<u8>, etag: &str) {
         let mut g = self.lock();
         let f = g.files.get_mut(key).expect("file exists");
-        f.data = data;
+        f.data = Bytes::from(data);
         f.etag = etag.to_string();
     }
 
@@ -204,7 +233,61 @@ impl Fake {
         self.lock().forbidden.insert(key.to_string());
     }
 
+    /// Pace download bodies: `total` bytes/s shared by all connections, `per_conn` bytes/s for each.
+    pub fn bandwidth(&self, total: Option<u64>, per_conn: Option<u64>) {
+        self.lock().bandwidth = Some(Bandwidth { total, per_conn });
+    }
+
     // ----- observation -----
+
+    /// The most download connections that were open at the same time.
+    pub fn peak_concurrency(&self) -> usize {
+        self.lock().peak
+    }
+    /// Open download connections over time: `(since start, count)` at every change.
+    pub fn concurrency_trace(&self) -> Vec<(Duration, usize)> {
+        self.lock().trace.clone()
+    }
+    /// Time-weighted mean number of open download connections between `from` and `to` (since start).
+    pub fn mean_concurrency(&self, from: Duration, to: Duration) -> f64 {
+        let g = self.lock();
+        let (mut area, mut level, mut at) = (0.0, 0usize, from);
+        for (t, n) in &g.trace {
+            if *t <= from {
+                level = *n;
+                continue;
+            }
+            let t = (*t).min(to);
+            area += level as f64 * (t - at).as_secs_f64();
+            at = t;
+            level = *n;
+        }
+        if to > at {
+            area += level as f64 * (to - at).as_secs_f64();
+        }
+        area / (to - from).as_secs_f64()
+    }
+    /// Time since the fake started.
+    pub fn elapsed(&self) -> Duration {
+        self.epoch.elapsed()
+    }
+    /// The most download requests (answered or not) that arrived within any `window`.
+    pub fn max_requests_within(&self, window: Duration) -> usize {
+        let g = self.lock();
+        let times = &g.download_times;
+        let (mut best, mut lo) = (0, 0);
+        for hi in 0..times.len() {
+            while times[hi] - times[lo] > window {
+                lo += 1;
+            }
+            best = best.max(hi - lo + 1);
+        }
+        best
+    }
+    /// Number of download requests that arrived, including refused ones.
+    pub fn download_requests(&self) -> usize {
+        self.lock().download_times.len()
+    }
 
     pub fn log(&self) -> Vec<Logged> {
         self.lock().log.clone()
@@ -434,8 +517,81 @@ fn folder_request(fake: &Fake, folder: &str, suffix: &str, query: &HashMap<Strin
     }
 }
 
-fn download(fake: &Fake, id: &str, headers: &HeaderMap) -> Response {
+/// Counts a connection as open until its body is finished or dropped.
+struct OpenConnection(Arc<Fake>);
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        let mut g = self.0.lock();
+        g.active = g.active.saturating_sub(1);
+        let (t, n) = (self.0.epoch.elapsed(), g.active);
+        g.trace.push((t, n));
+    }
+}
+
+struct Paced {
+    fake: Arc<Fake>,
+    data: Bytes,
+    pos: usize,
+    deadline: Instant,
+    _open: OpenConnection,
+}
+
+/// How far behind its schedule a connection may fall before it stops catching up.
+const MAX_LAG: Duration = Duration::from_millis(100);
+
+async fn next_chunk(mut st: Paced) -> Option<(Result<Bytes, std::io::Error>, Paced)> {
+    if st.pos >= st.data.len() {
+        return None;
+    }
+    let n = (st.data.len() - st.pos).min(CHUNK);
+    let (bw, active) = {
+        let g = st.fake.lock();
+        (g.bandwidth, g.active.max(1))
+    };
+    let mut rate = f64::INFINITY;
+    if let Some(bw) = bw {
+        if let Some(total) = bw.total {
+            rate = rate.min(total as f64 / active as f64);
+        }
+        if let Some(per_conn) = bw.per_conn {
+            rate = rate.min(per_conn as f64);
+        }
+    }
+    if rate.is_finite() {
+        // Pace against a running deadline so timer slop does not add up.
+        let now = Instant::now();
+        st.deadline = st.deadline.max(now - MAX_LAG) + Duration::from_secs_f64(n as f64 / rate);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(st.deadline)).await;
+    }
+    let chunk = st.data.slice(st.pos..st.pos + n);
+    st.pos += n;
+    Some((Ok(chunk), st))
+}
+
+/// The response body: paced when a bandwidth model is set, otherwise sent at once.
+fn body_for(fake: &Arc<Fake>, g: &mut Inner, data: Bytes) -> Body {
+    if g.bandwidth.is_none() {
+        return Body::from(data);
+    }
+    g.active += 1;
+    g.peak = g.peak.max(g.active);
+    let (t, n) = (fake.epoch.elapsed(), g.active);
+    g.trace.push((t, n));
+    let st = Paced {
+        fake: fake.clone(),
+        data,
+        pos: 0,
+        deadline: Instant::now(),
+        _open: OpenConnection(fake.clone()),
+    };
+    Body::from_stream(futures::stream::unfold(st, next_chunk))
+}
+
+fn download(fake: &Arc<Fake>, id: &str, headers: &HeaderMap) -> Response {
     let mut g = fake.lock();
+    let arrived = fake.epoch.elapsed();
+    g.download_times.push(arrived);
     let Some(key) = g.files.iter().find(|(_, f)| f.id == id).map(|(k, _)| k.clone()) else {
         return plain(StatusCode::NOT_FOUND, "no such file");
     };
@@ -484,7 +640,8 @@ fn download(fake: &Fake, id: &str, headers: &HeaderMap) -> Response {
                 .header(header::CONTENT_RANGE, format!("bytes {a}-{b}/{total}"))
                 // Real tenants label download.aspx bytes as text/html.
                 .header(header::CONTENT_TYPE, "text/html")
-                .body(Body::from(data[a as usize..=b as usize].to_vec()))
+                .header(header::CONTENT_LENGTH, b + 1 - a)
+                .body(body_for(fake, &mut g, data.slice(a as usize..=b as usize)))
                 .unwrap()
         }
         _ => {
@@ -496,13 +653,13 @@ fn download(fake: &Fake, id: &str, headers: &HeaderMap) -> Response {
             Response::builder()
                 .status(200)
                 .header(header::CONTENT_TYPE, "text/html")
-                .body(Body::from(data))
+                .body(body_for(fake, &mut g, data))
                 .unwrap()
         }
     };
     if let Some((_, new_data, new_etag)) = swap {
         let f = g.files.get_mut(&key).unwrap();
-        f.data = new_data;
+        f.data = Bytes::from(new_data);
         f.etag = new_etag;
     }
     if flap {

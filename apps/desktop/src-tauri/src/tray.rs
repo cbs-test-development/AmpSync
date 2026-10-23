@@ -9,18 +9,26 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 use crate::AppState;
 
-const TRAY_ID: &str = "main";
+pub(crate) const TRAY_ID: &str = "main";
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show AmpSync", true, None::<&str>)?;
+    let clip = MenuItem::with_id(
+        app,
+        "clipboard",
+        "Download link from clipboard",
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit (pause downloads)", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &clip, &quit])?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("AmpSync")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main(app),
+            "clipboard" => link_from_clipboard(app),
             "quit" => quit_now(app, true),
             _ => {}
         })
@@ -42,6 +50,8 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn show_main(app: &AppHandle) {
+    // Any show counts as "the window has appeared" for the startup fallback timer.
+    crate::splash::mark_shown();
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -49,14 +59,18 @@ pub fn show_main(app: &AppHandle) {
     }
 }
 
-pub fn update_tooltip(app: &AppHandle, fraction: Option<f64>) {
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let text = match fraction {
-            Some(f) => format!("AmpSync - {:.0}%", (f * 100.0).clamp(0.0, 100.0)),
-            None => "AmpSync".to_string(),
-        };
-        let _ = tray.set_tooltip(Some(text));
-    }
+/// The tray's "Download link from clipboard": the one place the app reads the clipboard itself,
+/// and only because the user chose that menu item. The frontend parses the text and says so
+/// inline when it is not a SharePoint folder link.
+fn link_from_clipboard(app: &AppHandle) {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    // Anything that is not text (an image, an empty clipboard) reads as no text.
+    let text = app.clipboard().read_text().unwrap_or_default();
+    show_main(app);
+    let _ = app.emit(
+        "incoming-link",
+        serde_json::json!({ "text": text, "source": "tray" }),
+    );
 }
 
 pub fn quit_now(app: &AppHandle, mark_paused: bool) {
@@ -80,12 +94,16 @@ pub fn apply_close(app: &AppHandle, behavior: CloseBehavior) {
 
 /// Called for every window event of the main window.
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
-    let WindowEvent::CloseRequested { api, .. } = event else {
-        return;
-    };
     if window.label() != "main" {
         return;
     }
+    if let WindowEvent::Focused(true) = event {
+        crate::progress::on_focus(window.app_handle());
+        return;
+    }
+    let WindowEvent::CloseRequested { api, .. } = event else {
+        return;
+    };
     let app = window.app_handle();
     let state = app.state::<AppState>();
     if state.quitting.load(Ordering::SeqCst) {

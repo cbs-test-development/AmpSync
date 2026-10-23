@@ -2,7 +2,8 @@
 //!
 //! Deleted: every saved session in the OS keychain (all hosts in the index, then the index), the
 //! settings directory, the whole per-user data directory (job state, sign-in profile, queue,
-//! update-check cache) and the desktop app's WebView cache. Download destinations are never
+//! update-check cache), the desktop app's WebView cache and, on Windows, the per-user registration
+//! that labels the desktop app's notifications. Download destinations are never
 //! touched: the only reference to them is a text file inside the data directory.
 //!
 //! Best effort: a failure is recorded in [`PurgeReport::errors`] and the rest carries on. Symbolic
@@ -23,6 +24,8 @@ pub struct PurgeReport {
     pub removed: Vec<PathBuf>,
     /// Keychain entries removed: one per saved session plus the host index.
     pub keychain_entries: usize,
+    /// Windows registry keys removed (the desktop app's notification registration).
+    pub registry_entries: usize,
     /// Everything that could not be removed, as readable text.
     pub errors: Vec<String>,
 }
@@ -90,8 +93,30 @@ pub fn purge_all() -> Result<PurgeReport, Error> {
         Ok(()) => report.keychain_entries += 1,
         Err(e) => report.errors.push(e.to_string()),
     }
+    #[cfg(windows)]
+    match remove_notification_registration() {
+        Ok(true) => report.registry_entries += 1,
+        Ok(false) => {}
+        Err(e) => report.errors.push(format!("notification registration: {e}")),
+    }
     report.errors.extend(setup_errors);
     Ok(report)
+}
+
+/// AppUserModelID of the desktop app (its bundle identifier). The desktop app registers it under
+/// `HKCU\Software\Classes\AppUserModelId` the first time it shows a notification, so Windows
+/// labels the notification "AmpSync" even for the portable exe.
+pub const WINDOWS_APP_ID: &str = "io.github.ampsync.desktop";
+
+/// Delete the desktop app's notification registration; `false` when there was none.
+#[cfg(windows)]
+fn remove_notification_registration() -> std::io::Result<bool> {
+    let key = format!(r"Software\Classes\AppUserModelId\{WINDOWS_APP_ID}");
+    match winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).delete_subkey_all(key) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// [`purge_all`] with the locations and the session store injected (tests, custom setups).
