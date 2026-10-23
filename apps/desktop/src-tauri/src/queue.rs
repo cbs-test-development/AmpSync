@@ -18,6 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::AppState;
+use crate::notify::{self, Trigger};
 use crate::paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +199,13 @@ impl Queue {
             .map(|p| crate::commands::start_url(&p))
     }
 
+    /// Status of the job that is running right now, if any (for the taskbar and tray progress).
+    pub fn current_status(&self) -> Option<ItemStatus> {
+        let g = self.lock();
+        let id = g.current.as_ref()?.id;
+        g.items.iter().find(|i| i.id == id).map(|i| i.status)
+    }
+
     pub fn has_active(&self) -> bool {
         let g = self.lock();
         g.current.is_some()
@@ -215,26 +223,30 @@ impl Queue {
     }
 
     fn publish(&self, app: &AppHandle) {
-        let _persist = self.persist.lock().unwrap_or_else(|p| p.into_inner());
-        let snap = {
-            let mut g = self.lock();
-            // Keep only the most recent finished jobs.
-            let finished: Vec<u64> = g
-                .items
-                .iter()
-                .filter(|i| i.status.is_finished())
-                .map(|i| i.id)
-                .collect();
-            if finished.len() > 20 {
-                let drop_ids: Vec<u64> = finished[..finished.len() - 20].to_vec();
-                g.items.retain(|i| !drop_ids.contains(&i.id));
+        {
+            let _persist = self.persist.lock().unwrap_or_else(|p| p.into_inner());
+            let snap = {
+                let mut g = self.lock();
+                // Keep only the most recent finished jobs.
+                let finished: Vec<u64> = g
+                    .items
+                    .iter()
+                    .filter(|i| i.status.is_finished())
+                    .map(|i| i.id)
+                    .collect();
+                if finished.len() > 20 {
+                    let drop_ids: Vec<u64> = finished[..finished.len() - 20].to_vec();
+                    g.items.retain(|i| !drop_ids.contains(&i.id));
+                }
+                g.items.clone()
+            };
+            if let Err(e) = save_queue(&paths::queue_file(), &snap) {
+                tracing::warn!("could not save the download queue: {e}");
             }
-            g.items.clone()
-        };
-        if let Err(e) = save_queue(&paths::queue_file(), &snap) {
-            tracing::warn!("could not save the download queue: {e}");
+            let _ = app.emit("queue-changed", &snap);
         }
-        let _ = app.emit("queue-changed", &snap);
+        // Taskbar and tray follow the running job (after the persist lock is released).
+        crate::progress::sync(app);
     }
 
     fn set_status(&self, app: &AppHandle, id: u64, status: ItemStatus, error: Option<String>) {
@@ -537,12 +549,31 @@ async fn run_item(app: &AppHandle, id: u64) {
                 }
             }
             queue.set_status(app, id, ItemStatus::Done, None);
+            notify::send(
+                app,
+                &Trigger::Finished {
+                    title: item.title.clone(),
+                    files: summary.downloaded + summary.skipped,
+                    failed: summary.failed,
+                },
+            );
         }
         Ok(None) => {} // paused or cancelled: status already set
-        Err(Error::Cancelled) => queue.set_status(app, id, ItemStatus::Cancelled, None),
-        Err(e) => queue.set_status(app, id, ItemStatus::Failed, Some(failure_text(&e))),
+        Err(Error::Cancelled) => {
+            queue.set_status(app, id, ItemStatus::Cancelled, None);
+            notify::send(app, &Trigger::Cancelled);
+        }
+        Err(e) => {
+            crate::progress::failed(app);
+            queue.set_status(app, id, ItemStatus::Failed, Some(failure_text(&e)));
+            notify::send(
+                app,
+                &Trigger::Failed {
+                    title: item.title.clone(),
+                },
+            );
+        }
     }
-    crate::tray::update_tooltip(app, None);
 }
 
 /// `Ok(Some)` finished, `Ok(None)` stopped by the user with the status already recorded.
@@ -610,11 +641,8 @@ async fn run_item_inner(
                 ev = events.recv() => match ev {
                     Ok(ev) => {
                         let _ = app.emit("job-event", JobEvent { job_id: id, event: ev.clone() });
+                        crate::progress::on_event(app, &ev);
                         match &ev {
-                            Event::Progress { bytes_done, bytes_total, .. } => {
-                                let pct = if *bytes_total > 0 { Some(*bytes_done as f64 / *bytes_total as f64) } else { None };
-                                crate::tray::update_tooltip(app, pct);
-                            }
                             Event::Paused => {
                                 if queue.item(id).is_some_and(|i| i.status != ItemStatus::NeedsSignIn) {
                                     queue.set_status(app, id, ItemStatus::Paused, None);
@@ -711,7 +739,11 @@ async fn acquire(
                 }
             }
             Err(e) => {
+                crate::progress::failed(app);
                 queue.set_status(app, id, ItemStatus::Failed, Some(failure_text(&e)));
+                if let Some(it) = queue.item(id) {
+                    notify::send(app, &Trigger::Failed { title: it.title });
+                }
                 return Outcome::Stop;
             }
         }

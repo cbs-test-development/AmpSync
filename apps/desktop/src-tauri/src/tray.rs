@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 use crate::AppState;
 
-const TRAY_ID: &str = "main";
+pub(crate) const TRAY_ID: &str = "main";
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show AmpSync", true, None::<&str>)?;
@@ -50,6 +50,8 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn show_main(app: &AppHandle) {
+    // Any show counts as "the window has appeared" for the startup fallback timer.
+    crate::splash::mark_shown();
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -69,16 +71,6 @@ fn link_from_clipboard(app: &AppHandle) {
         "incoming-link",
         serde_json::json!({ "text": text, "source": "tray" }),
     );
-}
-
-pub fn update_tooltip(app: &AppHandle, fraction: Option<f64>) {
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let text = match fraction {
-            Some(f) => format!("AmpSync - {:.0}%", (f * 100.0).clamp(0.0, 100.0)),
-            None => "AmpSync".to_string(),
-        };
-        let _ = tray.set_tooltip(Some(text));
-    }
 }
 
 pub fn quit_now(app: &AppHandle, mark_paused: bool) {
@@ -102,12 +94,16 @@ pub fn apply_close(app: &AppHandle, behavior: CloseBehavior) {
 
 /// Called for every window event of the main window.
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
-    let WindowEvent::CloseRequested { api, .. } = event else {
-        return;
-    };
     if window.label() != "main" {
         return;
     }
+    if let WindowEvent::Focused(true) = event {
+        crate::progress::on_focus(window.app_handle());
+        return;
+    }
+    let WindowEvent::CloseRequested { api, .. } = event else {
+        return;
+    };
     let app = window.app_handle();
     let state = app.state::<AppState>();
     if state.quitting.load(Ordering::SeqCst) {

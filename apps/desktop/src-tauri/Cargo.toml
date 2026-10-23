@@ -38,6 +38,8 @@ tracing = { workspace = true }
 directories = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 percent-encoding = { workspace = true }
+tauri-plugin-notification = "2"
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"

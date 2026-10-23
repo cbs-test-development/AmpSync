@@ -5,10 +5,13 @@ mod commands;
 mod contributors;
 mod error;
 mod links;
+mod notify;
 mod paths;
+mod progress;
 mod purge;
 mod queue;
 mod signin;
+mod splash;
 mod startup;
 mod tray;
 mod update;
@@ -97,6 +100,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::new(settings))
         .invoke_handler(tauri::generate_handler![
@@ -125,11 +129,16 @@ pub fn run() {
             commands::close_decision,
             commands::known_hosts,
             commands::purge_everything,
+            splash::splash_info,
+            splash::show_window,
         ])
         .on_window_event(tray::on_window_event)
         .setup(|app| {
             let handle = app.handle().clone();
+            progress::setup(&handle);
             tray::setup(&handle)?;
+            notify::setup(&handle);
+            splash::spawn_fallback(handle.clone());
             let state = app.state::<AppState>();
             state.queue.restore(&paths::queue_file());
             queue::spawn_runner(handle.clone());
