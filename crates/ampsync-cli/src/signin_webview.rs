@@ -233,7 +233,7 @@ pub fn sign_in(
         .map_err(|e| Failure::Unavailable(format!("window creation failed: {e}")))?;
 
     #[cfg(not(windows))]
-    let mut web_context = wry::WebContext::new(Some(opts.profile_dir.as_path()));
+    let mut web_context = wry::WebContext::new(Some(opts.profile_dir.clone()));
 
     #[cfg(windows)]
     let builder = {

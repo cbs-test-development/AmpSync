@@ -7,10 +7,7 @@
 [![License: MIT][badge-license]](LICENSE)
 ![Platforms: Windows | Ubuntu][badge-platforms]
 [![Downloads][badge-downloads]][releases]
-
-![AmpSync downloading a folder](docs/screenshot.png)
-
-<!-- Maintainers: add docs/screenshot.png (a window capture of the Transfers view, with no real site or file names). -->
+<a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584?style=flat-square&amp;logo=rust" alt="Built with Rust"></a>
 
 ## Why
 
