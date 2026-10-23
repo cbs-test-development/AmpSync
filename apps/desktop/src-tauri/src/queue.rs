@@ -254,7 +254,11 @@ impl Queue {
 
     /// Just the title, for notifications.
     pub fn title_of(&self, id: u64) -> Option<String> {
-        self.lock().items.iter().find(|i| i.id == id).map(|i| i.title.clone())
+        self.lock()
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.title.clone())
     }
 
     /// Hosts that have work waiting (used by the launch-time sign-in check).
