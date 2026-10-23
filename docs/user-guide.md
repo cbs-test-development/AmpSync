@@ -8,6 +8,7 @@ This guide walks through a download from start to finish and explains what AmpSy
 - [Your first download](#your-first-download)
 - [Signing in](#signing-in)
 - [When your sign-in expires](#when-your-sign-in-expires)
+- [Running from the command line](#running-from-the-command-line)
 - [Settings explained](#settings-explained)
 - [Where your files and data live](#where-your-files-and-data-live)
 - [Running a download again](#running-a-download-again)
@@ -67,6 +68,83 @@ SharePoint sessions end after a while, and very large downloads can outlast one.
 3. If Microsoft needs you to type a password or approve a prompt, the sign-in window opens. Sign in and the download resumes by itself.
 
 If you are away, it stays paused until you return. With the command line, the exit code is `3`; sign in again with `ampsync login` and run the same `ampsync get` command to continue.
+
+## Running from the command line
+
+`ampsync get <link> <folder>` does what the window does. This section covers what is specific to it; the options are listed in the [README](../README.md#command-line).
+
+### Disk space
+
+Before anything downloads, `get` works out how much is still to download (files that are already up to date and parts already on disk do not count) and compares it with the free space on the destination's disk. The summary shows both:
+
+```
+Disk space:   needs 31.2 GiB, 112.0 GiB free on D:
+```
+
+AmpSync keeps 1 GiB free on top of what the download needs. If the disk is too small, nothing starts, the exit code is `1`, and the message says how much to free up (the 1 GiB is included, so freeing exactly that much is enough):
+
+```
+error: Not enough space on D:. Needs 31.2 GiB, 24.9 GiB free. Free up 7.3 GiB or choose another folder.
+```
+
+The disk is named by its drive letter on Windows (`D:`) and by its mount point on Ubuntu (`/home`). Add `--ignore-space` to start anyway, for example when you know space will be freed by the time it is needed. If the operating system cannot report the free space, AmpSync warns and carries on.
+
+If the disk fills up **while downloading** (other programs use it too), the download pauses and nothing is deleted: finished files and partial files stay. A line like this appears:
+
+```
+Disk full on D: (12.0 MiB free, 20.0 GiB still to download). Paused. Free up space and it continues by itself (checking every 15s, or press Enter to try now); Ctrl+C stops and keeps what is downloaded.
+```
+
+Every 15 seconds AmpSync looks at the free space and carries on when trying again is worthwhile: when everything that is left plus the 1 GiB spare fits, or when at least 1 GiB more is free than when the disk filled up (enough for real progress; if it fills again it simply pauses again). Free space that has not grown at all never triggers a retry on its own, because some disks (quotas, network shares) report room but still refuse writes; press Enter on a terminal to force a retry. Ctrl+C stops cleanly and keeps the part files, and running the same command later resumes.
+
+### Simultaneous transfers
+
+Unless you say otherwise, AmpSync chooses how many files and pieces download at once. It starts with 4, tries one more when the speed is still rising, takes it back when it does not help, and halves the number when SharePoint asks it to slow down (between 2 and 16 in total). Each change is shown once, in plain words:
+
+```
+auto: 5 lanes (throughput still rising)
+auto: 4 lanes (the last lane did not help, holding here)
+auto: 2 lanes (SharePoint asked us to slow down)
+auto: 4 lanes (close to SharePoint's request limit, so no more lanes and bigger pieces)
+```
+
+`--parallel N` (1 to 16) switches this off and uses exactly N. There is no `--auto` flag: leaving `--parallel` out is automatic. The summary before the download says which mode is used (`Transfers:    automatic (2 to 16, starting at 4)` or `Transfers:    6 at a time (fixed)`).
+
+### `--json` for scripts
+
+`--json` prints one JSON object per line on standard output instead of the progress display, and never asks for confirmation. Messages and errors still go to standard error, and the exit code is the same as without `--json`. Every object has a `type`. Sizes are bytes, durations are milliseconds (`*_ms`), paths are relative to the destination with `/` separators.
+
+| `type` | Fields | When |
+|--------|--------|------|
+| `planned` | `files`, `bytes`, `skipped`, `skipped_bytes` | The job starts. Skipped files are only counted here, never listed |
+| `file_started` | `rel_path`, `size`, `lane`, `done_ranges` | A file's first request goes out. `done_ranges` lists the ranges (by index) already on disk when a download resumes; empty otherwise |
+| `range_done` | `rel_path`, `index`, `count` | One piece of a large file is on disk (`index` of `count`, counted from 0). Sent once per piece, never for small files; many per large file, and never shown without `--json` |
+| `lanes_changed` | `lanes`, `reason` | The automatic tuning changed the number of simultaneous transfers. `reason` is `probe_up`, `no_gain`, `throttled` or `budget` (with `budget` the count may be unchanged). Not sent for the initial 4, nor with `--parallel N` |
+| `progress` | `bytes_done`, `bytes_total`, `rate_bps` | Overall progress, about four times a second |
+| `lane_progress` | `lane`, `rel_path`, `offset`, `size` | Progress of one transfer |
+| `file_verified` | `rel_path`, `by` | A file is complete and checked (`by`: `hash`, `size_and_etag`, `size_and_mtime`) |
+| `file_skipped` | `rel_path` | A file was skipped while the job ran |
+| `file_failed` | `rel_path`, `error`, `will_retry` | A file failed; `will_retry` says whether another attempt follows |
+| `throttled` | `retry_after_ms` | SharePoint asked to slow down; all transfers wait |
+| `auth_expired` | `host` | The sign-in expired; the job is paused (a script cannot sign in again, so the command ends with exit code `3`) |
+| `disk_full` | `path`, `needed`, `free` | A write failed because the disk is full. `path` is the file being written, `needed` the bytes still to download, `free` the space on the destination's disk. The job is now paused and nothing was deleted |
+| `paused`, `resumed` | | The job paused or continued |
+| `finished` | `downloaded`, `skipped`, `failed`, `bytes`, `elapsed_ms`, `failures` | The job ran to the end |
+| `failed` | `error` | The job could not run |
+| `cancelled` | | The job was stopped |
+
+Examples:
+
+```json
+{"type":"lanes_changed","lanes":7,"reason":"probe_up"}
+{"type":"disk_full","path":"D:/out/big.bin","needed":33500000000,"free":12582912}
+{"type":"range_done","rel_path":"a/big.bin","index":3,"count":40}
+{"type":"file_started","rel_path":"a/big.bin","size":671088640,"lane":1,"done_ranges":[0,1,5]}
+```
+
+With `--json` and a full disk, nothing is printed besides the `disk_full` and `paused` events. The command waits and checks the free space every 15 seconds, using the same rule as above, and then resumes (you see a `resumed` event). There is no Enter-to-retry in this mode. To give up, stop the process: the next run resumes where it stopped.
+
+The disk-space check before the start applies to `--json` too: with too little space the command prints the message to standard error, prints no events, and exits with `1`.
 
 ## Settings explained
 

@@ -269,10 +269,12 @@ ampsync logout <host>
 ampsync sessions
 ampsync ls <url> [--depth N]
 ampsync get <url> <dest> [--include GLOB]... [--exclude GLOB]... [--parallel N]
-                         [--limit RATE] [--redownload] [--prune] [--yes] [--json]
+                         [--limit RATE] [--redownload] [--prune] [--ignore-space] [--yes] [--json]
 ampsync purge [--yes]          # delete all sign-ins, settings and app data; downloads are kept
 ```
-Exit codes: 0 ok, 1 error, 2 usage, 3 auth expired (rerun resumes), 4 some files failed. `--json` emits one `Event` per line for scripting. The CLI's webview sign-in uses `wry`/`tao` directly behind a `webview` cargo feature (on by default) so headless builds can opt out.
+Exit codes: 0 ok, 1 error, 2 usage, 3 auth expired (rerun resumes), 4 some files failed. `--json` emits one `Event` per line for scripting.
+
+`get` v1.1 behaviour (D21, D22): after planning it compares `Plan.bytes_needed + 1 GiB` with `free_space(dest)` and refuses with exit 1 and the shortfall unless `--ignore-space`; `--parallel N` sets `auto_tune = false` (there is no `--auto`; omitting `--parallel` is automatic). On `Event::DiskFull` the job is already paused: the CLI re-checks `free_space` every 15 s (and on Enter at a terminal) and calls `resume()` when the rest fits plus the margin, or at least 1 GiB more is free than when the disk filled up; free space that never grew does not retry by itself. The same loop runs under `--json`, which passes every event through unchanged; `range_done` is only ever printed there. The CLI's webview sign-in uses `wry`/`tao` directly behind a `webview` cargo feature (on by default) so headless builds can opt out.
 
 ## `ampsync-desktop`
 
