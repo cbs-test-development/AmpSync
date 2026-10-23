@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use ampsync_core::autotune::LanesReason;
 use ampsync_core::engine::Event;
 
 const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -98,6 +99,18 @@ pub fn event_json_line(event: &Event) -> String {
     })
 }
 
+/// The progress line for an automatic lane change, in plain words:
+/// `auto: 7 lanes (throughput still rising)`.
+pub fn lanes_line(lanes: u8, reason: LanesReason) -> String {
+    let why = match reason {
+        LanesReason::ProbeUp => "throughput still rising",
+        LanesReason::NoGain => "the last lane did not help, holding here",
+        LanesReason::Throttled => "SharePoint asked us to slow down",
+        LanesReason::Budget => "close to SharePoint's request limit, so no more lanes and bigger pieces",
+    };
+    format!("auto: {lanes} lanes ({why})")
+}
+
 /// `1 file` / `2 files`.
 pub fn count(n: u64, singular: &str, plural: &str) -> String {
     format!("{n} {}", if n == 1 { singular } else { plural })
@@ -186,6 +199,74 @@ mod tests {
         assert_eq!(v["type"], "finished");
         assert_eq!(v["elapsed_ms"], 1200);
         assert_eq!(event_json_line(&Event::Paused), r#"{"type":"paused"}"#);
+    }
+
+    #[test]
+    fn lane_lines_use_plain_words() {
+        assert_eq!(
+            lanes_line(7, LanesReason::ProbeUp),
+            "auto: 7 lanes (throughput still rising)"
+        );
+        assert!(lanes_line(5, LanesReason::NoGain).contains("did not help"));
+        assert!(lanes_line(3, LanesReason::Throttled).contains("slow down"));
+        assert!(lanes_line(6, LanesReason::Budget).contains("request limit"));
+    }
+
+    /// The `--json` shapes of the v1.1 events, as documented in the README.
+    #[test]
+    fn new_events_have_the_documented_json_shapes() {
+        let line = |e: Event| event_json_line(&e);
+        assert_eq!(
+            line(Event::LanesChanged {
+                lanes: 7,
+                reason: LanesReason::ProbeUp
+            }),
+            r#"{"type":"lanes_changed","lanes":7,"reason":"probe_up"}"#
+        );
+        for (reason, name) in [
+            (LanesReason::ProbeUp, "probe_up"),
+            (LanesReason::NoGain, "no_gain"),
+            (LanesReason::Throttled, "throttled"),
+            (LanesReason::Budget, "budget"),
+        ] {
+            let v: serde_json::Value =
+                serde_json::from_str(&line(Event::LanesChanged { lanes: 2, reason })).unwrap();
+            assert_eq!(v["reason"], name);
+        }
+        assert_eq!(
+            line(Event::DiskFull {
+                path: "D:/out/big.bin".into(),
+                needed: 1000,
+                free: 12
+            }),
+            r#"{"type":"disk_full","path":"D:/out/big.bin","needed":1000,"free":12}"#
+        );
+        assert_eq!(
+            line(Event::RangeDone {
+                rel_path: RelPath::new("a/big.bin").unwrap(),
+                index: 3,
+                count: 40
+            }),
+            r#"{"type":"range_done","rel_path":"a/big.bin","index":3,"count":40}"#
+        );
+        assert_eq!(
+            line(Event::FileStarted {
+                rel_path: RelPath::new("a/big.bin").unwrap(),
+                size: 99,
+                lane: 1,
+                done_ranges: vec![0, 1, 5]
+            }),
+            r#"{"type":"file_started","rel_path":"a/big.bin","size":99,"lane":1,"done_ranges":[0,1,5]}"#
+        );
+        assert_eq!(
+            line(Event::FileStarted {
+                rel_path: RelPath::new("small.txt").unwrap(),
+                size: 5,
+                lane: 0,
+                done_ranges: vec![]
+            }),
+            r#"{"type":"file_started","rel_path":"small.txt","size":5,"lane":0,"done_ranges":[]}"#
+        );
     }
 
     #[test]

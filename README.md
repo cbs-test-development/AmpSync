@@ -81,6 +81,8 @@ ampsync get "https://contoso.sharepoint.com/:f:/s/Projects/EaBcDeFgHiJkLmN" ./pr
 ampsync get "<link>" ./projects --include "*.pdf" --exclude "archive/**" --parallel 2 --limit 20M
 ```
 
+Before it starts, `get` lists what will be downloaded, how much disk space that needs and how much is free, and how many transfers run at once. If the destination disk is too small, it stops with exit code `1` and tells you how much to free up (`--ignore-space` starts anyway). If the disk fills up while downloading, it pauses, keeps everything already downloaded and carries on by itself once there is room (press Enter to try right away). The number of simultaneous transfers is chosen automatically; `--parallel N` fixes it at exactly N instead. See the [user guide](docs/user-guide.md#running-from-the-command-line) for details and the `--json` event list.
+
 | Command | What it does |
 |---------|--------------|
 | `ampsync login <url> [--method webview\|edge\|chrome\|paste]` | Sign in and store the session |
@@ -88,9 +90,9 @@ ampsync get "<link>" ./projects --include "*.pdf" --exclude "archive/**" --paral
 | `ampsync sessions` | List stored sessions |
 | `ampsync purge [--yes]` | Delete every saved sign-in, the settings and all AmpSync app data (downloaded files are kept) |
 | `ampsync ls <url> [--depth N]` | List a remote folder |
-| `ampsync get <url> <dest> [options]` | Download. Options: `--include`, `--exclude`, `--parallel`, `--limit`, `--redownload`, `--prune`, `--yes`, `--json` |
+| `ampsync get <url> <dest> [options]` | Download. Options: `--include`, `--exclude`, `--parallel` (a fixed number of transfers; automatic when left out), `--limit`, `--redownload`, `--prune`, `--ignore-space`, `--yes`, `--json` |
 
-Exit codes: `0` success, `1` error, `2` bad usage, `3` sign-in expired (sign in again and rerun to resume), `4` some files failed.
+Exit codes: `0` success, `1` error (this includes not enough disk space, and Ctrl+C), `2` bad usage, `3` sign-in expired (sign in again and rerun to resume), `4` some files failed.
 
 > [!TIP]
 > `--prune` deletes local files that no longer exist on SharePoint. Without it, AmpSync never deletes anything.

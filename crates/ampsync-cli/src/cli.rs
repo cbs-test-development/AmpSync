@@ -89,7 +89,7 @@ pub struct GetArgs {
     /// Skip files matching this glob (repeatable)
     #[arg(long, value_name = "GLOB", action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
-    /// Simultaneous transfers (1-16)
+    /// Simultaneous transfers (1-16); a fixed number turns automatic tuning off
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=16))]
     pub parallel: Option<u8>,
     /// Bandwidth limit in bytes per second; accepts suffixes such as 500K, 20M
@@ -101,6 +101,9 @@ pub struct GetArgs {
     /// Delete local files that no longer exist remotely
     #[arg(long)]
     pub prune: bool,
+    /// Start even if the destination disk looks too small for the download
+    #[arg(long)]
+    pub ignore_space: bool,
     /// Do not ask for confirmation
     #[arg(long, short = 'y')]
     pub yes: bool,
@@ -138,6 +141,7 @@ mod tests {
             "20M",
             "--redownload",
             "--prune",
+            "--ignore-space",
             "--yes",
             "--json",
         ])
@@ -149,7 +153,22 @@ mod tests {
         assert_eq!(g.exclude, ["tmp/**"]);
         assert_eq!(g.parallel, Some(8));
         assert_eq!(g.limit, Some(20 * 1024 * 1024));
-        assert!(g.redownload && g.prune && g.yes && g.json);
+        assert!(g.redownload && g.prune && g.yes && g.json && g.ignore_space);
+    }
+
+    #[test]
+    fn ignore_space_is_off_by_default() {
+        let Command::Get(g) = Cli::try_parse_from(["ampsync", "get", "u", "d"]).unwrap().command else {
+            panic!("not get")
+        };
+        assert!(!g.ignore_space);
+        let Command::Get(g) = Cli::try_parse_from(["ampsync", "get", "u", "d", "--ignore-space"])
+            .unwrap()
+            .command
+        else {
+            panic!("not get")
+        };
+        assert!(g.ignore_space);
     }
 
     #[test]
