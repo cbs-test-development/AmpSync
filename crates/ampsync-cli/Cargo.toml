@@ -30,4 +30,4 @@ tao = { version = "0.37", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = { version = "0.39", optional = true }
-windows-core = { version = "0.62", optional = true }
+windows-core = { version = "0.100", optional = true }
