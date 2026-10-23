@@ -7,6 +7,11 @@ updates:
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # windows-core has to be the exact 0.x line that wry, tao and webview2-com build on,
+      # otherwise its types don't line up with theirs. Bump it by hand together with them.
+      - dependency-name: windows-core
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: npm
     directory: /apps/desktop
