@@ -39,7 +39,6 @@ crates/ampsync-core/     all logic: links, auth, SharePoint client, engine, stat
 crates/ampsync-cli/      the `ampsync` command-line program
 apps/desktop/            Svelte 5 frontend (Vite)
 apps/desktop/src-tauri/  the Tauri 2 desktop crate
-design/prototype.html    the approved visual design for the desktop app
 docs/                    architecture and user guide
 spikes/probe/            throwaway experiments, not part of the build
 ```

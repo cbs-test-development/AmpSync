@@ -16,7 +16,7 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D8 | Throttling: honour `Retry-After` on 429/503 globally (all lanes pause), exponential backoff with jitter otherwise. User-Agent `NONISV|AmpSync|AmpSync/<version>`. | Microsoft guidance. |
 | D9 | Expired session pauses the job (never fails it) and emits `Event::AuthExpired`. | 80 GB jobs outlive sessions. |
 | D10 | Platforms: Windows x64 and Ubuntu x64. No macOS in v1. No code signing, no auto-update, no telemetry. | Agreed scope. |
-| D11 | GUI is Tauri 2 + Svelte 5, following `design/prototype.html` (approved). | |
+| D11 | GUI is Tauri 2 + Svelte 5, with an approved "instrument panel" design (graphite + amber, IBM Plex). | |
 | D13 | First launch shows a skippable walkthrough: a dimmed overlay spotlights one control at a time with a short text box (Back / Next / Skip, step counter). It is replayable from Settings. The "seen" flag lives in `settings.toml`. | Non-developer users. |
 | D15 | The webview sign-in uses a persistent AmpSync-only browser profile (per-user data dir), separate from the user's browsers. On launch the app silently checks every saved session (hidden webview load of the site); if Microsoft needs a password or MFA, the sign-in window opens right then, before any download starts. Mid-job expiry also tries a silent refresh first and shows the window only if interaction is required. On Windows, WebView2 SSO with the OS work account is enabled, so managed machines sign in with no prompt. Password saving is a Settings toggle, off by default. "Sign out" deletes the profile and the stored session. | Personal machines otherwise hit MFA on every sign-in; prompts should come at launch, not halfway through an 80 GB job. |
 | D16 | AmpSync never reads, signs in to, or syncs with the user's existing browser profiles (Edge, Chrome, Teams, …). The webview profile lives only in AmpSync's own data dir. The Edge/Chrome fallback always launches a fresh AmpSync-owned `--user-data-dir` with `--disable-sync` and browser implicit sign-in disabled, and only the SharePoint web session is captured. No code path imports cookies or passwords from a browser profile. | User requirement; browser profiles hold personal and work identities that AmpSync must not touch. |
@@ -36,7 +36,6 @@ apps/
   desktop/                 Svelte 5 frontend (Vite)
   desktop/src-tauri/       `ampsync-desktop` crate (Tauri 2), workspace member
 spikes/probe/              throwaway probe, NOT a workspace member
-design/prototype.html      approved visual spec
 ```
 
 ## `ampsync-core` modules and interfaces
@@ -264,7 +263,7 @@ Exit codes: 0 ok, 1 error, 2 usage, 3 auth expired (rerun resumes), 4 some files
 
 ## `ampsync-desktop`
 
-Tauri 2 commands mirror the engine (`resolve`, `plan`, `enqueue`, `pause`, `resume`, `cancel`, `sign_in`, `sign_out`, `sessions`, `get_settings`, `set_settings`, `contributors`). Engine events are forwarded to the frontend as Tauri events. A queue runs jobs one at a time. The frontend reproduces `design/prototype.html`: views Transfers, New download, Sign-ins, Settings, About, plus the first-run walkthrough (steps defined as data: target selector, view to show, title, body), skippable at any step and replayable from Settings.
+Tauri 2 commands mirror the engine (`resolve`, `plan`, `enqueue`, `pause`, `resume`, `cancel`, `sign_in`, `sign_out`, `sessions`, `get_settings`, `set_settings`, `contributors`). Engine events are forwarded to the frontend as Tauri events. A queue runs jobs one at a time. The frontend has the views Transfers, New download, Sign-ins, Settings, About, plus the first-run walkthrough (steps defined as data: target selector, view to show, title, body), skippable at any step and replayable from Settings.
 
 ## Testing
 

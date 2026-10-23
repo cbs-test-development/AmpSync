@@ -27,3 +27,7 @@ desktop.ini
 # Environment files
 .env
 .env.*
+
+# Local design mockups and planning notes (kept out of the repo)
+/design/
+/docs/plans/
