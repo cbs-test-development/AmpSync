@@ -3,6 +3,7 @@
   import { app } from "./core/store.svelte";
   import { api } from "./core/api";
   import type { ViewId } from "./core/types";
+  import { READY_EVENT } from "./core/splash";
   import Transfers from "./views/Transfers.svelte";
   import NewDownload from "./views/NewDownload.svelte";
   import SignIns from "./views/SignIns.svelte";
@@ -21,7 +22,11 @@
   };
 
   onMount(() => {
-    app.init().catch((e) => console.error("start-up failed", e));
+    app
+      .init()
+      .catch((e) => console.error("start-up failed", e))
+      // The startup splash leaves once the app has its state (or has given up trying).
+      .finally(() => window.dispatchEvent(new Event(READY_EVENT)));
   });
 
   const pending = $derived(app.queue.filter((q) => ["queued", "preparing", "running", "paused", "needs_sign_in"].includes(q.status)).length);
