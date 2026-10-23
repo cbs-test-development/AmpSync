@@ -3,6 +3,7 @@
 
 mod commands;
 mod contributors;
+mod diskspace;
 mod error;
 mod links;
 mod paths;
@@ -103,6 +104,7 @@ pub fn run() {
             commands::resolve,
             commands::plan,
             commands::parse_link,
+            diskspace::disk_space,
             commands::enqueue,
             commands::get_queue,
             commands::pause,
