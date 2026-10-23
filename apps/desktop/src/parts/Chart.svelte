@@ -104,8 +104,10 @@
   });
 </script>
 
-<canvas bind:this={canvas} aria-label="Download speed over the last two minutes"></canvas>
+<!-- The wrapper sets the size; the canvas is absolutely placed so its pixel size never feeds back into layout. -->
+<div class="wrap"><canvas bind:this={canvas} aria-label="Download speed over the last two minutes"></canvas></div>
 
 <style>
-  canvas { display: block; width: 100%; height: clamp(96px, 17vh, 170px); }
+  .wrap { position: relative; flex: 1 1 0; min-height: 150px; }
+  canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
 </style>

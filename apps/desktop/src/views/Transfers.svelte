@@ -170,22 +170,22 @@
   <div class="bar ticks" role="progressbar" aria-label="Overall progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(pct)}><i style:width="{pct.toFixed(2)}%"></i></div>
 
   <div class="grid-2">
-    <div class="panel">
+    <div class="panel col chart-panel">
       <div class="panel-h"><span class="label">Speed · last 2 min</span><span class="meta">peak {num(peak / MB, 1)} MB/s</span></div>
       {#if live}<Chart hist={live.hist} />{/if}
     </div>
-    <div class="panel col lanes-panel">
+    <div class="panel col">
       <div class="panel-h"><span class="label">Parallel lanes</span><span class="meta">{lanesNow.length} at a time</span></div>
-      <div class="lanes body">
+      <!-- Every lane is always visible: one compact line each, two columns above 8 lanes. -->
+      <div class="lanes" class:two={lanesNow.length > 8}>
         {#each lanesNow as lane, i}
           {@const waiting = laneStatus !== ""}
           <div class="lane" class:waiting>
             <span class="id">L{i + 1}</span>
             <div class="lane-body">
-              <div class="file" title={lane.rel_path ?? ""}>{lane.rel_path ?? "idle"}</div>
-              <div class="rng">
-                <span>{waiting ? laneStatus : lane.rel_path ? `at ${num(lane.offset / MB, 0)} MB` : ""}</span>
-                <span>{lane.rel_path ? size(lane.size) : ""}</span>
+              <div class="line">
+                <span class="file" title={lane.rel_path ?? ""}>{lane.rel_path ?? "idle"}</span>
+                <span class="rng">{waiting ? laneStatus : lane.rel_path ? `${num(lane.offset / MB, 0)} MB / ${size(lane.size)}` : ""}</span>
               </div>
               <div class="bar"><i style:width="{lane.rel_path && lane.size > 0 ? ((lane.offset / lane.size) * 100).toFixed(1) : 0}%"></i></div>
             </div>
@@ -293,17 +293,19 @@
   .v small { font-size: 13px; color: var(--muted); }
   .sub { font: 12px var(--f-mono); color: var(--muted); }
 
+  /* The speed chart (flex: 1 inside .panel.col) stretches to the lanes panel's height: grid items stretch. */
   .lanes { display: grid; align-content: start; }
-  /* The lanes panel takes the chart's height and scrolls when there are more lanes than fit. */
-  .lanes-panel { contain: size; }
+  .lanes.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lanes.two .lane:nth-child(odd) { border-right: 1px solid var(--line); }
   .fill-row { grid-template-rows: minmax(0, 1fr); }
-  .lane { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--line); }
-  .lane:last-child { border-bottom: 0; }
+  .lane { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 8px; align-items: center; padding: 6px 14px; border-bottom: 1px solid var(--line); min-width: 0; }
+  .lanes:not(.two) .lane:last-child { border-bottom: 0; }
   .lane .id { font: 500 11px var(--f-mono); color: var(--signal); }
   .lane-body { min-width: 0; }
-  .lane .file { font: 12px var(--f-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .lane .rng { font: 11px var(--f-mono); color: var(--muted); display: flex; justify-content: space-between; gap: 8px; margin-top: 2px; min-height: 16px; }
-  .lane .bar { height: 4px; margin-top: 5px; }
+  .lane .line { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+  .lane .file { flex: 1 1 auto; min-width: 0; font: 12px var(--f-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .lane .rng { flex: none; font: 11px var(--f-mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+  .lane .bar { height: 3px; margin-top: 4px; }
   .lane.waiting .id { color: var(--info); }
   .lane.waiting .bar > i { background: var(--info); }
 
@@ -328,7 +330,6 @@
     .job-head h2 { font-size: 19px; margin: 0 0 2px; }
   }
   @media (max-width: 800px) {
-    .lanes-panel { contain: none; max-height: 260px; }
     .fill-row { grid-template-rows: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 760px) {
