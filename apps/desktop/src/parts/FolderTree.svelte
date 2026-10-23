@@ -1,15 +1,25 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { num, size } from "../core/format";
-  import { type CheckState, type TreeModel, visibleRows } from "../core/selection";
+  import type { FilterResult } from "../core/filter";
+  import { type CheckState, filteredRows, selectedAmong, type TreeModel, visibleRows } from "../core/selection";
 
   /**
    * The folder picker: a collapsible tree with tri-state checkboxes. Only the rows in view are
    * rendered (fixed row height, absolute positioning), so a folder with 100k files is as light
    * as one with ten. Keyboard: Up/Down move, Right/Left expand/collapse (or step into/out of a
    * folder), Space ticks, Home/End jump.
+   *
+   * With a `filter` result the tree shows only the matching files and the folders leading to
+   * them, every folder open. Ticking a folder then acts on its matching files only, so what is
+   * listed is what changes. `version` is bumped by the parent after it changed the selection.
    */
-  let { model, onchange }: { model: TreeModel; onchange: () => void } = $props();
+  let {
+    model,
+    onchange,
+    filter = null,
+    version = 0,
+  }: { model: TreeModel; onchange: () => void; filter?: FilterResult | null; version?: number } = $props();
 
   const ROW = 28;
   const MAX_HEIGHT = 460;
@@ -17,6 +27,8 @@
 
   /** Every folder starts collapsed: only the top-level entries show until the user opens one. */
   const expanded = untrack(() => new Uint8Array(model.n));
+  /** Folders the user closed while a filter is on (the filtered tree starts fully open). */
+  const closed = untrack(() => new Uint8Array(model.n));
   let rev = $state(0);
   let scrollTop = $state(0);
   let viewport = $state(MAX_HEIGHT);
@@ -25,8 +37,32 @@
 
   const rows = $derived.by(() => {
     void rev;
-    return visibleRows(model, expanded);
+    void version;
+    return filter ? filteredRows(model, filter.visible, closed) : visibleRows(model, expanded);
   });
+
+  /** While filtering: selected matching files below each node. */
+  const picked = $derived.by(() => {
+    void rev;
+    void version;
+    return filter ? selectedAmong(model, filter.match) : null;
+  });
+
+  // A new filter result can drop the focused row; move to the nearest one that is left.
+  $effect(() => {
+    const r = rows;
+    untrack(() => {
+      if (r.length > 0) focused = r[rowOf(focused)];
+    });
+  });
+
+  const isOpen = (i: number) => (filter ? closed[i] === 0 : expanded[i] === 1);
+
+  function stateOf(i: number): CheckState {
+    if (!filter || !picked || model.isDir[i] === 0) return model.state(i);
+    const s = picked[i];
+    return s === 0 ? 0 : s === filter.files[i] ? 1 : 2;
+  }
 
   /** Row number of a node in `rows`, or the nearest row above it (rows are ascending). */
   function rowOf(node: number): number {
@@ -56,12 +92,13 @@
 
   const view = $derived.by((): Row[] => {
     void rev;
+    void version;
     const first = Math.max(0, Math.floor(scrollTop / ROW) - OVERSCAN);
     const last = Math.min(rows.length, Math.ceil((scrollTop + viewport) / ROW) + OVERSCAN);
     const out: Row[] = [];
     for (let k = first; k < last; k++) {
       const i = rows[k];
-      const st = model.state(i);
+      const st = stateOf(i);
       const dir = model.isDir[i] === 1;
       const partial = st === 2;
       out.push({
@@ -72,13 +109,17 @@
         depth: model.depth[i],
         st,
         kids: model.hasChildren(i),
-        open: expanded[i] === 1,
+        open: isOpen(i),
         count: !dir
           ? "file"
-          : partial
-            ? `${num(model.selFiles[i])} of ${num(model.files[i])} files`
-            : `${num(model.files[i])} ${model.files[i] === 1 ? "file" : "files"}`,
-        size: size(partial ? model.selBytes[i] : model.bytes[i]),
+          : filter
+            ? partial
+              ? `${num(picked?.[i] ?? 0)} of ${num(filter.files[i])} matching`
+              : `${num(filter.files[i])} matching`
+            : partial
+              ? `${num(model.selFiles[i])} of ${num(model.files[i])} files`
+              : `${num(model.files[i])} ${model.files[i] === 1 ? "file" : "files"}`,
+        size: size(filter ? filter.bytes[i] : partial ? model.selBytes[i] : model.bytes[i]),
         isFocus: i === focused,
       });
     }
@@ -91,14 +132,16 @@
 
   function setOpen(i: number, open: boolean) {
     if (!model.hasChildren(i)) return;
-    expanded[i] = open ? 1 : 0;
+    if (filter) closed[i] = open ? 0 : 1;
+    else expanded[i] = open ? 1 : 0;
     // Collapsing hides descendants; keep the focus on a row that still exists.
     if (!open && focused > i && focused < model.end[i]) focused = i;
     bump();
   }
 
   function tick(i: number) {
-    model.toggle(i);
+    if (filter) model.setMatching(i, model.end[i], stateOf(i) !== 1, filter.match);
+    else model.toggle(i);
     bump();
     onchange();
   }
@@ -141,12 +184,12 @@
         break;
       case "ArrowRight":
         if (model.hasChildren(node)) {
-          if (!expanded[node]) setOpen(node, true);
+          if (!isOpen(node)) setOpen(node, true);
           else focusRow(k + 1);
         }
         break;
       case "ArrowLeft":
-        if (model.hasChildren(node) && expanded[node]) setOpen(node, false);
+        if (model.hasChildren(node) && isOpen(node)) setOpen(node, false);
         else if (model.parent[node] >= 0) {
           focused = model.parent[node];
           reveal(focused);

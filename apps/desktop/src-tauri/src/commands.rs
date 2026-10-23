@@ -102,12 +102,15 @@ pub struct PlanTree {
     pub dirs: Vec<u8>,
     /// File sizes in bytes; 0 for folders.
     pub sizes: Vec<u64>,
+    /// Last-modified time of each file in unix seconds; 0 for folders.
+    pub modified: Vec<i64>,
 }
 
 struct BNode {
     name: String,
     is_dir: bool,
     size: u64,
+    modified: i64,
     children: Vec<usize>,
 }
 
@@ -120,12 +123,13 @@ struct TreeBuilder {
 }
 
 impl TreeBuilder {
-    fn push(&mut self, parent: Option<usize>, name: &str, is_dir: bool, size: u64) -> usize {
+    fn push(&mut self, parent: Option<usize>, name: &str, is_dir: bool, size: u64, modified: i64) -> usize {
         let idx = self.nodes.len();
         self.nodes.push(BNode {
             name: name.to_string(),
             is_dir,
             size,
+            modified,
             children: Vec::new(),
         });
         match parent {
@@ -143,7 +147,7 @@ impl TreeBuilder {
             let idx = match self.dirs.get(&key) {
                 Some(i) => *i,
                 None => {
-                    let i = self.push(parent, c, true, 0);
+                    let i = self.push(parent, c, true, 0, 0);
                     self.dirs.insert(key, i);
                     i
                 }
@@ -157,12 +161,12 @@ impl TreeBuilder {
         self.ensure_dirs(comps);
     }
 
-    fn add_file(&mut self, comps: &[&str], size: u64) {
+    fn add_file(&mut self, comps: &[&str], size: u64, modified: i64) {
         let Some((name, dirs)) = comps.split_last() else {
             return;
         };
         let parent = self.ensure_dirs(dirs);
-        self.push(parent, name, false, size);
+        self.push(parent, name, false, size, modified);
     }
 
     fn finish(mut self, listed_ms: u64) -> PlanTree {
@@ -186,6 +190,7 @@ impl TreeBuilder {
             out.parents.push(parent_new);
             out.dirs.push(u8::from(n.is_dir));
             out.sizes.push(n.size);
+            out.modified.push(n.modified);
             if !n.is_dir {
                 out.total_files += 1;
                 out.total_bytes += n.size;
@@ -225,7 +230,7 @@ async fn list_tree(app: &AppHandle, remote: &ClassicRemote, root: &RemoteRoot) -
                 let comps: Vec<&str> = f.rel_path.components().collect();
                 total_files += 1;
                 total_bytes += f.size;
-                builder.add_file(&comps, f.size);
+                builder.add_file(&comps, f.size, f.modified.unix_timestamp());
             }
             RemoteEntry::Folder { rel_path } => {
                 let comps: Vec<&str> = rel_path.components().collect();
@@ -242,6 +247,12 @@ async fn list_tree(app: &AppHandle, remote: &ClassicRemote, root: &RemoteRoot) -
     }
     drop(stream);
     Ok(builder.finish(u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX)))
+}
+
+/// Classify pasted, dropped or clipboard text (see `links`), so the frontend never guesses.
+#[tauri::command(rename_all = "snake_case")]
+pub fn parse_link(text: String) -> CmdResult<crate::links::ParsedLinkInfo> {
+    crate::links::parse_text(&text).map_err(|m| CmdError::new("invalid_link", m))
 }
 
 // ---------------------------------------------------------------- queue
@@ -584,4 +595,25 @@ pub fn purge_everything(app: AppHandle, state: State<'_, AppState>) -> CmdResult
     state.queue.pause_for_exit(&app, false);
     app.exit(0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_tree_carries_modified_times_in_display_order() {
+        let mut b = TreeBuilder::default();
+        b.add_file(&["zeta.txt"], 5, 1_700_000_000);
+        b.add_file(&["Docs", "b.pdf"], 7, 1_714_558_830);
+        b.add_file(&["Docs", "a.pdf"], 9, 1_600_000_000);
+        b.add_dir(&["Empty"]);
+        let t = b.finish(3);
+        assert_eq!(t.names, ["Docs", "a.pdf", "b.pdf", "Empty", "zeta.txt"]);
+        assert_eq!(t.dirs, [1, 0, 0, 1, 0]);
+        assert_eq!(t.sizes, [0, 9, 7, 0, 5]);
+        // Folders carry 0, files their own time.
+        assert_eq!(t.modified, [0, 1_600_000_000, 1_714_558_830, 0, 1_700_000_000]);
+        assert_eq!((t.total_files, t.total_bytes), (3, 21));
+    }
 }

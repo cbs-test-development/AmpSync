@@ -4,6 +4,7 @@
 mod commands;
 mod contributors;
 mod error;
+mod links;
 mod paths;
 mod purge;
 mod queue;
@@ -94,12 +95,14 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main(app);
         }))
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::new(settings))
         .invoke_handler(tauri::generate_handler![
             commands::resolve,
             commands::plan,
+            commands::parse_link,
             commands::enqueue,
             commands::get_queue,
             commands::pause,

@@ -5,6 +5,7 @@ import type {
   CmdError,
   ContributorList,
   EnqueueReq,
+  ParsedLinkInfo,
   PlanTree,
   QueueItem,
   Resolved,
@@ -22,6 +23,7 @@ export function toCmdError(e: unknown): CmdError {
 export const api = {
   resolve: (link: string) => invoke<Resolved>("resolve", { link }),
   plan: (link: string) => invoke<PlanTree>("plan", { link }),
+  parseLink: (text: string) => invoke<ParsedLinkInfo>("parse_link", { text }),
   enqueue: (req: EnqueueReq) => invoke<number>("enqueue", { req }),
   getQueue: () => invoke<QueueItem[]>("get_queue"),
   pause: (job_id: number) => invoke<void>("pause", { job_id }),

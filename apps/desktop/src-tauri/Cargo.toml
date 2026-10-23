@@ -24,6 +24,7 @@ base64 = { workspace = true }
 [dependencies]
 ampsync-core = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"

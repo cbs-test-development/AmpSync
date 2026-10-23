@@ -13,14 +13,22 @@ const TRAY_ID: &str = "main";
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show AmpSync", true, None::<&str>)?;
+    let clip = MenuItem::with_id(
+        app,
+        "clipboard",
+        "Download link from clipboard",
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit (pause downloads)", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &clip, &quit])?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("AmpSync")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main(app),
+            "clipboard" => link_from_clipboard(app),
             "quit" => quit_now(app, true),
             _ => {}
         })
@@ -47,6 +55,20 @@ pub fn show_main(app: &AppHandle) {
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+}
+
+/// The tray's "Download link from clipboard": the one place the app reads the clipboard itself,
+/// and only because the user chose that menu item. The frontend parses the text and says so
+/// inline when it is not a SharePoint folder link.
+fn link_from_clipboard(app: &AppHandle) {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    // Anything that is not text (an image, an empty clipboard) reads as no text.
+    let text = app.clipboard().read_text().unwrap_or_default();
+    show_main(app);
+    let _ = app.emit(
+        "incoming-link",
+        serde_json::json!({ "text": text, "source": "tray" }),
+    );
 }
 
 pub fn update_tooltip(app: &AppHandle, fraction: Option<f64>) {
