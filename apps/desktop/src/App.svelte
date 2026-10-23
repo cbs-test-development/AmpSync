@@ -24,7 +24,7 @@
     app.init().catch((e) => console.error("start-up failed", e));
   });
 
-  const pending = $derived(app.queue.filter((q) => ["queued", "preparing", "running", "paused", "needs_sign_in"].includes(q.status)).length);
+  const pending = $derived(app.queue.filter((q) => ["queued", "preparing", "running", "paused", "needs_sign_in", "needs_space"].includes(q.status)).length);
 
   const chip = $derived.by(() => {
     const s = app.sessions;
