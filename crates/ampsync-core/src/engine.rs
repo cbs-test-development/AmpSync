@@ -684,7 +684,10 @@ async fn run_job_inner(
             tracing::error!("a transfer lane stopped unexpectedly: {e}");
         }
     }
+    // `abort` only takes effect at the ticker's next await, so wait for it to actually stop:
+    // otherwise a tick already in progress can emit Progress after `Finished`.
     ticker.abort();
+    let _ = ticker.await;
 
     if ctl.is_cancelled() {
         return Err(Error::Cancelled);

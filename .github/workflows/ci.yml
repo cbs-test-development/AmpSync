@@ -24,7 +24,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-24.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
