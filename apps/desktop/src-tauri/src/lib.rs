@@ -14,6 +14,8 @@ mod queue;
 mod signin;
 mod splash;
 mod startup;
+#[cfg(windows)]
+mod toast;
 mod tray;
 mod update;
 

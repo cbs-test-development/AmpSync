@@ -206,6 +206,9 @@ pub fn render_purge_report(r: &PurgeReport) -> Vec<String> {
         lines.push("Removed folders:".to_string());
         lines.extend(r.removed.iter().map(|p| format!("  {}", p.display())));
     }
+    if r.registry_entries > 0 {
+        lines.push("Removed the notification registration of the desktop app.".to_string());
+    }
     if !r.errors.is_empty() {
         lines.push("Some things could not be removed (close AmpSync and try again):".to_string());
         lines.extend(r.errors.iter().map(|e| format!("  {e}")));
@@ -364,6 +367,7 @@ mod tests {
         let report = PurgeReport {
             removed: vec!["/data/AmpSync".into()],
             keychain_entries: 3,
+            registry_entries: 1,
             errors: vec!["/x: busy".into()],
         };
         let text = render_purge_report(&report).join(
@@ -373,6 +377,7 @@ mod tests {
         assert!(text.contains("Removed 3 saved sign-in entries."));
         assert!(text.contains("AmpSync"));
         assert!(text.contains("/x: busy"));
+        assert!(text.contains("notification registration"));
         let empty = render_purge_report(&PurgeReport::default()).join(
             "
 ",

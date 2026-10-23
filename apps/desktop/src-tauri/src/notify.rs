@@ -113,20 +113,48 @@ pub fn send(app: &AppHandle, trigger: &Trigger) {
     let Some(msg) = decide(app_focused(app), opt_in, trigger) else {
         return;
     };
-    let shown = app
-        .notification()
-        .builder()
-        .title(msg.title)
-        .body(msg.body)
-        .extra("kind", msg.kind.as_str())
-        .show();
-    if let Err(e) = shown {
-        tracing::warn!("could not show a notification: {e}");
+    // Windows: shown directly so the toast is labelled AmpSync in every build (see `toast`).
+    #[cfg(windows)]
+    {
+        let name = app
+            .config()
+            .product_name
+            .clone()
+            .unwrap_or_else(|| "AmpSync".into());
+        if let Err(e) = crate::toast::register(&name, &crate::paths::data_dir()) {
+            tracing::warn!("could not register AmpSync for notifications: {e}");
+        }
+        let (handle, kind) = (app.clone(), msg.kind);
+        if let Err(e) = crate::toast::show(&msg.title, &msg.body, move || clicked(&handle, kind.as_str())) {
+            tracing::warn!("could not show a notification: {e}");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let shown = app
+            .notification()
+            .builder()
+            .title(msg.title)
+            .body(msg.body)
+            .extra("kind", msg.kind.as_str())
+            .show();
+        if let Err(e) = shown {
+            tracing::warn!("could not show a notification: {e}");
+        }
     }
 }
 
-/// A click on a notification brings AmpSync forward: the Transfers view, or the sign-in window
-/// when that is what the notification was about. Registered once at startup.
+/// Bring AmpSync forward after a click: the Transfers view, or the sign-in window when that is
+/// what the notification was about.
+fn clicked(handle: &AppHandle, kind: &str) {
+    crate::tray::show_main(handle);
+    if kind == Kind::SignIn.as_str() {
+        handle.state::<AppState>().signin.focus(handle);
+    }
+    let _ = handle.emit("notification-click", serde_json::json!({ "kind": kind }));
+}
+
+/// Clicks on notifications shown through the plugin (Linux). Registered once at startup.
 pub fn setup(app: &AppHandle) {
     let handle = app.clone();
     let registered = app.notification().on_action(move |action| {
@@ -136,11 +164,7 @@ pub fn setup(app: &AppHandle) {
             .and_then(|v| v.as_str())
             .unwrap_or("job")
             .to_string();
-        crate::tray::show_main(&handle);
-        if kind == Kind::SignIn.as_str() {
-            handle.state::<AppState>().signin.focus(&handle);
-        }
-        let _ = handle.emit("notification-click", serde_json::json!({ "kind": kind }));
+        clicked(&handle, &kind);
     });
     if let Err(e) = registered {
         tracing::warn!("notification clicks will not focus the window: {e}");

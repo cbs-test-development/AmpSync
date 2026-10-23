@@ -92,6 +92,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "url",
+ "winreg",
 ]
 
 [[package]]
@@ -113,6 +114,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "tauri-winrt-notification",
  "time",
  "tiny-skia",
  "tokio",
@@ -120,6 +122,7 @@ dependencies = [
  "url",
  "webview2-com",
  "windows-core",
+ "winreg",
 ]
 
 [[package]]

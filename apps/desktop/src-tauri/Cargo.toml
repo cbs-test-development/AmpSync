@@ -44,3 +44,5 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std", "si
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
 windows-core = "0.62"
+winreg = "0.56"
+tauri-winrt-notification = "0.8"
