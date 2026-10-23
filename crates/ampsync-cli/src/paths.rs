@@ -41,7 +41,8 @@ mod tests {
     fn profile_dir_is_ampsync_owned() {
         if let Some(p) = webview_profile_dir() {
             assert!(p.ends_with("signin-profile"));
-            assert!(p.to_string_lossy().contains("AmpSync"));
+            // Windows keeps the app name's case ("AmpSync"); Linux lowercases it ("ampsync").
+            assert!(p.to_string_lossy().to_lowercase().contains("ampsync"));
         }
     }
 }
