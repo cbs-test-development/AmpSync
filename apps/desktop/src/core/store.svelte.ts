@@ -3,6 +3,7 @@ import type {
   AppInfo,
   ContributorList,
   EngineEvent,
+  IncomingLink,
   JobEventPayload,
   QueueItem,
   SessionInfo,
@@ -93,8 +94,14 @@ class Store {
   /** Host of the sign-in window that is open right now, if any. */
   signInOpen = $state<string | null>(null);
   ready = $state(false);
+  /** A SharePoint link that arrived by paste, drop or the tray; New download opens it. */
+  incoming = $state<{ link: string; n: number } | null>(null);
+  /** Short inline message under the top bar, e.g. for a paste that is not a SharePoint folder link. */
+  notice = $state<string | null>(null);
 
   private toastTimer: ReturnType<typeof setTimeout> | undefined;
+  private noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  private incomingSeq = 0;
   private rowIndex = new Map<number, Map<string, FileRow>>();
 
   /** The job shown in the Transfers view: the running one, else the first waiting one. */
@@ -128,6 +135,29 @@ class Store {
     this.toastText = text;
     clearTimeout(this.toastTimer);
     this.toastTimer = setTimeout(() => (this.toastText = null), ms);
+  }
+
+  setNotice(text: string | null, ms = 8000) {
+    this.notice = text;
+    clearTimeout(this.noticeTimer);
+    if (text) this.noticeTimer = setTimeout(() => (this.notice = null), ms);
+  }
+
+  /**
+   * Text from a paste, a drop or the tray's "Download link from clipboard". A SharePoint folder
+   * link opens New download and starts listing; anything else gets a short inline notice. The
+   * tour and the close question keep the keyboard to themselves.
+   */
+  async receiveLink(text: string) {
+    if (!this.ready || this.tourOpen || this.closePrompt) return;
+    try {
+      const info = await api.parseLink(text);
+      this.setNotice(null);
+      this.incoming = { link: info.link, n: ++this.incomingSeq };
+      this.go("new");
+    } catch (e) {
+      this.setNotice(toCmdError(e).message);
+    }
   }
 
   setTheme(t: Theme) {
@@ -309,6 +339,7 @@ class Store {
       this.closePrompt = true;
     });
     await on<UpdateInfo | null>("update-available", (u) => (this.update = u));
+    await on<IncomingLink>("incoming-link", (p) => void this.receiveLink(p.text));
 
     const [settings, queue, info, contributors, update] = await Promise.all([
       api.getSettings(),
