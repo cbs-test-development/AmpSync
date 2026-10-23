@@ -4,6 +4,7 @@ import type {
   AppInfo,
   CmdError,
   ContributorList,
+  DiskSpace,
   EnqueueReq,
   ParsedLinkInfo,
   PlanTree,
@@ -23,6 +24,7 @@ export function toCmdError(e: unknown): CmdError {
 export const api = {
   resolve: (link: string) => invoke<Resolved>("resolve", { link }),
   plan: (link: string) => invoke<PlanTree>("plan", { link }),
+  diskSpace: (dest: string) => invoke<DiskSpace>("disk_space", { dest }),
   parseLink: (text: string) => invoke<ParsedLinkInfo>("parse_link", { text }),
   enqueue: (req: EnqueueReq) => invoke<number>("enqueue", { req }),
   getQueue: () => invoke<QueueItem[]>("get_queue"),

@@ -6,9 +6,12 @@ This guide walks through a download from start to finish and explains what AmpSy
 
 - [What AmpSync does](#what-ampsync-does)
 - [Your first download](#your-first-download)
+- [Checking the disk first](#checking-the-disk-first)
 - [Signing in](#signing-in)
 - [When your sign-in expires](#when-your-sign-in-expires)
-- [Parallel downloads: Auto](#parallel-downloads-auto)
+- [When the disk is full](#when-the-disk-is-full)
+- [Parallel lanes: Auto](#parallel-lanes-auto)
+- [Big files and the fill map](#big-files-and-the-fill-map)
 - [Progress on the taskbar and in the tray](#progress-on-the-taskbar-and-in-the-tray)
 - [Notifications](#notifications)
 - [Startup animation](#startup-animation)
@@ -33,6 +36,16 @@ AmpSync copies a SharePoint or OneDrive folder to your disk. It is download-only
 6. Start. The **Transfers** view shows progress, speed, time left, the files in flight and the queue. Add more links and they run one after another.
 
 Pausing, closing the window and restarting the computer are all safe.
+
+## Checking the disk first
+
+Under the folder tree, a line next to the selected total shows what the selection needs and what the destination has free, for example **Needs 31.2 GB · 112 GB free on D:**. The figure on the left is the size of what is ticked. It does not know which files are already on your disk (AmpSync only finds that out when the download starts), so with *Skip if unchanged* the real need can be lower.
+
+AmpSync wants a gigabyte of room to spare on top of that for its own temporary files. If the selection does not fit, the line turns red, **Add to queue** is disabled, and the message under it says how much to free up:
+
+> Not enough space on D:. Free up 6.3 GB or choose another folder.
+
+It looks again whenever you change the **Save to** folder, when you come back to the window, and just before the download is added, so freeing space or picking another drive takes effect straight away. On Ubuntu the drive is named by its mount point (`/home`, for example). Nothing here uses the network; it only asks your computer how much space is free.
 
 ## Signing in
 
@@ -73,11 +86,38 @@ SharePoint sessions end after a while, and very large downloads can outlast one.
 
 If you are away, it stays paused until you return. With the command line, the exit code is `3`; sign in again with `ampsync login` and run the same `ampsync get` command to continue.
 
-## Parallel downloads: Auto
+## When the disk is full
 
-**Files at the same time** is set to **Auto** by default. AmpSync starts with four downloads at once and checks your speed every ten seconds: if one more download made the transfer faster it keeps it, otherwise it takes it back and holds that number for a minute. It never runs fewer than two or more than sixteen. When SharePoint asks it to slow down, it halves the number and waits as long as SharePoint asks before building up again. All of this happens in the middle of a job without losing or repeating any work, and the Transfers view always shows how many downloads are running.
+Free space can run out during a long download, because other programs write to the same drive. When a write fails because the disk is full:
+
+1. The download **pauses**. It does not fail, and nothing already saved is touched or deleted.
+2. The Transfers view shows a banner such as **D: is full: 6.3 GB more needed**, the download is labelled *Paused: disk full*, and its queue entry says *needs space*. This is different from a pause you asked for and from a sign-in pause.
+3. Free up space (or move the destination's contents elsewhere), then press **Retry**. The banner shows how much is free right now, and says when there is room again. Retry carries on from where the download stopped. If the disk is still full, the download pauses again with a fresh message.
+
+If you quit AmpSync while it is waiting for space, the download goes back in the queue and starts again the next time you open the app. If the disk is still full, it pauses again with the same banner.
+
+## Parallel lanes: Auto
+
+A lane is one transfer running at the same time as the others. By default AmpSync is on **Auto**: it starts with 4 lanes and, every 10 seconds of active transfer, tries one more. If that did not make the download at least 5% faster it takes the lane back and waits a minute before trying again. When SharePoint asks it to slow down it halves the lanes and waits before adding any. It stays under about 80% of SharePoint's request limit for one user, using larger pieces for new files when it gets close. It never uses fewer than 2 lanes or more than 16.
+
+The **Parallel lanes** panel in Transfers is headed **Auto · 7 lanes** (or just **7 lanes** if you set a fixed number). Every lane is listed, in two columns once there are more than 8, so you can see what each is doing. A lane that is being taken away finishes its file first and is marked *closing*.
+
+On the speed chart, a dotted line marks each moment the number of lanes changed, with the new count next to it. Hover over it (or look at the list below the chart if you use a screen reader) to read why in plain words, for example *Speed was still rising, so AmpSync tried one more*, or *SharePoint asked AmpSync to slow down, so it halved the lanes*.
 
 Pick a number from 1 to 16 in **Settings** if you want a fixed count instead (for example, to leave bandwidth for a video call). Choose **Auto** again to hand control back. Either way the change applies to the next download that starts.
+
+## Big files and the fill map
+
+Files over 64 MB are fetched in pieces (ranges), several at a time. For those, the lane shows a **fill map** under the file name: a strip with one cell for each piece, squeezed into at most 120 cells for very big files.
+
+- Dark: not fetched yet.
+- Dim amber: being fetched right now.
+- Solid amber: saved. A cell that stands for several pieces fills from the bottom as they arrive.
+- Outlined: a piece that failed and is being fetched again.
+
+Hover over a cell to read it, for example *range 412 of 5,021 · 16 MiB*. For a cell that stands for several pieces it gives the span and how many are saved. When a download resumes, the map starts filled where it left off.
+
+To look closer, click a file in the **Files** list (files with a map have a small striped mark). The **Selected file** panel replaces the queue and shows a larger map, a count of saved pieces and a key. Click **Close** to get the queue back. Only the most recent 500 files keep a map. If your system is set to reduce motion, pieces simply appear as saved, without the brief flash.
 
 ## Progress on the taskbar and in the tray
 
@@ -117,7 +157,7 @@ Settings save automatically.
 | Setting | What it does |
 |---------|--------------|
 | Default folder | Pre-fills **Save to** in New download. |
-| Files at the same time | **Auto** (default) lets AmpSync tune how many transfers run in parallel; a number from 1 to 16 fixes it. See [Parallel downloads: Auto](#parallel-downloads-auto). |
+| Files at the same time | **Auto** (default) lets AmpSync choose the number of lanes, or fix it at 1 to 16. See [Parallel lanes: Auto](#parallel-lanes-auto). More is not always faster; if SharePoint slows you down, try fewer. |
 | Speed limit | Caps total download speed, so a big job does not use the whole connection. Empty means unlimited. |
 | When the window closes | **Ask**, **Keep going in tray** (transfers continue in the system tray), or **Pause** (pauses and quits). |
 | Check for new versions | Looks at GitHub Releases once a day. Nothing else is sent, and AmpSync never installs an update by itself. |
@@ -268,6 +308,7 @@ If you used the command line, also run `ampsync sessions` and `ampsync logout <h
 
 - **"Sign-in expired" keeps appearing.** Sign in again from the Sign-ins view. If your organisation shortens session lifetimes, a long job will pause more than once; it resumes each time.
 - **The sign-in window is blank or blocked.** Choose the Edge or Chrome method instead.
-- **Downloads are slow or pause for a while.** SharePoint asks apps to slow down when it is busy, and AmpSync obeys. Try fewer files at the same time.
+- **Downloads are slow or pause for a while.** SharePoint asks apps to slow down when it is busy, and AmpSync obeys. On Auto it backs off by itself; with a fixed number, try fewer files at the same time.
+- **"D: is full" and the download stopped.** See [When the disk is full](#when-the-disk-is-full). Free some space and press Retry.
 - **A file failed.** AmpSync retries automatically. If it still fails, run the download again; only the missing pieces are fetched.
 - **Reporting a problem.** Open About, choose **Copy diagnostics**, and paste it into a [new issue](https://github.com/cbs-test-development/AmpSync/issues/new/choose). Do not include SharePoint links, file names or cookies.

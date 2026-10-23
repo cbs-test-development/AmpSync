@@ -30,6 +30,8 @@ export type ItemStatus =
   | "running"
   | "paused"
   | "needs_sign_in"
+  /** The destination disk is full; Retry resumes. */
+  | "needs_space"
   | "done"
   | "failed"
   | "cancelled";
@@ -53,12 +55,15 @@ export interface SummaryLite {
   failures: { rel_path: string; error: string }[];
 }
 
+/** The job description as the queue view receives it: no file list, only its length. */
+export type QueueSpec = Omit<JobSpec, "files"> & { file_count?: number | null };
+
 export interface QueueItem {
   id: number;
   title: string;
   path_label: string;
   host: string;
-  spec: JobSpec;
+  spec: QueueSpec;
   est_files: number;
   est_bytes: number;
   status: ItemStatus;
@@ -68,18 +73,24 @@ export interface QueueItem {
 
 export type EngineEvent =
   | { type: "planned"; files: number; bytes: number; skipped: number }
-  | { type: "file_started"; rel_path: string; size: number; lane: number }
+  | { type: "file_started"; rel_path: string; size: number; lane: number; done_ranges: number[] }
   | { type: "progress"; bytes_done: number; bytes_total: number; rate_bps: number }
   | { type: "lane_progress"; lane: number; rel_path: string; offset: number; size: number }
   | { type: "file_verified"; rel_path: string; by: "hash" | "size_and_etag" | "size_and_mtime" }
   | { type: "file_failed"; rel_path: string; error: string; will_retry: boolean }
   | { type: "throttled"; retry_after_ms: number }
   | { type: "auth_expired"; host: string }
+  | { type: "disk_full"; path: string; needed: number; free: number }
+  | { type: "range_done"; rel_path: string; index: number; count: number }
+  | { type: "lanes_changed"; lanes: number; reason: LanesReason }
   | { type: "paused" }
   | { type: "resumed" }
   | ({ type: "finished" } & SummaryLiteEvent)
   | { type: "failed"; error: string }
   | { type: "cancelled" };
+
+/** Why automatic tuning changed the lane count (D22). */
+export type LanesReason = "probe_up" | "no_gain" | "throttled" | "budget";
 
 export interface SummaryLiteEvent {
   downloaded: number;
@@ -134,6 +145,13 @@ export interface ParsedLinkInfo {
 export interface IncomingLink {
   text: string;
   source: "tray";
+}
+
+/** Free space on the volume that holds a destination folder. */
+export interface DiskSpace {
+  free: number;
+  /** A drive letter (`D:`), a network share, or a mount point (`/home`). */
+  volume: string;
 }
 
 export interface SessionInfo {

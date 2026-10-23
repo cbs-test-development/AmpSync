@@ -195,6 +195,7 @@ impl Core {
             Some(ItemStatus::Preparing | ItemStatus::Queued) => Phase::Preparing,
             Some(ItemStatus::Running) => Phase::Running,
             Some(ItemStatus::NeedsSignIn) => Phase::SignIn,
+            Some(ItemStatus::NeedsSpace) => Phase::DiskFull,
             Some(ItemStatus::Paused) if self.disk_full => Phase::DiskFull,
             Some(ItemStatus::Paused) => Phase::Paused,
             Some(ItemStatus::Done | ItemStatus::Cancelled) => Phase::Idle,

@@ -3,11 +3,12 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api, on, toCmdError } from "../core/api";
   import { app } from "../core/store.svelte";
+  import { checkSpace, needsText, notEnoughText } from "../core/diskspace";
   import { joinPath, num, size } from "../core/format";
   import { emptyState, extensionStats, isActive, toSpec, type ExtStat, type FilterResult, type FilterState } from "../core/filter";
   import { FilterRunner } from "../core/filterRunner";
   import { selectionToSpec, TreeModel } from "../core/selection";
-  import type { CmdError, PlanTree, Resolved } from "../core/types";
+  import type { CmdError, DiskSpace, PlanTree, Resolved } from "../core/types";
   import FilterBar from "../parts/FilterBar.svelte";
   import FolderTree from "../parts/FolderTree.svelte";
   import SignInForm from "../parts/SignInForm.svelte";
@@ -88,10 +89,50 @@
     });
   });
 
+  // Free space on the destination's volume (F3). The figure that goes against it is the size of the
+  // current selection: the picker does not know which files are already on disk (that is only
+  // found out when the download starts), so with "Skip if unchanged" the real need can be lower.
+  let space = $state<DiskSpace | null>(null);
+  let spaceSeq = 0;
+
+  async function readSpace(dest: string): Promise<DiskSpace | null> {
+    const token = ++spaceSeq;
+    try {
+      const s = await api.diskSpace(dest);
+      if (token === spaceSeq) space = s;
+      return s;
+    } catch {
+      // Not a path yet, or a drive that is not there: nothing to compare against.
+      if (token === spaceSeq) space = null;
+      return null;
+    }
+  }
+
+  $effect(() => {
+    // Look again whenever the destination changes (after a short pause for typing).
+    const dest = saveTo.trim();
+    if (!dest) {
+      spaceSeq++;
+      space = null;
+      return;
+    }
+    const t = setTimeout(() => void readSpace(dest), 250);
+    return () => clearTimeout(t);
+  });
+
   onMount(() => {
     let off: (() => void) | undefined;
     void on<{ files: number; bytes: number }>("listing-progress", (p) => (listing = p)).then((u) => (off = u));
-    return () => off?.();
+    // Someone may have freed space while the window was in the background.
+    const refocus = () => {
+      const dest = untrack(() => saveTo.trim());
+      if (dest) void readSpace(dest);
+    };
+    window.addEventListener("focus", refocus);
+    return () => {
+      off?.();
+      window.removeEventListener("focus", refocus);
+    };
   });
 
   onDestroy(() => runner?.dispose());
@@ -159,12 +200,23 @@
     }
   });
 
-  const canAdd = $derived(phase === "ready" && sel.files > 0 && saveTo.trim() !== "" && !adding);
+  const room = $derived(space ? checkSpace(sel.bytes, space.free) : null);
+  const roomShort = $derived(room !== null && !room.ok);
+  const canAdd = $derived(phase === "ready" && sel.files > 0 && saveTo.trim() !== "" && !adding && !roomShort);
 
   async function addToQueue() {
     if (!resolved || !tree || !model) return;
     adding = true;
     try {
+      // Space may have changed since the last look: check once more before committing.
+      const fresh = await readSpace(saveTo.trim());
+      if (fresh) {
+        const c = checkSpace(sel.bytes, fresh.free);
+        if (!c.ok) {
+          app.toast(notEnoughText(c.shortBy, fresh.volume));
+          return;
+        }
+      }
       const picked = selectionToSpec(model);
       const ahead = app.queue.filter((q) => ["queued", "running", "preparing", "needs_sign_in"].includes(q.status));
       const where = joinPath(saveTo.trim(), resolved.display_name);
@@ -280,6 +332,9 @@
     <div class="foot-bar">
       <span class="figures">
         <span class="total">{size(sel.bytes)} <small>· {num(sel.files)} {sel.files === 1 ? "file" : "files"} selected</small></span>
+        {#if sel.files > 0}
+          <span class="needs" class:short={roomShort}>{needsText(sel.bytes, space?.free ?? null, space?.volume ?? "")}</span>
+        {/if}
         {#if result}
           <span class="match" aria-live="polite">{num(result.count)} {result.count === 1 ? "file matches" : "files match"} <small>· {size(result.totalBytes)}</small></span>
         {/if}
@@ -315,7 +370,11 @@
     </div>
   </div>
   <div class="foot-bar">
-    <span class="note">Nothing on your computer is deleted.</span>
+    {#if roomShort && room && space}
+      <span class="note short" role="alert">{notEnoughText(room.shortBy, space.volume)}</span>
+    {:else}
+      <span class="note">Nothing on your computer is deleted.</span>
+    {/if}
     <button type="button" class="btn primary" onclick={addToQueue} disabled={!canAdd}>Add to queue</button>
   </div>
 </div>
@@ -329,4 +388,7 @@
   .figures { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 22px; }
   .match { font: 500 13px var(--f-mono); color: var(--signal); }
   .note { font-size: 13px; color: var(--muted); }
+  .note.short { color: var(--crit); }
+  .needs { font: 500 13px var(--f-mono); color: var(--muted); }
+  .needs.short { color: var(--crit); }
 </style>

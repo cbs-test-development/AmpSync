@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter, Manager, State, Url};
 
 use crate::AppState;
 use crate::error::{CmdError, CmdResult};
-use crate::queue::{ItemStatus, QueueItem};
+use crate::queue::{ItemStatus, QueueItem, QueueItemView};
 
 // ---------------------------------------------------------------- links and listing
 
@@ -303,7 +303,7 @@ pub fn enqueue(app: AppHandle, state: State<'_, AppState>, req: EnqueueReq) -> C
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_queue(state: State<'_, AppState>) -> Vec<QueueItem> {
+pub fn get_queue(state: State<'_, AppState>) -> Vec<QueueItemView> {
     state.queue.snapshot()
 }
 
