@@ -1,6 +1,6 @@
 //! What will happen before anything downloads: job description, relative paths, and the plan.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -130,6 +130,10 @@ pub struct JobSpec {
     pub include: Vec<String>,
     /// Glob patterns that remove files matched by `include`.
     pub exclude: Vec<String>,
+    /// Exactly these files (D20), used when a selection is too scattered for a few globs.
+    /// `include` / `exclude` still apply on top. Matching is case-insensitive, like the globs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<RelPath>>,
     pub existing: ExistingPolicy,
     /// Delete local files that no longer exist remotely. CLI only (`--prune`); default false (D1).
     pub prune: bool,
@@ -143,6 +147,7 @@ impl JobSpec {
             dest: dest.into(),
             include: Vec::new(),
             exclude: Vec::new(),
+            files: None,
             existing: ExistingPolicy::default(),
             prune: false,
         }
@@ -234,6 +239,8 @@ pub(crate) const PART_SUFFIX: &str = ".ampsync-part";
 pub(crate) struct Filters {
     include: Option<GlobSet>,
     exclude: Option<GlobSet>,
+    /// Lowercased `JobSpec::files`.
+    files: Option<HashSet<String>>,
 }
 
 impl Filters {
@@ -257,11 +264,25 @@ impl Filters {
         Ok(Filters {
             include: build(include)?,
             exclude: build(exclude)?,
+            files: None,
         })
     }
 
+    /// The filters of a job: its globs plus its explicit file list.
+    pub(crate) fn for_spec(spec: &JobSpec) -> Result<Self, Error> {
+        let mut f = Self::new(&spec.include, &spec.exclude)?;
+        f.files = spec
+            .files
+            .as_ref()
+            .map(|list| list.iter().map(|p| p.as_str().to_lowercase()).collect());
+        Ok(f)
+    }
+
     pub(crate) fn matches(&self, rel_path: &str) -> bool {
-        self.include.as_ref().is_none_or(|g| g.is_match(rel_path))
+        self.files
+            .as_ref()
+            .is_none_or(|set| set.contains(&rel_path.to_lowercase()))
+            && self.include.as_ref().is_none_or(|g| g.is_match(rel_path))
             && !self.exclude.as_ref().is_some_and(|g| g.is_match(rel_path))
     }
 }
@@ -311,7 +332,7 @@ pub(crate) async fn build<R: Remote + ?Sized>(
     spec: &JobSpec,
     data_dir: Option<&Path>,
 ) -> Result<Plan, Error> {
-    let filters = Filters::new(&spec.include, &spec.exclude)?;
+    let filters = Filters::for_spec(spec)?;
     let dest = absolute_dest(&spec.dest);
     let lock = {
         let (dest, data_dir) = (dest.clone(), data_dir.map(Path::to_path_buf));
@@ -493,6 +514,29 @@ mod tests {
         let all = Filters::new(&[], &[]).unwrap();
         assert!(all.matches("anything/at/all"));
         assert!(Filters::new(&["[".into()], &[]).is_err());
+    }
+
+    #[test]
+    fn explicit_file_list_narrows_the_globs() {
+        let mut spec = JobSpec::new("x", "d");
+        spec.files = Some(vec![
+            RelPath::new("A/Report.PDF").unwrap(),
+            RelPath::new("b/[draft] *.txt").unwrap(),
+            RelPath::new("c/skip.pdf").unwrap(),
+        ]);
+        spec.exclude = vec!["c/**".into()];
+        let f = Filters::for_spec(&spec).unwrap();
+        assert!(f.matches("a/report.pdf"));
+        // Glob characters in a listed name are literal.
+        assert!(f.matches("b/[draft] *.txt") && !f.matches("b/d x.txt"));
+        assert!(!f.matches("a/other.pdf"));
+        // Exclude still wins.
+        assert!(!f.matches("c/skip.pdf"));
+
+        let json = serde_json::to_string(&JobSpec::new("x", "d")).unwrap();
+        assert!(!json.contains("files"));
+        let back: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.files, None);
     }
 
     #[test]

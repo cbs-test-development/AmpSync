@@ -1527,7 +1527,7 @@ fn remove_part_files(
         let s = p.to_string_lossy().to_string();
         if cfg!(windows) { s.to_lowercase() } else { s }
     };
-    let filters = Filters::new(&spec.include, &spec.exclude)?;
+    let filters = Filters::for_spec(spec)?;
     let mut keep: HashSet<String> = HashSet::new();
     for rel in failed {
         if !state.completed_ranges(rel)?.is_empty() {
@@ -1578,7 +1578,7 @@ fn remove_part_files(
 /// Delete local files inside the job's scope (matching the include/exclude globs) that are not part
 /// of the plan, plus leftover part files, then remove directories left empty. Returns files removed.
 fn prune(dest: &Path, spec: &JobSpec, planned: &[RelPath]) -> Result<u64, Error> {
-    let filters = Filters::new(&spec.include, &spec.exclude)?;
+    let filters = Filters::for_spec(spec)?;
     let norm = |s: &str| {
         if cfg!(windows) {
             s.to_lowercase()

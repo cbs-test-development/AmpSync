@@ -24,6 +24,7 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D18 | Probe result (real tenant, 2026-10-22): with cookies, `/_api/v2.0/*` returns 403 and `SP.OAuth.Token/Acquire` returns 400, so no QuickXorHash. Classic REST listing works; `/_layouts/15/download.aspx?UniqueId=` honours Range (206); `GetFileByServerRelativePath/$value` ignores Range. v1 ships `ClassicRemote` only; verification is exact size + eTag unchanged (re-`stat` after download). `V2Remote` stays a documented extension point, not implemented. | Measured, not assumed. |
 | D14 | Commits and PRs carry only human authors: no bot or AI-tool co-author trailers or "generated with" lines. | The contributor list shows people. |
 | D12 | Contributors list is generated from the GitHub API at build time; repo slug comes from `AMPSYNC_REPO` / `GITHUB_REPOSITORY`, never hardcoded. | Forks show their own contributors; works offline. |
+| D20 | `JobSpec.files` is an optional explicit list of files. The picker sends globs when 50 patterns or fewer describe the selection, otherwise the list. `include` / `exclude` still apply on top, and the usual skip and resume rules hold. | Filtered selections (v1.1 search) scatter across the tree. |
 
 ## Layout
 

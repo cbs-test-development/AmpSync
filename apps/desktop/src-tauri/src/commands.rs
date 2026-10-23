@@ -8,7 +8,7 @@ use ampsync_core::Error;
 use ampsync_core::auth::{BrowserKind, BrowserSignIn, PastedSignIn, Session, SignIn, SignInMethod};
 use ampsync_core::link::{self, ParsedLink};
 use ampsync_core::names;
-use ampsync_core::plan::{ExistingPolicy, JobSpec};
+use ampsync_core::plan::{ExistingPolicy, JobSpec, RelPath};
 use ampsync_core::remote::{ClassicRemote, Remote, RemoteEntry, RemoteRoot};
 use ampsync_core::settings::{CloseBehavior, Settings};
 use futures::StreamExt;
@@ -254,6 +254,9 @@ pub struct EnqueueReq {
     pub folder_name: String,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    /// Explicit file list (D20) for selections that would need too many globs.
+    #[serde(default)]
+    pub files: Option<Vec<RelPath>>,
     pub existing: ExistingPolicy,
     pub title: String,
     pub path_label: String,
@@ -271,6 +274,7 @@ pub fn enqueue(app: AppHandle, state: State<'_, AppState>, req: EnqueueReq) -> C
     let mut spec = JobSpec::new(req.source, dest);
     spec.include = req.include;
     spec.exclude = req.exclude;
+    spec.files = req.files;
     spec.existing = req.existing;
     let item = QueueItem {
         id: 0,
