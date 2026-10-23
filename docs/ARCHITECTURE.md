@@ -278,6 +278,9 @@ Exit codes: 0 ok, 1 error, 2 usage, 3 auth expired (rerun resumes), 4 some files
 
 Tauri 2 commands mirror the engine (`resolve`, `plan`, `enqueue`, `pause`, `resume`, `cancel`, `sign_in`, `sign_out`, `sessions`, `get_settings`, `set_settings`, `contributors`). Engine events are forwarded to the frontend as Tauri events. A queue runs jobs one at a time. The frontend has the views Transfers, New download, Sign-ins, Settings, About, plus the first-run walkthrough (steps defined as data: target selector, view to show, title, body), skippable at any step and replayable from Settings.
 
+Desktop extras (v1.1): the taskbar progress bar and a tray progress ring (progress.rs, redrawn at most every 2 s); opt-in notifications decided by a pure function (
+otify.rs, D23: window unfocused, user opted in, only finished / failed / sign-in needed); and the startup splash (D25): the main window is created hidden, index.html paints the splash, splash_info reports the mode, the sign-in check state and the credit line from the build-time contributor list, and show_window (or a 5 s fallback timer) shows the window.
+
 ## Testing
 
 - Unit tests in every core module.

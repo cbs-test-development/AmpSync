@@ -8,6 +8,10 @@ This guide walks through a download from start to finish and explains what AmpSy
 - [Your first download](#your-first-download)
 - [Signing in](#signing-in)
 - [When your sign-in expires](#when-your-sign-in-expires)
+- [Parallel downloads: Auto](#parallel-downloads-auto)
+- [Progress on the taskbar and in the tray](#progress-on-the-taskbar-and-in-the-tray)
+- [Notifications](#notifications)
+- [Startup animation](#startup-animation)
 - [Settings explained](#settings-explained)
 - [Where your files and data live](#where-your-files-and-data-live)
 - [Running a download again](#running-a-download-again)
@@ -68,6 +72,43 @@ SharePoint sessions end after a while, and very large downloads can outlast one.
 
 If you are away, it stays paused until you return. With the command line, the exit code is `3`; sign in again with `ampsync login` and run the same `ampsync get` command to continue.
 
+## Parallel downloads: Auto
+
+**Files at the same time** is set to **Auto** by default. AmpSync starts with four downloads at once and checks your speed every ten seconds: if one more download made the transfer faster it keeps it, otherwise it takes it back and holds that number for a minute. It never runs fewer than two or more than sixteen. When SharePoint asks it to slow down, it halves the number and waits as long as SharePoint asks before building up again. All of this happens in the middle of a job without losing or repeating any work, and the Transfers view always shows how many downloads are running.
+
+Pick a number from 1 to 16 in **Settings** if you want a fixed count instead (for example, to leave bandwidth for a video call). Choose **Auto** again to hand control back. Either way the change applies to the next download that starts.
+
+## Progress on the taskbar and in the tray
+
+While a download runs you do not need the AmpSync window in front.
+
+- **Taskbar (Windows).** AmpSync's taskbar button fills like a progress bar. It is green while downloading, yellow when the download is paused, waiting for you to sign in, or stopped because the disk is full, and red if it stopped with an error. The red bar goes away the next time you open the window. On Ubuntu the same bar appears where the desktop supports it (Unity launcher API); other desktops ignore it.
+- **Tray icon.** A ring around the AmpSync icon fills clockwise as the download progresses (grey while paused). Hover over it for the numbers, for example `AmpSync · 42% · 9 min left`. The time left is left out while the download is paused or the speed is too low to give an honest estimate. The tray icon returns to normal when nothing is downloading.
+
+## Notifications
+
+AmpSync can tell you when something needs your attention, so you can leave a big download running in the background. It is **opt-in**: the first time you start a download, a small question appears at the top of the Transfers view, "Get a notification when downloads finish?" Choose **Yes** or **No thanks**; AmpSync never asks again. You can change your mind any time under **Settings, Notify when downloads finish**.
+
+When it is on, you get a notification for exactly three things, and only while AmpSync's window is in the background:
+
+- a download **finished** ("Your folder is ready, 3,906 files"),
+- a download **stopped with an error**,
+- a **sign-in is needed** to carry on.
+
+Pausing, stopping a download yourself and other routine events never notify. Clicking a notification brings AmpSync to the front. Nothing is sent anywhere: notifications are drawn by your operating system on your own computer.
+
+## Startup animation
+
+When AmpSync opens it shows a short animation while it loads and checks your saved sign-ins. The line under the name tells you what it is really doing (checking sign-ins, how many downloads are waiting). It stays for at least three seconds and leaves as soon as AmpSync is ready, or after six seconds at most. Click or press any key to skip it.
+
+Choose how it plays under **Settings, Startup animation**:
+
+- **On** (default): the full animation.
+- **Reduced motion**: a still logo and name with the status line, then a quick fade. Also used automatically when your operating system's "reduce motion" setting is on.
+- **Off**: no animation; the window opens as soon as the app is ready.
+
+The line at the bottom ("built by @name and N contributors") comes from the contributor list of the build you are running, and is left out when a build has none.
+
 ## Settings explained
 
 Settings save automatically.
@@ -75,11 +116,12 @@ Settings save automatically.
 | Setting | What it does |
 |---------|--------------|
 | Default folder | Pre-fills **Save to** in New download. |
-| Files at the same time | How many transfers run in parallel (1 to 16, default 4). More is not always faster; if SharePoint slows you down, try fewer. |
+| Files at the same time | **Auto** (default) lets AmpSync tune how many transfers run in parallel; a number from 1 to 16 fixes it. See [Parallel downloads: Auto](#parallel-downloads-auto). |
 | Speed limit | Caps total download speed, so a big job does not use the whole connection. Empty means unlimited. |
 | When the window closes | **Ask**, **Keep going in tray** (transfers continue in the system tray), or **Pause** (pauses and quits). |
 | Check for new versions | Looks at GitHub Releases once a day. Nothing else is sent, and AmpSync never installs an update by itself. |
-| Notify when a download finishes | Uses your system's notifications. |
+| Notify when downloads finish | Opt-in notifications for finished, failed and sign-in-needed, only while the window is in the background. See [Notifications](#notifications). |
+| Startup animation | **On**, **Reduced motion** or **Off**. See [Startup animation](#startup-animation). |
 | Remember passwords in the sign-in window | Off by default. |
 | Use the Windows work account (Windows) | Single sign-on with the account Windows is signed in with. On by default. |
 | Replay the walkthrough | Shows the first-run tour again. |
