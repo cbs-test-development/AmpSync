@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "ampsync-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ampsync-core",
  "clap",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "ampsync-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "ampsync-desktop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ampsync-core",
  "base64 0.23.1",
