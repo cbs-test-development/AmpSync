@@ -13,8 +13,18 @@
   const doneBytes = $derived(live?.bytes_done ?? 0);
   const totalBytes = $derived(live?.bytes_total || job?.est_bytes || 0);
   const pct = $derived(totalBytes > 0 ? Math.min(100, (doneBytes / totalBytes) * 100) : 0);
-  const rateNow = $derived(live && !live.paused && !live.waiting_sign_in ? live.rate_bps : 0);
-  const etaSeconds = $derived(rateNow > 0 ? (totalBytes - doneBytes) / rateNow : NaN);
+  // Paused or waiting for sign-in: no speed and no time left (the decaying average would otherwise
+  // show ~1 B/s and an absurd ETA). Right after a resume the average is still tiny, so the time left
+  // stays hidden until the speed is meaningful.
+  const stalled = $derived(!live || live.paused || live.waiting_sign_in || job?.status === "paused" || job?.status === "needs_sign_in");
+  const rateNow = $derived(stalled ? 0 : live!.rate_bps);
+  const MIN_RATE_FOR_ETA = 256 * 1024;
+  const MAX_ETA = 30 * 24 * 3600;
+  const etaSeconds = $derived.by(() => {
+    if (rateNow < MIN_RATE_FOR_ETA) return NaN;
+    const s = (totalBytes - doneBytes) / rateNow;
+    return s > MAX_ETA ? NaN : s;
+  });
   const peak = $derived(live ? Math.max(0, ...live.hist.map((h) => h.v)) : 0);
   const filesDone = $derived((live?.verified ?? 0) + (live?.skipped ?? 0));
   const filesTotal = $derived(live?.files_total || job?.est_files || 0);
@@ -150,13 +160,13 @@
     </div>
     <div>
       <span class="label">Speed</span>
-      <div class="v">{rate(rateNow)[0]} <small>{rate(rateNow)[1]}</small></div>
+      <div class="v">{#if stalled}-{:else}{rate(rateNow)[0]} <small>{rate(rateNow)[1]}</small>{/if}</div>
       <div class="sub">{app.settings?.parallel_files ?? 6} at a time</div>
     </div>
     <div>
       <span class="label">Time left</span>
       <div class="v">{isFinite(etaSeconds) ? duration(etaSeconds) : "-"}</div>
-      <div class="sub">{isFinite(etaSeconds) ? "at current speed" : laneStatus || "working it out"}</div>
+      <div class="sub">{isFinite(etaSeconds) ? "at current speed" : laneStatus || (stalled ? "" : "working it out")}</div>
     </div>
     <div>
       <span class="label">Files</span>
