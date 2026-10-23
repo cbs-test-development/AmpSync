@@ -38,11 +38,11 @@ The Windows files are not code-signed yet, so SmartScreen does not recognise the
 If you want to be sure you have the file the project published, compare its checksum with the one in `SHA256SUMS.txt` on the release page:
 
 ```powershell
-Get-FileHash .\AmpSync_1.0.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\AmpSync_1.1.0_x64-setup.exe -Algorithm SHA256
 ```
 
 ```bash
-sha256sum AmpSync_1.0.0_amd64.AppImage
+sha256sum AmpSync_1.1.0_amd64.AppImage
 ```
 
 ## First run
