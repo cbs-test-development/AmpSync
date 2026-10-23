@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -23,6 +24,7 @@
     "svelte": "^5.57.0",
     "svelte-check": "^4.7.0",
     "typescript": "~5.9.0",
-    "vite": "^8.0.0"
+    "vite": "^8.0.0",
+    "vitest": "^5.0.5"
   }
 }

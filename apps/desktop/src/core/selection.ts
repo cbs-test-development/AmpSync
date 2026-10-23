@@ -137,6 +137,41 @@ export class TreeModel {
   }
 
   /**
+   * Tick or untick only the files flagged in `match` (a filter result) inside `[from, to)`;
+   * everything else keeps its state. A folder row in a filtered tree uses its own range, the
+   * "Select matching" / "Clear matching" buttons use the whole tree.
+   */
+  setMatching(from: number, to: number, value: boolean, match: Uint8Array) {
+    for (let j = from; j < to; j++) {
+      if (this.isDir[j] || !match[j] || (this.selFiles[j] === 1) === value) continue;
+      const d = value ? 1 : -1;
+      const db = d * this.bytes[j];
+      this.selFiles[j] = value ? 1 : 0;
+      this.selBytes[j] = value ? this.bytes[j] : 0;
+      for (let p = this.parent[j]; p >= 0; p = this.parent[p]) {
+        this.selFiles[p] += d;
+        this.selBytes[p] += db;
+      }
+      this.totalFiles += d;
+      this.totalBytes += db;
+    }
+  }
+
+  /** Slash-joined paths of every selected file, in display order. */
+  selectedFiles(): string[] {
+    const out: string[] = [];
+    // Folder paths are built once and reused by everything below them.
+    const prefix = new Array<string>(this.n);
+    for (let i = 0; i < this.n; i++) {
+      const p = this.parent[i];
+      const path = p < 0 ? this.names[i] : `${prefix[p]}/${this.names[i]}`;
+      if (this.isDir[i]) prefix[i] = path;
+      else if (this.selFiles[i] === 1) out.push(path);
+    }
+    return out;
+  }
+
+  /**
    * Include/exclude globs for the engine (`JobSpec.include` / `exclude`), both empty meaning
    * "everything".
    *
@@ -186,6 +221,58 @@ export function visibleRows(model: TreeModel, expanded: Uint8Array): Int32Array 
   while (i < model.n) {
     out[count++] = i;
     i = model.isDir[i] && !expanded[i] ? model.end[i] : i + 1;
+  }
+  return out.subarray(0, count);
+}
+
+/** Per node: how many of the files flagged in `match` are selected (a file counts itself). */
+export function selectedAmong(model: TreeModel, match: Uint8Array): Float64Array {
+  const out = new Float64Array(model.n);
+  for (let i = model.n - 1; i >= 0; i--) {
+    if (!model.isDir[i] && match[i] && model.selFiles[i] === 1) out[i] = 1;
+    const p = model.parent[i];
+    if (p >= 0) out[p] += out[i];
+  }
+  return out;
+}
+
+/** The most globs sent as `include` / `exclude` before the explicit file list is used instead. */
+export const MAX_GLOBS = 50;
+
+/** The selection as the engine's job description (`JobSpec` fields, D20). */
+export interface SelectionSpec {
+  include: string[];
+  exclude: string[];
+  /** Exactly these files; set only when the globs would be too many, and then both lists are empty. */
+  files: string[] | null;
+}
+
+/**
+ * Turn the selection into a job: the compact globs when there are at most `maxGlobs`, else the
+ * list of selected files. Glob metacharacters in names are escaped by `filters()`, so a file
+ * called `[draft] *.txt` selects exactly itself either way.
+ */
+export function selectionToSpec(model: TreeModel, maxGlobs = MAX_GLOBS): SelectionSpec {
+  const f = model.filters();
+  if (f.include.length + f.exclude.length <= maxGlobs) return { ...f, files: null };
+  return { include: [], exclude: [], files: model.selectedFiles() };
+}
+
+/**
+ * Rows of a filtered tree: only `visible` nodes (matching files and the folders leading to them),
+ * every folder open unless it is flagged in `collapsed`.
+ */
+export function filteredRows(model: TreeModel, visible: Uint8Array, collapsed: Uint8Array): Int32Array {
+  const out = new Int32Array(model.n);
+  let count = 0;
+  let i = 0;
+  while (i < model.n) {
+    if (!visible[i]) {
+      i = model.isDir[i] ? model.end[i] : i + 1;
+      continue;
+    }
+    out[count++] = i;
+    i = model.isDir[i] && collapsed[i] ? model.end[i] : i + 1;
   }
   return out.subarray(0, count);
 }

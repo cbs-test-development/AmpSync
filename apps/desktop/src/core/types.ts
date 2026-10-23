@@ -31,6 +31,7 @@ export interface JobSpec {
   dest: string;
   include: string[];
   exclude: string[];
+  files?: string[] | null;
   existing: "skip_unchanged" | "redownload";
   prune: boolean;
 }
@@ -109,6 +110,22 @@ export interface PlanTree {
   dirs: number[];
   /** File sizes in bytes; 0 for folders. */
   sizes: number[];
+  /** Last-modified time of each file in unix seconds; 0 for folders. */
+  modified: number[];
+}
+
+/** What `parse_link` makes of pasted, dropped or clipboard text. */
+export interface ParsedLinkInfo {
+  host: string;
+  kind: "sharing" | "folder";
+  /** The text for the link field: trimmed, Safe Links wrapper removed. */
+  link: string;
+}
+
+/** Payload of the `incoming-link` event (the tray's "Download link from clipboard"). */
+export interface IncomingLink {
+  text: string;
+  source: "tray";
 }
 
 export interface SessionInfo {
@@ -157,6 +174,8 @@ export interface EnqueueReq {
   folder_name: string;
   include: string[];
   exclude: string[];
+  /** Exactly these files (D20), instead of globs, for selections too scattered for 50 patterns. */
+  files?: string[] | null;
   existing: "skip_unchanged" | "redownload";
   title: string;
   path_label: string;
