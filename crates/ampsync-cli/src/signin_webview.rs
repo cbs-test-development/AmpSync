@@ -35,6 +35,7 @@ pub struct Options {
     /// Persistent AmpSync-owned profile directory (D15).
     pub profile_dir: PathBuf,
     /// Windows: single sign-on with the OS work/school account (`Settings::use_windows_account`).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub use_windows_account: bool,
     /// Let the browser offer to save passwords (`Settings::save_passwords`).
     pub save_passwords: bool,
