@@ -195,6 +195,10 @@ pub struct Plan {
     pub root: RemoteRoot,
     pub items: Vec<PlannedFile>,
     pub totals: Totals,
+    /// Bytes still to download (D21): the sizes of the files to download plus the missing bytes of
+    /// the files to resume, nothing for skipped files or ranges already on disk. Always equal to
+    /// `totals.bytes`; the desktop compares it with [`free_space`] before a job is queued.
+    pub bytes_needed: u64,
     #[serde(skip)]
     pub(crate) lock: PlanLock,
 }
@@ -326,6 +330,18 @@ pub(crate) fn hash_text(file: &RemoteFile) -> Option<String> {
     })
 }
 
+/// Bytes available to the current user on the volume that holds `dest` (D21). `dest` need not
+/// exist yet: the nearest existing parent decides. Honours per-user quotas where the OS reports
+/// them.
+pub fn free_space(dest: &Path) -> std::io::Result<u64> {
+    let abs = absolute_dest(dest);
+    let existing = abs
+        .ancestors()
+        .find(|p| p.exists())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no existing parent folder"))?;
+    fs4::available_space(existing)
+}
+
 /// List the remote tree, apply the filters, compare with the destination and `state.db`.
 pub(crate) async fn build<R: Remote + ?Sized>(
     remote: &R,
@@ -377,6 +393,7 @@ pub(crate) async fn build<R: Remote + ?Sized>(
     Ok(Plan {
         root,
         items,
+        bytes_needed: totals.bytes,
         totals,
         lock: PlanLock::holding(lock),
     })

@@ -11,6 +11,7 @@ base64.workspace = true
 bytes.workspace = true
 directories.workspace = true
 fastrand = "2"
+fs4 = "1"
 futures.workspace = true
 globset.workspace = true
 httpdate = "1"

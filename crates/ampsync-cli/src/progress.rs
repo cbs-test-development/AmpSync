@@ -113,7 +113,9 @@ impl Display {
 
     pub fn on_event(&mut self, event: &Event) {
         match event {
-            Event::FileStarted { rel_path, size, lane } => {
+            Event::FileStarted {
+                rel_path, size, lane, ..
+            } => {
                 self.lane_of.insert(rel_path.clone(), *lane);
                 self.sizes.insert(rel_path.clone(), *size);
                 self.lane_bar(*lane)

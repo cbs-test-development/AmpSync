@@ -25,6 +25,11 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D14 | Commits and PRs carry only human authors: no bot or AI-tool co-author trailers or "generated with" lines. | The contributor list shows people. |
 | D12 | Contributors list is generated from the GitHub API at build time; repo slug comes from `AMPSYNC_REPO` / `GITHUB_REPOSITORY`, never hardcoded. | Forks show their own contributors; works offline. |
 | D20 | `JobSpec.files` is an optional explicit list of files. The picker sends globs when 50 patterns or fewer describe the selection, otherwise the list. `include` / `exclude` still apply on top, and the usual skip and resume rules hold. | Filtered selections (v1.1 search) scatter across the tree. |
+| D21 | `Plan.bytes_needed` is the bytes still to download (skipped files and ranges already on disk excluded; equal to `totals.bytes`). `free_space(dest)` (the `fs4` crate) reports the space on the destination's volume, using the nearest existing parent. A write that fails with disk full (`StorageFull`, `ENOSPC`, Windows 112 / 39) pauses the job like `AuthExpired`, emits `Event::DiskFull { path, needed, free }`, and never fails the job or deletes finished or partial work; `resume` retries. | Big jobs fill disks; a full disk must be recoverable, not a pile of failed files. |
+| D22 | Parallel downloads are tuned automatically by default (`Settings.auto_tune`, true); `parallel_files` is the fixed value when it is off. AIMD per 10 s of active transfer: start 4 lanes, bounds 2 to 16; +1 lane when throughput rose at least 5% over the window before the last change, else take the last lane back and hold 60 s; halve (minimum 2) on 429/503 and hold 2 min after the `Retry-After` wait; above 2,400 requests per rolling 5 minutes (80% of SharePoint's ~3,000) stop adding lanes and use 32 MiB ranges for files started from then on. Lanes change mid-job without losing or repeating work (`Event::LanesChanged { lanes, reason }`). | The best lane count depends on the link and the tenant; a fixed number is wrong somewhere. |
+| D23 | `Settings.notify_on_finish: Option<bool>`; `None` means the user has not been asked yet (the key is absent from `settings.toml`). The desktop asks once, at the first download, and notifies only while the window is unfocused. | Notifications are opt-in. |
+| D24 | `Event::RangeDone { rel_path, index, count }` is sent once per range of a file split into ranges; `Event::FileStarted` carries `done_ranges` (ranges already on disk when resuming). Ranges lie on a fixed grid of the file's range size, so indices are stable across resumes. | Drives the fill map for big files. |
+| D25 | `Settings.splash: SplashMode` with `on` (default), `reduced`, `off`. The desktop implements the behaviour. | Startup animation is a preference. |
 
 ## Layout
 
@@ -169,7 +174,9 @@ pub struct JobSpec {
     pub existing: ExistingPolicy,       // SkipUnchanged (default) | Redownload
     pub prune: bool,                    // CLI only; default false
 }
-pub struct Plan { pub root: RemoteRoot, pub items: Vec<PlannedFile>, pub totals: Totals }
+pub struct Plan { pub root: RemoteRoot, pub items: Vec<PlannedFile>, pub totals: Totals,
+                  pub bytes_needed: u64 }   // D21: bytes still to download, == totals.bytes
+pub fn free_space(dest: &Path) -> io::Result<u64>;  // D21: also `ampsync_core::free_space`
 pub enum PlannedAction { Download, Resume { have: u64 }, SkipUnchanged }
 ```
 
@@ -181,7 +188,9 @@ Tables: `job` (spec, root, created/updated), `file` (rel_path PK, size, etag, ha
 
 ```rust
 pub struct Settings {
-    pub parallel_files: u8,            // default 6, 1..=16
+    pub parallel_files: u8,            // default 6, 1..=16; the fixed lane count when auto_tune is off
+    pub auto_tune: bool,               // default true (D22): lanes chosen by the engine, 2..=16
+    // application fields: notify_on_finish: Option<bool> (D23), splash: SplashMode (D25)
     pub range_size: u64,               // default 16 MiB (keeps a fast download under SharePoint's ~3000 requests / 5 min per user)
     pub large_file_threshold: u64,     // files above this get parallel ranges; default 64 MiB
     pub bandwidth_limit: Option<u64>,  // bytes/s, shared across lanes
@@ -207,7 +216,7 @@ impl JobHandle {
 
 pub enum Event {
     Planned { files: u64, bytes: u64, skipped: u64 },
-    FileStarted { rel_path: RelPath, size: u64, lane: u8 },
+    FileStarted { rel_path: RelPath, size: u64, lane: u8, done_ranges: Vec<u32> }, // D24
     Progress { bytes_done: u64, bytes_total: u64, rate_bps: u64 }, // throttled to ~4 Hz
     LaneProgress { lane: u8, rel_path: RelPath, offset: u64, size: u64 },
     FileVerified { rel_path: RelPath, by: VerifiedBy },             // Hash | SizeAndEtag | SizeAndMtime
@@ -215,13 +224,16 @@ pub enum Event {
     FileFailed { rel_path: RelPath, error: String, will_retry: bool },
     Throttled { retry_after: Duration },
     AuthExpired { host: String },                                   // job is now paused
+    DiskFull { path: String, needed: u64, free: u64 },              // job is now paused (D21)
+    RangeDone { rel_path: RelPath, index: u32, count: u32 },        // once per range of a ranged file (D24)
+    LanesChanged { lanes: u8, reason: LanesReason },                // probe_up | no_gain | throttled | budget (D22)
     Paused, Resumed,
     Finished(Summary),
 }
 ```
 
 Engine rules:
-- Files ≤ `large_file_threshold` are one request each; larger files are split into `range_size` ranges spread across lanes. Total in-flight requests never exceed `parallel_files`.
+- Files ≤ `large_file_threshold` are one request each; larger files are split into `range_size` ranges spread across lanes. Total in-flight requests never exceed the lane count (`parallel_files`, or the tuned count with `auto_tune`; see D22). A lane that is taken away finishes its current range or file first.
 - Each range is written with positional writes into the preallocated `.ampsync-part`; completed ranges are recorded in `state.db` so a restart only fetches missing ranges.
 - After the last byte: verify hash if present, else size + `stat()` eTag unchanged. Then rename over the destination. On mismatch: delete the part file and retry the file once, then `FileFailed`.
 - Windows: use `\\?\` long paths; replace characters illegal on Windows (`<>:"|?*` and trailing dots/spaces) with a visible substitute and record the mapping in `state.db`.

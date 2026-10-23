@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ampsync_core::Error;
-use ampsync_core::engine::{Engine, Event, Settings, Summary, Tuning, VerifiedBy};
+use ampsync_core::autotune::{AutoTuneConfig, LanesReason};
+use ampsync_core::engine::{Engine, Event, FreeSpaceHook, Settings, Summary, Tuning, VerifiedBy, WriteHook};
 use ampsync_core::link;
 use ampsync_core::names;
 use ampsync_core::plan::{ExistingPolicy, JobSpec, PlannedAction, RelPath};
@@ -40,6 +41,7 @@ fn key(rel: &str) -> String {
 fn settings() -> Settings {
     Settings {
         parallel_files: 4,
+        auto_tune: false,
         range_size: 256 * 1024,
         large_file_threshold: 256 * 1024,
         max_retries: 3,
@@ -77,6 +79,7 @@ fn tuning() -> Tuning {
             backoff_base: Duration::from_millis(2),
             backoff_max: Duration::from_millis(10),
         },
+        ..Tuning::default()
     }
 }
 
@@ -1598,6 +1601,604 @@ async fn recorded_ranges_that_do_not_add_up_reset_the_file_and_it_is_fetched_aga
         let fetched: u64 = fake.downloads().iter().map(|(_, a, b)| b - a).sum();
         assert_eq!(fetched, 2 * big.len() as u64);
         assert!(no_part_files(dest.path()));
+    })
+    .await;
+}
+
+// ------------------------------------------------------------------------------------------
+// v1.1: automatic tuning (D22)
+// ------------------------------------------------------------------------------------------
+
+const MIB: usize = 1024 * KIB;
+
+/// Run a job to its terminal event, handing every event to `on_event` as it arrives.
+async fn run_watching(
+    engine: &Engine<ClassicRemote>,
+    spec: JobSpec,
+    mut on_event: impl FnMut(&Event),
+) -> (Summary, Vec<Event>) {
+    let plan = engine.plan(&spec).await.unwrap();
+    let handle = engine.start(spec, plan);
+    let mut rx = handle.events();
+    let mut events = Vec::new();
+    loop {
+        match rx.recv().await {
+            Ok(e) => {
+                on_event(&e);
+                let end = matches!(&e, Event::Finished(_) | Event::Failed { .. } | Event::Cancelled);
+                events.push(e);
+                if end {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(e) => panic!("event stream ended: {e}"),
+        }
+    }
+    let summary = handle.wait().await.unwrap();
+    (summary, events)
+}
+
+/// The controller's timing, shrunk so that a simulation takes seconds.
+fn sim_cfg() -> AutoTuneConfig {
+    AutoTuneConfig {
+        sample: Duration::from_millis(25),
+        window: Duration::from_millis(500),
+        hold_no_gain: Duration::from_secs(2),
+        hold_throttled: Duration::from_secs(2),
+        throttle_guard: Duration::from_millis(500),
+        request_window: Duration::from_secs(3),
+        request_limit: 1_000_000,
+        budget_range_size: 512 * KIB as u64,
+        ..AutoTuneConfig::default()
+    }
+}
+
+fn auto_engine(fake: &Fake, cfg: AutoTuneConfig) -> Engine<ClassicRemote> {
+    Engine::with_tuning(
+        remote(fake, COOKIE_OLD),
+        Settings {
+            auto_tune: true,
+            ..settings()
+        },
+        Tuning {
+            autotune: cfg,
+            progress_interval: Duration::from_millis(100),
+            ..tuning()
+        },
+    )
+}
+
+fn lane_changes(events: &[Event]) -> Vec<(u8, LanesReason)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::LanesChanged { lanes, reason } => Some((*lanes, *reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_tuning_converges_near_the_bandwidth_optimum() {
+    guarded(async {
+        // A 6 MiB/s link where one connection carries 1 MiB/s: six lanes fill it.
+        let fake = Fake::start().await;
+        fake.bandwidth(Some(6 * MIB as u64), Some(MIB as u64));
+        let body = data(5, 4 * MIB);
+        let names: Vec<String> = (0..16).map(|i| format!("f{i:02}.bin")).collect();
+        for n in &names {
+            fake.add_file(&key(n), body.clone());
+        }
+        let dest = tempfile::tempdir().unwrap();
+        let e = auto_engine(&fake, sim_cfg());
+
+        let (summary, events) = run_watching(&e, spec(dest.path()), |_| {}).await;
+
+        assert_eq!((summary.downloaded, summary.failed), (16, 0));
+        for n in &names {
+            assert_eq!(read(dest.path(), n), body, "{n}");
+        }
+        let changes = lane_changes(&events);
+        assert_eq!(changes[0], (5, LanesReason::ProbeUp), "{changes:?}");
+        let peak = changes.iter().map(|c| c.0).max().unwrap();
+        assert!(
+            (5..=9).contains(&peak),
+            "the optimum is 6 lanes, the tuner peaked at {peak}: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|c| c.1 == LanesReason::NoGain),
+            "the link saturates, so a probe must have been taken back: {changes:?}"
+        );
+        let last = changes.last().unwrap().0;
+        assert!((5..=9).contains(&last), "settled at {last}: {changes:?}");
+        // The server never saw more connections than the tuner allowed.
+        assert!(
+            fake.peak_concurrency() <= usize::from(peak).max(4),
+            "{} connections against at most {peak} lanes",
+            fake.peak_concurrency()
+        );
+        assert!(no_part_files(dest.path()));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_tuning_backs_off_when_throttled() {
+    guarded(async {
+        let fake = Fake::start().await;
+        // No shared limit: more lanes always help, so the tuner keeps climbing until throttled.
+        fake.bandwidth(None, Some(MIB as u64));
+        let body = data(6, 4 * MIB);
+        for i in 0..20 {
+            fake.add_file(&key(&format!("f{i:02}.bin")), body.clone());
+        }
+        let dest = tempfile::tempdir().unwrap();
+        let e = auto_engine(&fake, sim_cfg());
+
+        let mut armed = false;
+        let mut lanes = 0u8;
+        let (summary, events) = run_watching(&e, spec(dest.path()), |ev| {
+            if let Event::LanesChanged { lanes: n, .. } = ev {
+                lanes = *n;
+                if *n >= 6 && !armed {
+                    armed = true;
+                    fake.throttle_downloads(1); // the next download request gets a 429
+                }
+            }
+        })
+        .await;
+
+        assert_eq!((summary.downloaded, summary.failed), (20, 0));
+        let changes = lane_changes(&events);
+        let at = changes
+            .iter()
+            .position(|c| c.1 == LanesReason::Throttled)
+            .unwrap_or_else(|| panic!("no back-off: {changes:?}"));
+        let before = changes[at - 1].0;
+        assert_eq!(changes[at].0, (before / 2).max(2), "halved: {changes:?}");
+        assert!(events.iter().any(|e| matches!(e, Event::Throttled { .. })));
+        // Held after the throttle: the next change is not an immediate probe back up.
+        let after = events
+            .iter()
+            .skip_while(|e| {
+                !matches!(
+                    e,
+                    Event::LanesChanged {
+                        reason: LanesReason::Throttled,
+                        ..
+                    }
+                )
+            })
+            .filter(|e| matches!(e, Event::Progress { .. }))
+            .count();
+        assert!(after > 0, "the job carried on after the back-off");
+        let _ = lanes;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_tuning_stays_under_the_request_budget() {
+    guarded(async {
+        // Each lane makes about four requests a second (256 KiB ranges at 1 MiB/s) and nothing
+        // else limits throughput, so the tuner would climb to 16 lanes: about 190 requests in
+        // 3 s. The budget is 130 per 3 s, and growth must stop before that.
+        let fake = Fake::start().await;
+        fake.bandwidth(None, Some(MIB as u64));
+        let body = data(7, 4 * MIB);
+        for i in 0..24 {
+            fake.add_file(&key(&format!("f{i:02}.bin")), body.clone());
+        }
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = AutoTuneConfig {
+            request_limit: 130,
+            ..sim_cfg()
+        };
+        let window = cfg.request_window;
+        let e = auto_engine(&fake, cfg);
+
+        let (summary, events) = run_watching(&e, spec(dest.path()), |_| {}).await;
+
+        assert_eq!((summary.downloaded, summary.failed), (24, 0));
+        let changes = lane_changes(&events);
+        assert!(
+            changes.iter().any(|c| c.1 == LanesReason::Budget),
+            "the budget must have been reached: {changes:?}"
+        );
+        let peak = changes.iter().map(|c| c.0).max().unwrap();
+        assert!(peak < 16, "growth stopped below the maximum: {changes:?}");
+        let busiest = fake.max_requests_within(window);
+        assert!(busiest < 130, "{busiest} requests within {window:?}: {changes:?}");
+        // Once over budget, files are fetched with larger ranges.
+        assert!(
+            fake.downloads().iter().any(|(_, s, e)| e - s > 256 * KIB as u64),
+            "no range was larger than the configured size"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lanes_grow_and_shrink_mid_job_without_losing_or_repeating_work() {
+    guarded(async {
+        let fake = Fake::start().await;
+        fake.bandwidth(None, Some(2 * MIB as u64));
+        // A mix of sizes, all with different content: empty, one request, and many ranges.
+        let mut files: Vec<(String, Vec<u8>)> = vec![("empty.txt".into(), Vec::new())];
+        for i in 0..40 {
+            let len = match i % 4 {
+                0 => 100 * KIB,
+                1 => 256 * KIB + 17,
+                2 => 700 * KIB,
+                _ => 1536 * KIB + 3,
+            };
+            files.push((format!("d{}/f{i:02}.bin", i % 3), data(i as u8, len)));
+        }
+        for (name, body) in &files {
+            fake.add_file(&key(name), body.clone());
+        }
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = AutoTuneConfig {
+            start_lanes: 2,
+            min_lanes: 2,
+            max_lanes: 8,
+            window: Duration::from_millis(200),
+            hold_throttled: Duration::from_secs(1),
+            min_gain: -1.0, // any measurement counts as improvement: grow every window
+            ..sim_cfg()
+        };
+        let e = auto_engine(&fake, cfg);
+
+        // Shrink twice with injected throttling, each time after the lanes have grown again.
+        let (mut lanes, mut shrinks) = (2u8, 0);
+        let (summary, events) = run_watching(&e, spec(dest.path()), |ev| {
+            if let Event::LanesChanged { lanes: n, reason } = ev {
+                if *reason == LanesReason::Throttled {
+                    shrinks += 1;
+                } else if (*n >= 6 && shrinks == 0) || (*n >= 5 && shrinks == 1 && *n > lanes) {
+                    fake.throttle_downloads(1);
+                }
+                lanes = *n;
+            }
+        })
+        .await;
+
+        let changes = lane_changes(&events);
+        let throttled = changes.iter().filter(|c| c.1 == LanesReason::Throttled).count();
+        assert!(throttled >= 2, "lanes should have shrunk twice: {changes:?}");
+        assert!(
+            changes.iter().filter(|c| c.1 == LanesReason::ProbeUp).count() >= 6,
+            "{changes:?}"
+        );
+        assert_eq!(
+            (summary.downloaded, summary.failed),
+            (41, 0),
+            "{:?}",
+            summary.failures
+        );
+        for (name, body) in &files {
+            assert_eq!(&read(dest.path(), name), body, "{name}");
+        }
+        // Every file was verified once, and every request the server served is a distinct range
+        // that was asked for: nothing was lost and nothing was fetched twice.
+        let verified = events
+            .iter()
+            .filter(|e| matches!(e, Event::FileVerified { .. }))
+            .count();
+        assert_eq!(verified, 41);
+        let step = 256 * KIB as u64;
+        let mut expected: Vec<(String, u64, u64)> = Vec::new();
+        for (name, body) in &files {
+            let len = body.len() as u64;
+            if len == 0 {
+                continue;
+            }
+            if len > step {
+                let mut start = 0;
+                while start < len {
+                    expected.push((key(name), start, (start + step).min(len)));
+                    start += step;
+                }
+            } else {
+                expected.push((key(name), 0, len));
+            }
+        }
+        let mut served = fake.downloads();
+        served.sort();
+        expected.sort();
+        assert_eq!(served, expected);
+        assert!(fake.peak_concurrency() <= 8);
+        assert!(no_part_files(dest.path()));
+    })
+    .await;
+}
+
+// ------------------------------------------------------------------------------------------
+// v1.1: disk space (D21)
+// ------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bytes_needed_counts_only_what_is_left_to_download() {
+    guarded(async {
+        let fake = Fake::start().await;
+        let step = 256 * KIB as u64;
+        fake.add_file(&key("a.txt"), data(1, 30));
+        fake.add_file(&key("b.txt"), data(2, 40));
+        let dest = tempfile::tempdir().unwrap();
+        let one_lane = Settings {
+            parallel_files: 1,
+            ..settings()
+        };
+        run(&engine_with(&fake, one_lane.clone()), spec(dest.path())).await;
+
+        // Now: a.txt is unchanged (skipped), b.txt changed, big.bin gets three of its eight
+        // ranges before the job is cancelled, new.txt is untouched.
+        let b2 = data(9, 55);
+        fake.replace_file(&key("b.txt"), b2.clone(), "\"b2\"");
+        fake.add_file(&key("big.bin"), data(6, 8 * step as usize));
+        fake.add_file(&key("new.txt"), data(7, 70));
+        let base = fake.download_count();
+        fake.hang_after(base + 4); // b.txt and three ranges are served, the next request hangs
+        let e = engine_with(&fake, one_lane);
+        let s = spec(dest.path());
+        let first = e.plan(&s).await.unwrap();
+        // Nothing is on disk yet for big.bin and new.txt.
+        assert_eq!(first.bytes_needed, 55 + 8 * step + 70);
+        let handle = e.start(s, first);
+        while fake.download_count() < base + 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.cancel();
+        assert!(matches!(handle.wait().await, Err(Error::Cancelled)));
+
+        fake.hang_after(usize::MAX);
+        let plan = e.plan(&spec(dest.path())).await.unwrap();
+        let action = |name: &str| {
+            plan.items
+                .iter()
+                .find(|i| i.file.rel_path.as_str() == name)
+                .map(|i| i.action)
+                .unwrap()
+        };
+        assert_eq!(action("a.txt"), PlannedAction::SkipUnchanged);
+        assert_eq!(
+            action("b.txt"),
+            PlannedAction::SkipUnchanged,
+            "b.txt finished before the cancel"
+        );
+        assert_eq!(action("big.bin"), PlannedAction::Resume { have: 3 * step });
+        assert_eq!(action("new.txt"), PlannedAction::Download);
+        assert_eq!(
+            plan.bytes_needed,
+            5 * step + 70,
+            "skips and finished ranges are not counted"
+        );
+        assert_eq!(plan.bytes_needed, plan.totals.bytes);
+        assert_eq!(plan.totals.skipped_bytes, 30 + 55);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn free_space_looks_at_the_nearest_existing_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let here = ampsync_core::free_space(dir.path()).unwrap();
+    assert!(here > 0);
+    let missing = dir.path().join("not").join("yet").join("created");
+    let there = ampsync_core::free_space(&missing).unwrap();
+    // Same volume; allow for other processes using the disk between the two calls.
+    assert!(here.abs_diff(there) < 256 * MIB as u64, "{here} vs {there}");
+    assert!(!missing.exists(), "looking must not create anything");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_disk_pauses_the_job_and_resume_completes_it() {
+    guarded(async {
+        let fake = Fake::start().await;
+        let big = data(3, 8 * 256 * KIB);
+        let mid = data(4, 100 * KIB);
+        let small = data(5, 20);
+        fake.add_file(&key("big.bin"), big.clone());
+        fake.add_file(&key("sub/mid.bin"), mid.clone());
+        fake.add_file(&key("small.txt"), small.clone());
+        let dest = tempfile::tempdir().unwrap();
+
+        let full = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_full = full.clone();
+        let t = Tuning {
+            before_write: Some(WriteHook::new(move |_, _, _| {
+                if writer_full.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+                } else {
+                    Ok(())
+                }
+            })),
+            free_space: Some(FreeSpaceHook::new(|_| Ok(12_345))),
+            ..tuning()
+        };
+        let e = Engine::with_tuning(remote(&fake, COOKIE_OLD), settings(), t);
+        let s = spec(dest.path());
+        let plan = e.plan(&s).await.unwrap();
+        let handle = e.start(s, plan);
+        let mut rx = handle.events();
+        let mut seen = Vec::new();
+
+        until(&mut rx, &mut seen, |e| matches!(e, Event::DiskFull { .. })).await;
+        until(&mut rx, &mut seen, |e| matches!(e, Event::Paused)).await;
+        // Several lanes hit the wall; the job stays paused and nothing is failed or deleted.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drain(&mut rx, &mut seen);
+        let full_events: Vec<_> = seen
+            .iter()
+            .filter_map(|e| match e {
+                Event::DiskFull { path, needed, free } => Some((path.clone(), *needed, *free)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            full_events.len(),
+            1,
+            "one announcement, not one per lane: {seen:?}"
+        );
+        let (path, needed, free) = &full_events[0];
+        assert_eq!(*free, 12_345);
+        assert!(*needed > 0 && *needed <= (big.len() + mid.len() + small.len()) as u64);
+        assert!(!path.ends_with(".ampsync-part"), "{path}");
+        assert!(Path::new(path).starts_with(dest.path()), "{path}");
+        assert!(
+            !seen.iter().any(|e| matches!(
+                e,
+                Event::FileFailed {
+                    will_retry: false,
+                    ..
+                } | Event::Finished(_)
+                    | Event::Failed { .. }
+                    | Event::Cancelled
+            )),
+            "{seen:?}"
+        );
+        assert!(!no_part_files(dest.path()), "partial files are kept while paused");
+
+        full.store(false, std::sync::atomic::Ordering::SeqCst);
+        handle.resume();
+        until(&mut rx, &mut seen, |e| matches!(e, Event::Finished(_))).await;
+        let summary = handle.wait().await.unwrap();
+        assert_eq!(
+            (summary.downloaded, summary.failed),
+            (3, 0),
+            "{:?}",
+            summary.failures
+        );
+        assert_eq!(read(dest.path(), "big.bin"), big);
+        assert_eq!(read(dest.path(), "sub/mid.bin"), mid);
+        assert_eq!(read(dest.path(), "small.txt"), small);
+        assert!(no_part_files(dest.path()));
+        assert!(seen.iter().any(|e| matches!(e, Event::Resumed)));
+    })
+    .await;
+}
+
+// ------------------------------------------------------------------------------------------
+// v1.1: fill map (D24)
+// ------------------------------------------------------------------------------------------
+
+fn range_events(events: &[Event], name: &str) -> Vec<(u32, u32)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::RangeDone {
+                rel_path,
+                index,
+                count,
+            } if rel_path.as_str() == name => Some((*index, *count)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn started_done_ranges(events: &[Event], name: &str) -> Vec<Vec<u32>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::FileStarted {
+                rel_path,
+                done_ranges,
+                ..
+            } if rel_path.as_str() == name => Some(done_ranges.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn range_done_covers_each_range_exactly_once() {
+    guarded(async {
+        let fake = Fake::start().await;
+        let step = 256 * KIB;
+        fake.add_file(&key("big.bin"), data(1, 4 * step + 17)); // five ranges
+        fake.add_file(&key("huge.bin"), data(2, 12 * step)); // twelve
+        fake.add_file(&key("small.txt"), data(3, 100));
+        let dest = tempfile::tempdir().unwrap();
+
+        let (summary, events) = run(&engine(&fake), spec(dest.path())).await;
+        assert_eq!((summary.downloaded, summary.failed), (3, 0));
+
+        for (name, count) in [("big.bin", 5u32), ("huge.bin", 12)] {
+            let mut done = range_events(&events, name);
+            assert!(done.iter().all(|(_, c)| *c == count), "{name}: {done:?}");
+            done.sort();
+            let indices: Vec<u32> = done.iter().map(|(i, _)| *i).collect();
+            assert_eq!(indices, (0..count).collect::<Vec<_>>(), "{name}: each range once");
+            assert_eq!(started_done_ranges(&events, name), vec![Vec::<u32>::new()]);
+            // The map is announced before it is filled.
+            let started = events
+                .iter()
+                .position(|e| matches!(e, Event::FileStarted { rel_path, .. } if rel_path.as_str() == name))
+                .unwrap();
+            let first_done = events
+                .iter()
+                .position(|e| matches!(e, Event::RangeDone { rel_path, .. } if rel_path.as_str() == name))
+                .unwrap();
+            assert!(started < first_done);
+        }
+        assert!(
+            range_events(&events, "small.txt").is_empty(),
+            "single-request files have no ranges"
+        );
+        assert_eq!(started_done_ranges(&events, "small.txt"), vec![Vec::<u32>::new()]);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_reports_the_ranges_already_on_disk() {
+    guarded(async {
+        let fake = Fake::start().await;
+        let step = 256 * KIB as u64;
+        let big = data(6, 8 * 256 * KIB);
+        fake.add_file(&key("big.bin"), big.clone());
+        fake.hang_after(3); // three ranges are served, the fourth request never answers
+        let dest = tempfile::tempdir().unwrap();
+        let one_lane = Settings {
+            parallel_files: 1,
+            ..settings()
+        };
+
+        let e = engine_with(&fake, one_lane.clone());
+        let s = spec(dest.path());
+        let plan = e.plan(&s).await.unwrap();
+        let handle = e.start(s, plan);
+        let mut rx = handle.events();
+        while fake.download_count() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.cancel();
+        assert!(matches!(handle.wait().await, Err(Error::Cancelled)));
+        let mut first = Vec::new();
+        drain(&mut rx, &mut first);
+        assert_eq!(started_done_ranges(&first, "big.bin"), vec![Vec::<u32>::new()]);
+        let mut done_first: Vec<u32> = range_events(&first, "big.bin").iter().map(|r| r.0).collect();
+        done_first.sort();
+        assert_eq!(done_first, vec![0, 1, 2]);
+        assert_eq!(
+            state_db(dest.path()).completed_ranges(&rel("big.bin")).unwrap(),
+            vec![0..3 * step]
+        );
+
+        fake.hang_after(usize::MAX);
+        let e = engine_with(&fake, one_lane);
+        let (summary, events) = run(&e, spec(dest.path())).await;
+        assert_eq!((summary.downloaded, summary.failed), (1, 0));
+        assert_eq!(read(dest.path(), "big.bin"), big);
+        assert_eq!(started_done_ranges(&events, "big.bin"), vec![vec![0, 1, 2]]);
+        let mut done: Vec<(u32, u32)> = range_events(&events, "big.bin");
+        done.sort();
+        assert_eq!(
+            done,
+            (3..8).map(|i| (i, 8)).collect::<Vec<_>>(),
+            "only the missing ranges"
+        );
     })
     .await;
 }

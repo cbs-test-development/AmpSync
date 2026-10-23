@@ -63,12 +63,32 @@ impl Error {
         }
     }
 
+    /// A write failed because the disk is full. The engine pauses the job instead of failing it.
+    pub fn is_disk_full(&self) -> bool {
+        matches!(self, Error::Io { source, .. } if is_disk_full(source))
+    }
+
     /// Convenience constructor for [`Error::Io`].
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Error::Io {
             path: path.into(),
             source,
         }
+    }
+}
+
+/// `ErrorKind::StorageFull`, `ENOSPC`, or on Windows `ERROR_DISK_FULL` (112) /
+/// `ERROR_HANDLE_DISK_FULL` (39).
+pub fn is_disk_full(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::StorageFull {
+        return true;
+    }
+    match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(code) => code == libc::ENOSPC,
+        #[cfg(windows)]
+        Some(code) => matches!(code, 112 | 39),
+        _ => false,
     }
 }
 
@@ -118,6 +138,23 @@ mod tests {
             .is_retryable()
         );
         assert!(!Error::io("p", std::io::Error::other("x")).is_retryable());
+    }
+
+    #[test]
+    fn disk_full_is_recognised() {
+        use std::io::{Error as IoError, ErrorKind};
+        assert!(is_disk_full(&IoError::from(ErrorKind::StorageFull)));
+        assert!(Error::io("p", IoError::from(ErrorKind::StorageFull)).is_disk_full());
+        #[cfg(unix)]
+        assert!(is_disk_full(&IoError::from_raw_os_error(libc::ENOSPC)));
+        #[cfg(windows)]
+        for code in [112, 39] {
+            assert!(is_disk_full(&IoError::from_raw_os_error(code)), "{code}");
+        }
+        assert!(!is_disk_full(&IoError::other("x")));
+        assert!(!is_disk_full(&IoError::from(ErrorKind::PermissionDenied)));
+        assert!(!Error::Cancelled.is_disk_full());
+        assert!(!Error::io("p", IoError::other("x")).is_disk_full());
     }
 
     #[test]
