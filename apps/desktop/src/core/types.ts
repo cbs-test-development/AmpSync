@@ -1,9 +1,17 @@
 // Shapes that cross the Rust <-> JavaScript boundary. Field names are snake_case on both sides.
 
 export type CloseBehavior = "ask" | "tray" | "pause";
+export type SplashMode = "on" | "reduced" | "off";
 
 export interface Settings {
+  /** Simultaneous downloads when `auto_tune` is off. */
   parallel_files: number;
+  /** AmpSync chooses the number of simultaneous downloads (D22). */
+  auto_tune: boolean;
+  /** Notify when a download finishes, fails or needs sign-in; absent until the user was asked (D23). */
+  notify_on_finish?: boolean | null;
+  /** Startup animation (D25). */
+  splash: SplashMode;
   range_size: number;
   large_file_threshold: number;
   bandwidth_limit?: number | null;
