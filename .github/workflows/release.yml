@@ -1,0 +1,264 @@
+name: Release
+
+# Builds and publishes only when a version tag is pushed (D17).
+# "Run workflow" (workflow_dispatch) builds everything for a dry run but publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Baked into the app at build time so About shows this repository's contributors (D12).
+  AMPSYNC_REPO: ${{ github.repository }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  verify:
+    name: Check tag and version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read workspace version and compare with the tag
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)".*/\1/p}' Cargo.toml | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read [workspace.package] version from Cargo.toml"
+            exit 1
+          fi
+          echo "Workspace version: $version"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            if [ "$tag" != "v$version" ]; then
+              echo "::error::Tag $tag does not match workspace version $version (expected v$version). Bump Cargo.toml, or delete and re-push the tag."
+              exit 1
+            fi
+          else
+            echo "Dry run on ${GITHUB_REF_NAME}: tag check skipped, nothing will be published."
+          fi
+          # If the desktop config pins its own version, it must agree too.
+          conf=apps/desktop/src-tauri/tauri.conf.json
+          if [ -f "$conf" ]; then
+            confver="$(jq -r '.version // empty' "$conf")"
+            if [ -n "$confver" ] && [[ "$confver" =~ ^[0-9] ]] && [ "$confver" != "$version" ]; then
+              echo "::error::tauri.conf.json version $confver does not match workspace version $version"
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  desktop:
+    name: Desktop (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            bundles: nsis
+          # Built on 22.04 so the AppImage and .deb run on older glibc.
+          - name: ubuntu
+            os: ubuntu-22.04
+            bundles: appimage,deb
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev pkg-config build-essential patchelf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      # --- Windows code signing (D10/D19: unsigned for now) -----------------------------------
+      # To enable: add repository secrets WINDOWS_CERTIFICATE (base64 of the .pfx) and
+      # WINDOWS_CERTIFICATE_PASSWORD, set "bundle.windows.certificateThumbprint" in
+      # apps/desktop/src-tauri/tauri.conf.json to the certificate thumbprint, then uncomment
+      # this step and the "Sign portable exe" step further down.
+      #
+      # - name: Import Windows code-signing certificate
+      #   if: runner.os == 'Windows'
+      #   shell: pwsh
+      #   env:
+      #     WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      #     WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      #   run: |
+      #     $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+      #     [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+      #     $pwd = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+      #     $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
+      #     "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+      #     Remove-Item $pfx
+      # -----------------------------------------------------------------------------------------
+
+      - name: Build desktop bundles
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: apps/desktop
+          args: --bundles ${{ matrix.bundles }}
+
+      # - name: Sign portable exe
+      #   if: runner.os == 'Windows'
+      #   shell: pwsh
+      #   run: |
+      #     $exe = (Get-ChildItem target/release -Filter ampsync-desktop.exe).FullName
+      #     $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
+      #     & $signtool sign /sha1 $env:WINDOWS_CERTIFICATE_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # The workspace target dir is normally at the repo root; fall back to the app's own.
+          bundle=target/release/bundle
+          [ -d "$bundle" ] || bundle=apps/desktop/src-tauri/target/release/bundle
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "$bundle"/nsis/*-setup.exe dist/
+            exe=target/release/ampsync-desktop.exe
+            [ -f "$exe" ] || exe=apps/desktop/src-tauri/target/release/ampsync-desktop.exe
+            cp "$exe" "dist/AmpSync-portable-${VERSION}-x64.exe"
+          else
+            cp "$bundle"/appimage/*.AppImage dist/
+            cp "$bundle"/deb/*.deb dist/
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  cli:
+    name: CLI (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cargo_flags: ""
+          # The Linux CLI is a headless build: sign in with Edge/Chrome or a pasted session.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            cargo_flags: --no-default-features
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config build-essential
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p ampsync-cli ${{ matrix.cargo_flags }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "ampsync-$env:VERSION-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "stage/$name", dist | Out-Null
+          Copy-Item target/release/ampsync.exe "stage/$name/"
+          Copy-Item LICENSE, README.md "stage/$name/"
+          Compress-Archive -Path "stage/$name" -DestinationPath "dist/$name.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ampsync-${VERSION}-${{ matrix.target }}"
+          mkdir -p "stage/$name" dist
+          cp target/release/ampsync LICENSE README.md "stage/$name/"
+          tar -C stage -czf "dist/$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Checksums and GitHub Release
+    needs: [verify, desktop, cli]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Write SHA256SUMS.txt
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          ls -l
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Keep the files for dry runs
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-release-files
+          path: artifacts/*
+          retention-days: 7
+
+      - name: Create the GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: artifacts/*

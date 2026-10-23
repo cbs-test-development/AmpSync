@@ -1,0 +1,33 @@
+[package]
+name = "ampsync-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Throwaway SharePoint access probe for AmpSync"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "ampsync-probe"
+path = "src/main.rs"
+
+[dependencies]
+wry = "0.57"
+tao = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+percent-encoding = "2"
+base64 = "0.22"
+url = "2"
+anyhow = "1"
+rpassword = "7"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+tempfile = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"
