@@ -5,6 +5,7 @@
 
 pub mod appdirs;
 pub mod auth;
+pub mod autotune;
 pub mod engine;
 pub mod errors;
 pub mod hash;
@@ -18,4 +19,5 @@ pub mod state;
 
 pub use auth::{SessionStatus, check_session};
 pub use errors::Error;
+pub use plan::free_space;
 pub use purge::{PurgeReport, purge_all};

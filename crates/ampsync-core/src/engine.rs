@@ -31,7 +31,7 @@
 //!   [`crate::names::sanitize`] and record the mapping in `state.db`.
 //! - Nothing local is deleted unless `JobSpec::prune`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -46,6 +46,7 @@ use tokio::task::JoinHandle;
 use crate::Error;
 use crate::auth::Session;
 use crate::auth::SessionStatus;
+use crate::autotune::{AutoTuneConfig, Change, Controller, LanesReason, RequestLog};
 use crate::hash::QuickXorHash;
 use crate::names;
 use crate::plan::{self, Filters, JobSpec, Plan, PlannedAction, RelPath};
@@ -112,10 +113,31 @@ pub enum Event {
         skipped: u64,
         skipped_bytes: u64,
     },
+    /// A file's first request is about to go out. `done_ranges` lists the ranges (by index, see
+    /// `RangeDone`) that are already on disk when a download resumes; empty otherwise and for
+    /// files that are not split into ranges. A second `FileStarted` for the same path (the whole
+    /// file is fetched again after a verification mismatch) starts its range map over.
     FileStarted {
         rel_path: RelPath,
         size: u64,
         lane: u8,
+        done_ranges: Vec<u32>,
+    },
+    /// One byte range of a file split into ranges is on disk (D24). Range `index` of `count` is
+    /// `index * chunk .. (index + 1) * chunk` of the file, `chunk` being the range size the file
+    /// was started with. Sent exactly once per range of a file that completes (ranges listed in
+    /// `FileStarted::done_ranges` are not sent again), never for single-request files.
+    RangeDone {
+        rel_path: RelPath,
+        index: u32,
+        count: u32,
+    },
+    /// Automatic tuning changed the number of parallel lanes (D22). With `reason` `budget` the
+    /// count may be unchanged: growth just stopped. A job starts with 4 lanes and sends nothing
+    /// for that.
+    LanesChanged {
+        lanes: u8,
+        reason: LanesReason,
     },
     /// Overall progress, throttled to about 4 Hz.
     Progress {
@@ -151,6 +173,14 @@ pub enum Event {
     AuthExpired {
         host: String,
     },
+    /// A write failed because the disk is full (D21). The job is now paused and nothing was
+    /// deleted; `resume` retries. `path` is the file being written, `needed` the bytes still to
+    /// download and `free` the space available on the destination volume.
+    DiskFull {
+        path: String,
+        needed: u64,
+        free: u64,
+    },
     Paused,
     Resumed,
     /// Terminal: the job ran to the end (some files may still have failed, see `Summary`).
@@ -182,6 +212,12 @@ pub struct Tuning {
     pub write_buffer: usize,
     /// Retry policy for listing and metadata requests (`Remote::set_retry_policy`).
     pub retry: RetryPolicy,
+    /// Automatic lane tuning (used when `Settings::auto_tune` is on).
+    pub autotune: AutoTuneConfig,
+    /// Replaces [`crate::plan::free_space`] when reporting `Event::DiskFull`.
+    pub free_space: Option<FreeSpaceHook>,
+    /// Called before every positional write; an `Err` is treated as that write's own error.
+    pub before_write: Option<WriteHook>,
     /// Directory that holds job state (`jobs/<key>/`). `None` uses the per-user data directory
     /// (`AMPSYNC_DATA_DIR` overrides it); tests point this at a temporary directory.
     pub data_dir: Option<PathBuf>,
@@ -197,8 +233,47 @@ impl Default for Tuning {
             rename_delay: Duration::from_millis(100),
             write_buffer: 1024 * 1024,
             retry: RetryPolicy::default(),
+            autotune: AutoTuneConfig::default(),
+            free_space: None,
+            before_write: None,
             data_dir: None,
         }
+    }
+}
+
+/// Test hook: how much space is free on a volume.
+#[derive(Clone)]
+pub struct FreeSpaceHook(Arc<FreeSpaceFn>);
+
+type FreeSpaceFn = dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync;
+
+impl FreeSpaceHook {
+    pub fn new(f: impl Fn(&Path) -> std::io::Result<u64> + Send + Sync + 'static) -> Self {
+        FreeSpaceHook(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for FreeSpaceHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FreeSpaceHook")
+    }
+}
+
+/// Test hook: runs before each positional write with the part file, the offset and the length.
+#[derive(Clone)]
+pub struct WriteHook(Arc<WriteFn>);
+
+type WriteFn = dyn Fn(&Path, u64, usize) -> std::io::Result<()> + Send + Sync;
+
+impl WriteHook {
+    pub fn new(f: impl Fn(&Path, u64, usize) -> std::io::Result<()> + Send + Sync + 'static) -> Self {
+        WriteHook(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for WriteHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriteHook")
     }
 }
 
@@ -337,6 +412,12 @@ struct Control {
     session_gen: AtomicU64,
     /// A new session arrived and no request has succeeded with it yet.
     session_unproven: AtomicBool,
+    /// Bumped by every `throttle`, with the latest `Retry-After` in `throttle_last`; the tuner
+    /// polls these.
+    throttle_seq: AtomicU64,
+    throttle_last: Mutex<Duration>,
+    /// `DiskFull` was announced since the last resume (guards against one event per lane).
+    disk_full: Mutex<bool>,
 }
 
 impl Control {
@@ -348,6 +429,9 @@ impl Control {
             throttle_until: Mutex::new(None),
             session_gen: AtomicU64::new(0),
             session_unproven: AtomicBool::new(false),
+            throttle_seq: AtomicU64::new(0),
+            throttle_last: Mutex::new(Duration::ZERO),
+            disk_full: Mutex::new(false),
         }
     }
 
@@ -370,6 +454,7 @@ impl Control {
     }
 
     fn resume(&self) {
+        *lock(&self.disk_full) = false;
         if self.paused.send_replace(false) {
             self.emit(Event::Resumed);
         }
@@ -389,8 +474,27 @@ impl Control {
         }
     }
 
+    /// The disk is full: pause everything once and tell the UI (D21). `event` is only built for
+    /// the first lane that reports it after a resume.
+    fn disk_full(&self, event: impl FnOnce() -> Event) {
+        let mut announced = lock(&self.disk_full);
+        if !*announced {
+            *announced = true;
+            self.emit(event());
+        }
+        // Still holding the lock: a second lane's `Paused` cannot overtake the `DiskFull`.
+        self.pause();
+    }
+
+    /// Waiting out a `Retry-After`.
+    fn is_throttled(&self) -> bool {
+        lock(&self.throttle_until).is_some_and(|until| until > Instant::now())
+    }
+
     /// All lanes wait `retry_after` before their next request (D8).
     fn throttle(&self, retry_after: Duration) {
+        *lock(&self.throttle_last) = retry_after;
+        self.throttle_seq.fetch_add(1, Ordering::SeqCst);
         let until = Instant::now() + retry_after;
         let mut guard = self.throttle_until.lock().unwrap_or_else(|p| p.into_inner());
         let announce = match *guard {
@@ -510,6 +614,13 @@ struct FileCtx {
     written: AtomicU64,
     failed: Mutex<Option<Error>>,
     failed_flag: AtomicBool,
+    /// Range grid of a file split into ranges: cell `i` is `i * chunk .. (i + 1) * chunk`.
+    chunk: u64,
+    cell_count: u32,
+    /// Cells already complete on disk at activation.
+    done_cells: Vec<u32>,
+    /// Pieces still to download per cell (a cell is reported done when its count reaches 0).
+    cells_pending: Mutex<HashMap<u32, u32>>,
 }
 
 impl FileCtx {
@@ -568,6 +679,13 @@ struct Job {
     /// Bytes received in this run, never reduced (for `Summary::bytes`).
     transferred: AtomicU64,
     lanes: Vec<LaneInfo>,
+    /// Lanes allowed to take new work: lane `i` works while `i < target`. Lanes above it finish
+    /// what they hold and wait.
+    lane_target: watch::Sender<usize>,
+    /// Requests in the rolling budget window (only filled when tuning automatically).
+    requests: RequestLog,
+    /// Over the request budget: files started now use the larger range size.
+    budget_ranges: AtomicBool,
     results: Mutex<Results>,
 }
 
@@ -577,6 +695,13 @@ fn refused(rel: &RelPath) -> Error {
         status: 403,
         context: format!("{rel}: SharePoint refused access to this file"),
     }
+}
+
+/// A path as shown to the user: without the Windows long-path prefix or the part-file suffix.
+fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    text.strip_suffix(plan::PART_SUFFIX).unwrap_or(text).to_string()
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -654,8 +779,19 @@ async fn run_job_inner(
         }
     }
 
-    let lane_count = usize::from(settings.parallel_files);
+    // Automatic tuning starts a few lanes and moves within its bounds; otherwise the fixed number
+    // of lanes is all there is.
+    let auto = settings.auto_tune;
+    let (lane_count, initial_lanes) = if auto {
+        (tuning.autotune.max(), tuning.autotune.initial_lanes())
+    } else {
+        let n = usize::from(settings.parallel_files);
+        (n, n)
+    };
     let job = Arc::new(Job {
+        requests: RequestLog::new(tuning.autotune.request_window),
+        lane_target: watch::channel(initial_lanes).0,
+        budget_ranges: AtomicBool::new(false),
         limiter: Limiter::new(settings.bandwidth_limit),
         remote,
         settings,
@@ -675,6 +811,7 @@ async fn run_job_inner(
     });
 
     let ticker = tokio::spawn(progress_ticker(job.clone()));
+    let tuner = auto.then(|| tokio::spawn(tuner_task(job.clone())));
     let mut lanes = Vec::with_capacity(lane_count);
     for lane in 0..lane_count {
         lanes.push(tokio::spawn(lane_loop(job.clone(), lane)));
@@ -684,10 +821,14 @@ async fn run_job_inner(
             tracing::error!("a transfer lane stopped unexpectedly: {e}");
         }
     }
-    // `abort` only takes effect at the ticker's next await, so wait for it to actually stop:
+    // `abort` only takes effect at a task's next await, so wait for each to actually stop:
     // otherwise a tick already in progress can emit Progress after `Finished`.
     ticker.abort();
     let _ = ticker.await;
+    if let Some(tuner) = tuner {
+        tuner.abort();
+        let _ = tuner.await;
+    }
 
     if ctl.is_cancelled() {
         return Err(Error::Cancelled);
@@ -803,6 +944,19 @@ impl Job {
         changed
     }
 
+    /// Apply a decision of the tuner: move the lane target, switch the range size, announce.
+    fn apply_lanes(&self, change: Option<Change>, controller: &Controller) {
+        self.budget_ranges
+            .store(controller.over_budget(), Ordering::SeqCst);
+        if let Some(change) = change {
+            self.lane_target.send_replace(change.lanes);
+            self.ctl.emit(Event::LanesChanged {
+                lanes: u8::try_from(change.lanes).unwrap_or(u8::MAX),
+                reason: change.reason,
+            });
+        }
+    }
+
     fn has_work(&self) -> bool {
         !lock(&self.queue).is_empty() || !lock(&self.active).is_empty()
     }
@@ -906,8 +1060,49 @@ impl Job {
                     });
                     self.ctl.sleep(self.backoff(attempt)).await?;
                 }
+                // Pause; the next turn of the loop waits for `resume` and then tries again.
+                Err(e) if e.is_disk_full() => self.pause_for_disk_full(&e),
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// A write failed because the disk is full (D21): pause the job and announce it once. Nothing
+    /// is deleted, and the work that failed is retried after `resume`.
+    fn pause_for_disk_full(&self, e: &Error) {
+        self.ctl.disk_full(|| {
+            let path = match e {
+                Error::Io { path, .. } => display_path(path),
+                _ => display_path(&self.dest),
+            };
+            let needed = self
+                .bytes_total
+                .load(Ordering::SeqCst)
+                .saturating_sub(self.bytes_done.load(Ordering::SeqCst));
+            let free = match &self.tuning.free_space {
+                Some(hook) => (hook.0)(&self.dest),
+                None => plan::free_space(&self.dest),
+            }
+            .unwrap_or(0);
+            Event::DiskFull { path, needed, free }
+        });
+    }
+
+    /// Count one request against the rolling budget (only needed when tuning automatically).
+    fn count_request(&self) {
+        if self.settings.auto_tune {
+            self.requests.record();
+        }
+    }
+
+    /// Range size for files started now: larger while over the request budget.
+    fn range_size(&self) -> u64 {
+        if self.budget_ranges.load(Ordering::SeqCst) {
+            self.settings
+                .range_size
+                .max(self.tuning.autotune.budget_range_size)
+        } else {
+            self.settings.range_size
         }
     }
 
@@ -959,24 +1154,31 @@ async fn progress_ticker(job: Arc<Job>) {
 }
 
 async fn lane_loop(job: Arc<Job>, lane: usize) {
+    let mut target = job.lane_target.subscribe();
     loop {
         if job.ctl.gate().await.is_err() {
             return;
         }
-        if let Some((ctx, range)) = job.take_range() {
-            process_range(&job, lane, ctx, range).await;
-            continue;
+        // A lane above the target takes no new work: it has finished what it held, and waits to be
+        // wanted again or for the end of the job.
+        let wanted = lane < *target.borrow_and_update();
+        if wanted {
+            if let Some((ctx, range)) = job.take_range() {
+                process_range(&job, lane, ctx, range).await;
+                continue;
+            }
+            let queued = lock(&job.queue).pop_front();
+            if let Some(q) = queued {
+                activate(&job, lane, q).await;
+                continue;
+            }
         }
-        let queued = lock(&job.queue).pop_front();
-        if let Some(q) = queued {
-            activate(&job, lane, q).await;
-            continue;
-        }
-        // Nothing to take right now. Wait for new work (a retry of a file) or for the end.
+        // Nothing to take right now. Wait for new work (a retry of a file), for a change of the
+        // lane target, or for the end.
         let notified = job.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if job.has_work() {
+        if wanted && job.has_work() {
             continue;
         }
         if job.unfinished.load(Ordering::SeqCst) == 0 {
@@ -985,7 +1187,60 @@ async fn lane_loop(job: Arc<Job>, lane: usize) {
         let mut cancelled = job.ctl.cancelled.subscribe();
         tokio::select! {
             _ = &mut notified => {}
+            _ = target.changed() => {}
             _ = cancelled.wait_for(|c| *c) => return,
+        }
+    }
+}
+
+/// Automatic tuning (D22): every window of active transfer, hand the throughput and the request
+/// count to the controller and apply what it decides.
+async fn tuner_task(job: Arc<Job>) {
+    let cfg = job.tuning.autotune.clone();
+    let mut controller = Controller::new(cfg.clone());
+    let mut interval = tokio::time::interval(cfg.sample.max(Duration::from_millis(1)));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_at = Instant::now();
+    let mut last_bytes = job.transferred.load(Ordering::SeqCst);
+    let mut seen_throttles = job.ctl.throttle_seq.load(Ordering::SeqCst);
+    let (mut window_bytes, mut window_time) = (0u64, Duration::ZERO);
+    let mut window_requests_from = job.requests.total();
+    loop {
+        interval.tick().await;
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_at);
+        last_at = now;
+        let bytes = job.transferred.load(Ordering::SeqCst);
+        let delta = bytes.saturating_sub(last_bytes);
+        last_bytes = bytes;
+
+        let throttles = job.ctl.throttle_seq.load(Ordering::SeqCst);
+        if throttles != seen_throttles {
+            seen_throttles = throttles;
+            let retry_after = *lock(&job.ctl.throttle_last);
+            let change = controller.on_throttle(now, retry_after);
+            (window_bytes, window_time) = (0, Duration::ZERO);
+            window_requests_from = job.requests.total();
+            job.apply_lanes(change, &controller);
+            continue;
+        }
+        // Only time spent actually transferring counts towards a window.
+        if job.ctl.is_paused() || job.ctl.is_throttled() {
+            continue;
+        }
+        window_bytes += delta;
+        window_time += elapsed;
+        if window_time >= cfg.window {
+            let throughput = window_bytes as f64 / window_time.as_secs_f64();
+            // The rolling count lags far behind a change of lanes (5 minutes against a 10 s
+            // window), so judge the budget by what it will reach at the rate of this window.
+            let rate = (job.requests.total() - window_requests_from) as f64 / window_time.as_secs_f64();
+            let projected = (rate * cfg.request_window.as_secs_f64()) as u64;
+            let requests = job.requests.count().max(projected);
+            (window_bytes, window_time) = (0, Duration::ZERO);
+            window_requests_from = job.requests.total();
+            let change = controller.on_window(now, throughput, requests);
+            job.apply_lanes(change, &controller);
         }
     }
 }
@@ -994,10 +1249,19 @@ async fn lane_loop(job: Arc<Job>, lane: usize) {
 async fn activate(job: &Arc<Job>, lane: usize, q: Queued) {
     let Queued { file, attempt } = q;
     let rel = file.rel_path.clone();
-    let prepared = {
+    let prepared = loop {
         let job2 = job.clone();
         let file2 = file.clone();
-        blocking(move || prepare_file(&job2, file2, attempt)).await
+        match blocking(move || prepare_file(&job2, file2, attempt)).await {
+            // No room for the part file: pause, and try again after `resume`.
+            Err(e) if e.is_disk_full() => {
+                job.pause_for_disk_full(&e);
+                if job.ctl.gate().await.is_err() {
+                    return;
+                }
+            }
+            other => break other,
+        }
     };
     match prepared {
         Err(e) => fail_permanently(job, &rel, &e).await,
@@ -1020,6 +1284,7 @@ fn announce_start(job: &Job, lane: usize, ctx: &FileCtx) {
             rel_path: ctx.file.rel_path.clone(),
             size: ctx.file.size,
             lane: lane as u8,
+            done_ranges: ctx.done_cells.clone(),
         });
     }
 }
@@ -1087,6 +1352,15 @@ fn prepare_file(job: &Job, file: RemoteFile, attempt: u8) -> Result<FileCtx, Err
     }
 
     let large = size > job.settings.large_file_threshold;
+    // Ranges of a large file lie on a fixed grid of `chunk` bytes, so each has an index that stays
+    // the same across resumes (and the fill map of the UI can use it).
+    let chunk = job.range_size().max(1);
+    let cell_count = if large {
+        u32::try_from(size.div_ceil(chunk)).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let mut cells_pending: HashMap<u32, u32> = HashMap::new();
     let mut ranges = VecDeque::new();
     let mut cursor = 0u64;
     let mut gaps: Vec<Range<u64>> = Vec::new();
@@ -1103,7 +1377,10 @@ fn prepare_file(job: &Job, file: RemoteFile, attempt: u8) -> Result<FileCtx, Err
         if large {
             let mut start = gap.start;
             while start < gap.end {
-                let end = (start + job.settings.range_size).min(gap.end);
+                let end = ((start / chunk + 1) * chunk).min(gap.end);
+                *cells_pending
+                    .entry(u32::try_from(start / chunk).unwrap_or(u32::MAX))
+                    .or_default() += 1;
                 ranges.push_back(start..end);
                 start = end;
             }
@@ -1112,7 +1389,14 @@ fn prepare_file(job: &Job, file: RemoteFile, attempt: u8) -> Result<FileCtx, Err
         }
     }
 
+    let done_cells: Vec<u32> = (0..cell_count)
+        .filter(|i| !cells_pending.contains_key(i))
+        .collect();
     Ok(FileCtx {
+        chunk,
+        cell_count,
+        done_cells,
+        cells_pending: Mutex::new(cells_pending),
         file,
         attempt,
         final_path,
@@ -1143,7 +1427,11 @@ async fn process_range(job: &Arc<Job>, lane: usize, ctx: Arc<FileCtx>, range: Ra
     let result = match result {
         Ok(()) if ctx.record_ranges => {
             let (rel, r) = (ctx.file.rel_path.clone(), range.clone());
-            job.db(move |db| db.add_range(&rel, r)).await
+            let recorded = job.db(move |db| db.add_range(&rel, r)).await;
+            if recorded.is_ok() {
+                range_done(job, &ctx, &range);
+            }
+            recorded
         }
         other => other,
     };
@@ -1168,6 +1456,29 @@ async fn process_range(job: &Arc<Job>, lane: usize, ctx: Arc<FileCtx>, range: Ra
                 settle(job, lane, ctx, 1).await;
             }
         }
+    }
+}
+
+/// Announce a grid cell once its last piece is on disk (D24).
+fn range_done(job: &Job, ctx: &FileCtx, range: &Range<u64>) {
+    let index = u32::try_from(range.start / ctx.chunk).unwrap_or(u32::MAX);
+    let finished = {
+        let mut cells = lock(&ctx.cells_pending);
+        match cells.get_mut(&index) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => cells.remove(&index).is_some(),
+            None => false,
+        }
+    };
+    if finished {
+        job.ctl.emit(Event::RangeDone {
+            rel_path: ctx.file.rel_path.clone(),
+            index,
+            count: ctx.cell_count,
+        });
     }
 }
 
@@ -1201,6 +1512,7 @@ async fn fetch_range_inner(
     counted: &mut u64,
 ) -> Result<(), Error> {
     let handle = ctx.handle()?;
+    job.count_request();
     let mut stream = job.remote.read_range(&ctx.file, range.clone()).await?;
     let mut cancelled = job.ctl.cancelled.subscribe();
     let mut buf: Vec<u8> = Vec::new();
@@ -1228,7 +1540,7 @@ async fn fetch_range_inner(
         job.lanes[lane].offset.store(offset, Ordering::SeqCst);
         buf.extend_from_slice(&chunk);
         if buf.len() >= job.tuning.write_buffer {
-            flush(&handle, &mut buf, buf_start, &ctx.part_path).await?;
+            flush(job, &handle, &mut buf, buf_start, &ctx.part_path).await?;
             buf_start = offset;
         }
     }
@@ -1239,7 +1551,7 @@ async fn fetch_range_inner(
             range.end - range.start
         )));
     }
-    flush(&handle, &mut buf, buf_start, &ctx.part_path).await?;
+    flush(job, &handle, &mut buf, buf_start, &ctx.part_path).await?;
     if ctx.record_ranges {
         // The range is about to be recorded as complete: make sure it is really on disk.
         let (h, p) = (handle.clone(), ctx.part_path.clone());
@@ -1248,13 +1560,26 @@ async fn fetch_range_inner(
     Ok(())
 }
 
-async fn flush(handle: &Arc<std::fs::File>, buf: &mut Vec<u8>, pos: u64, path: &Path) -> Result<(), Error> {
+async fn flush(
+    job: &Job,
+    handle: &Arc<std::fs::File>,
+    buf: &mut Vec<u8>,
+    pos: u64,
+    path: &Path,
+) -> Result<(), Error> {
     if buf.is_empty() {
         return Ok(());
     }
     let data = std::mem::take(buf);
     let (h, p) = (handle.clone(), path.to_path_buf());
-    blocking(move || write_all_at(&h, &data, pos).map_err(|e| Error::io(p, e))).await
+    let hook = job.tuning.before_write.clone();
+    blocking(move || {
+        if let Some(hook) = &hook {
+            (hook.0)(&p, pos, data.len()).map_err(|e| Error::io(&p, e))?;
+        }
+        write_all_at(&h, &data, pos).map_err(|e| Error::io(p, e))
+    })
+    .await
 }
 
 #[cfg(windows)]
@@ -1381,12 +1706,15 @@ async fn finalize(job: &Arc<Job>, ctx: &Arc<FileCtx>) -> Result<VerifiedBy, Fina
     let handle = ctx.handle()?;
     let size = ctx.file.size;
     {
-        let (h, p) = (handle.clone(), ctx.part_path.clone());
-        let actual = blocking(move || {
-            h.sync_all().map_err(|e| Error::io(&p, e))?;
-            h.metadata().map(|m| m.len()).map_err(|e| Error::io(&p, e))
-        })
-        .await?;
+        let actual = job
+            .retrying(&ctx.file.rel_path, || {
+                let (h, p) = (handle.clone(), ctx.part_path.clone());
+                blocking(move || {
+                    h.sync_all().map_err(|e| Error::io(&p, e))?;
+                    h.metadata().map(|m| m.len()).map_err(|e| Error::io(&p, e))
+                })
+            })
+            .await?;
         if actual != size {
             return Err(Error::Integrity {
                 rel_path: ctx.file.rel_path.clone(),
@@ -1405,7 +1733,10 @@ async fn finalize(job: &Arc<Job>, ctx: &Arc<FileCtx>) -> Result<VerifiedBy, Fina
         }
         _ => {
             let fresh = job
-                .retrying(&ctx.file.rel_path, || job.remote.stat(&ctx.file))
+                .retrying(&ctx.file.rel_path, || {
+                    job.count_request();
+                    job.remote.stat(&ctx.file)
+                })
                 .await?;
             if fresh.etag != ctx.file.etag || fresh.size != ctx.file.size {
                 return Err(FinalizeError {
@@ -1708,10 +2039,11 @@ mod tests {
             rel_path: RelPath::new("a/b.txt").unwrap(),
             size: 10,
             lane: 2,
+            done_ranges: vec![0, 3],
         };
         assert_eq!(
             serde_json::to_string(&e).unwrap(),
-            r#"{"type":"file_started","rel_path":"a/b.txt","size":10,"lane":2}"#
+            r#"{"type":"file_started","rel_path":"a/b.txt","size":10,"lane":2,"done_ranges":[0,3]}"#
         );
         assert_eq!(
             serde_json::to_string(&Event::Paused).unwrap(),
@@ -1732,6 +2064,71 @@ mod tests {
             serde_json::to_string(&v).unwrap(),
             r#"{"type":"file_verified","rel_path":"x","by":"size_and_etag"}"#
         );
+    }
+
+    #[test]
+    fn v1_1_events_serialise() {
+        let r = Event::RangeDone {
+            rel_path: RelPath::new("big.bin").unwrap(),
+            index: 4,
+            count: 9,
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"type":"range_done","rel_path":"big.bin","index":4,"count":9}"#
+        );
+        let l = Event::LanesChanged {
+            lanes: 7,
+            reason: LanesReason::ProbeUp,
+        };
+        assert_eq!(
+            serde_json::to_string(&l).unwrap(),
+            r#"{"type":"lanes_changed","lanes":7,"reason":"probe_up"}"#
+        );
+        let d = Event::DiskFull {
+            path: "/d/x.bin".into(),
+            needed: 10,
+            free: 2,
+        };
+        assert_eq!(
+            serde_json::to_string(&d).unwrap(),
+            r#"{"type":"disk_full","path":"/d/x.bin","needed":10,"free":2}"#
+        );
+    }
+
+    #[test]
+    fn display_path_hides_the_plumbing() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\D:\dest\a.bin.ampsync-part")),
+            r"D:\dest\a.bin"
+        );
+        assert_eq!(display_path(Path::new("/d/a.bin.ampsync-part")), "/d/a.bin");
+        assert_eq!(display_path(Path::new("/d/a.bin")), "/d/a.bin");
+    }
+
+    #[test]
+    fn disk_full_is_announced_once_per_resume() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let c = Control::new(tx);
+        let ev = || Event::DiskFull {
+            path: "p".into(),
+            needed: 1,
+            free: 0,
+        };
+        c.disk_full(ev);
+        c.disk_full(ev); // a second lane hit the same wall
+        c.resume();
+        c.disk_full(ev);
+        let mut kinds = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            kinds.push(
+                serde_json::to_value(&e).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(kinds, ["disk_full", "paused", "resumed", "disk_full", "paused"]);
     }
 
     #[test]

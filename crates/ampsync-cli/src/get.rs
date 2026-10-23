@@ -139,6 +139,8 @@ async fn get_inner(args: GetArgs) -> Result<u8, Failure> {
     let mut settings = load_settings();
     if let Some(p) = args.parallel {
         settings.parallel_files = p;
+        // An explicit number means exactly that many, not automatic tuning.
+        settings.auto_tune = false;
     }
     if let Some(l) = args.limit {
         settings.bandwidth_limit = Some(l);
