@@ -49,6 +49,15 @@ It looks again whenever you change the **Save to** folder, when you come back to
 
 ## Signing in
 
+When AmpSync needs you to sign in (you pasted a link, or a queued download's sign-in ran out) and it cannot renew the session quietly, a small dialog opens in the AmpSync window, which comes forward if it was in the tray. It names the site and offers two ways:
+
+- **Via AmpSync** is the sign-in window inside the app (method 1 below). Recommended for personal devices.
+- **Via Edge or Chrome** opens that browser instead (method 2 below), with **Use Edge** and **Use Chrome** buttons. Recommended for work devices.
+
+**Remember my choice** is ticked by default, so the next sign-in goes straight to that method. Untick it to be asked again next time. **Cancel** (or Escape) closes the dialog without signing in; New download then shows the other ways to sign in, and a queued download waits as *needs sign-in*.
+
+You can change the remembered choice any time under **Sign-ins, When AmpSync needs you to sign in**: *Ask every time*, *AmpSync window*, *Edge* or *Chrome*. The **Sign in** button next to an expired site follows the same setting. The three-method form further down the Sign-ins view always lets you pick a method yourself.
+
 AmpSync uses your normal SharePoint sign-in, including multi-factor authentication. It tries three methods in order, and moves on only if the previous one does not work.
 
 ### 1. AmpSync window
@@ -307,7 +316,7 @@ If you used the command line, also run `ampsync sessions` and `ampsync logout <h
 ## Troubleshooting
 
 - **"Sign-in expired" keeps appearing.** Sign in again from the Sign-ins view. If your organisation shortens session lifetimes, a long job will pause more than once; it resumes each time.
-- **The sign-in window is blank or blocked.** Choose the Edge or Chrome method instead.
+- **The sign-in window is blank or blocked.** Choose the Edge or Chrome method instead. To stop being offered the window, set **Sign-ins, When AmpSync needs you to sign in** to Edge or Chrome.
 - **Downloads are slow or pause for a while.** SharePoint asks apps to slow down when it is busy, and AmpSync obeys. On Auto it backs off by itself; with a fixed number, try fewer files at the same time.
 - **"D: is full" and the download stopped.** See [When the disk is full](#when-the-disk-is-full). Free some space and press Retry.
 - **A file failed.** AmpSync retries automatically. If it still fails, run the download again; only the missing pieces are fetched.
