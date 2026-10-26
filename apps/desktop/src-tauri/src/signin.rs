@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ampsync_core::Error;
-use ampsync_core::auth::{Session, SessionCookie, SignInMethod};
-use ampsync_core::settings::Settings;
+use ampsync_core::auth::{BrowserKind, BrowserSignIn, Session, SessionCookie, SignIn, SignInMethod};
+use ampsync_core::settings::{Settings, SignInChoice};
 use tauri::{AppHandle, Emitter, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use time::OffsetDateTime;
 
@@ -80,10 +80,50 @@ unsafe impl Send for SendEnv {}
 #[cfg(windows)]
 unsafe impl Sync for SendEnv {}
 
+/// The question "how do you want to sign in?" while the frontend shows it (D26).
+struct PendingChoice {
+    host: String,
+    tx: tokio::sync::oneshot::Sender<Option<SignInChoice>>,
+}
+
+/// Marks an interactive sign-in as open for as long as it lives, and tells the frontend when it
+/// ends, also when the waiting task is dropped (the queue does that on Pause and Cancel).
+struct OpenGuard<'a> {
+    app: &'a AppHandle,
+    flag: &'a AtomicBool,
+    host: &'a str,
+}
+
+impl<'a> OpenGuard<'a> {
+    fn new(app: &'a AppHandle, flag: &'a AtomicBool, host: &'a str) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        OpenGuard { app, flag, host }
+    }
+}
+
+impl Drop for OpenGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+        emit_state(self.app, self.host, "closed");
+    }
+}
+
+fn emit_state(app: &AppHandle, host: &str, state: &str) {
+    let _ = app.emit(
+        "signin-state",
+        serde_json::json!({ "host": host, "state": state }),
+    );
+}
+
 pub struct SignInCoordinator {
     /// Serialises everything that may open a window.
     gate: tokio::sync::Mutex<()>,
+    /// A chooser, the sign-in window or the sign-in browser is open.
     interactive_open: AtomicBool,
+    /// The open chooser, if any (at most one: `obtain` calls are serialised by `gate`).
+    pending: Mutex<Option<PendingChoice>>,
+    /// Stops the sign-in browser that is running, if any.
+    browser_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(windows)]
     env: Mutex<Option<SendEnv>>,
     #[cfg(not(windows))]
@@ -101,6 +141,8 @@ impl SignInCoordinator {
         SignInCoordinator {
             gate: tokio::sync::Mutex::new(()),
             interactive_open: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            browser_cancel: Mutex::new(None),
             #[cfg(windows)]
             env: Mutex::new(None),
             #[cfg(not(windows))]
@@ -112,8 +154,70 @@ impl SignInCoordinator {
         self.interactive_open.load(Ordering::SeqCst)
     }
 
-    /// Close any sign-in window (used by Cancel).
+    /// The host the open chooser is asking about, for a frontend that loaded after the event.
+    pub fn pending_choice(&self) -> Option<String> {
+        let g = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        g.as_ref().map(|p| p.host.clone())
+    }
+
+    /// Answer the open chooser; `None` is Cancel. Returns false when none is open.
+    pub fn resolve_choice(&self, choice: Option<SignInChoice>) -> bool {
+        let taken = self.pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+        match taken {
+            Some(p) => p.tx.send(choice).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Ask the user how to sign in. The main window is raised first (it may be in the tray).
+    /// `None` when the user cancelled.
+    async fn ask(&self, app: &AppHandle, host: &str) -> Option<SignInChoice> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(PendingChoice {
+            host: host.to_string(),
+            tx,
+        });
+        // If this future is dropped the question must not linger.
+        struct Clear<'a>(&'a Mutex<Option<PendingChoice>>);
+        impl Drop for Clear<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+            }
+        }
+        let _clear = Clear(&self.pending);
+        crate::tray::show_main(app);
+        emit_state(app, host, "choosing");
+        let _ = app.emit("signin-choose", serde_json::json!({ "host": host }));
+        rx.await.ok().flatten()
+    }
+
+    /// Sign in through Edge or Chrome with a temporary profile; Cancel stops the browser.
+    async fn run_browser(&self, kind: BrowserKind, host: &str, start_url: &Url) -> Result<Session, Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.browser_cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+        let method = BrowserSignIn { kind };
+        let r = tokio::select! {
+            r = method.sign_in(host, start_url) => r,
+            _ = rx => Err(Error::Cancelled),
+        };
+        self.browser_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        r
+    }
+
+    /// Close any sign-in window, chooser or sign-in browser (used by Cancel).
     pub fn cancel(&self, app: &AppHandle) {
+        self.resolve_choice(None);
+        if let Some(tx) = self
+            .browser_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = tx.send(());
+        }
         for label in [SIGNIN_LABEL, REFRESH_LABEL] {
             if let Some(w) = app.get_webview_window(label) {
                 let _ = w.destroy();
@@ -125,6 +229,9 @@ impl SignInCoordinator {
         if let Some(w) = app.get_webview_window(SIGNIN_LABEL) {
             let _ = w.show();
             let _ = w.set_focus();
+        } else {
+            // The chooser or the sign-in browser: the main window is the place to look.
+            crate::tray::show_main(app);
         }
     }
 
@@ -171,20 +278,31 @@ impl SignInCoordinator {
             state.set_status(app, host, "expired");
             return Err(Error::AuthExpired { host: host.into() });
         }
-        self.interactive_open.store(true, Ordering::SeqCst);
+        let _open = OpenGuard::new(app, &self.interactive_open, host);
         crate::notify::send(app, &crate::notify::Trigger::SignInNeeded { host: host.into() });
-        let _ = app.emit(
-            "signin-state",
-            serde_json::json!({ "host": host, "state": "window_open" }),
-        );
-        let res = self
-            .run_window(app, host, start_url, &site, &settings, true)
-            .await;
-        self.interactive_open.store(false, Ordering::SeqCst);
-        let _ = app.emit(
-            "signin-state",
-            serde_json::json!({ "host": host, "state": "closed" }),
-        );
+        let choice = match settings.sign_in_with {
+            Some(c) => Some(c),
+            None => self.ask(app, host).await,
+        };
+        let res = match choice {
+            None => Err(Error::Cancelled),
+            Some(SignInChoice::Window) => {
+                emit_state(app, host, "window_open");
+                self.run_window(app, host, start_url, &site, &settings, true)
+                    .await
+            }
+            Some(c) => {
+                emit_state(app, host, "browser_open");
+                let kind = if c == SignInChoice::Edge {
+                    BrowserKind::Edge
+                } else {
+                    BrowserKind::Chrome
+                };
+                self.run_browser(kind, host, start_url)
+                    .await
+                    .map(|s| (s, Validity::Valid))
+            }
+        };
         match res {
             Ok((s, verdict)) => {
                 state.store.save(&s)?;

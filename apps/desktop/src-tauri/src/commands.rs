@@ -10,7 +10,7 @@ use ampsync_core::link::{self, ParsedLink};
 use ampsync_core::names;
 use ampsync_core::plan::{ExistingPolicy, JobSpec, RelPath};
 use ampsync_core::remote::{ClassicRemote, Remote, RemoteEntry, RemoteRoot};
-use ampsync_core::settings::{CloseBehavior, Settings};
+use ampsync_core::settings::{CloseBehavior, Settings, SignInChoice};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Url};
@@ -337,7 +337,7 @@ pub fn clear_finished(app: AppHandle, state: State<'_, AppState>) {
 #[derive(Serialize)]
 pub struct SessionInfo {
     pub host: String,
-    /// "webview", "edge", "chrome" or "paste".
+    /// "webview", "edge", "chrome", "paste", or "auto" (the remembered way, else ask).
     pub method: &'static str,
     pub captured_at: String,
     /// "active", "expired", "checking" or "unknown".
@@ -422,7 +422,7 @@ pub async fn sign_in(app: AppHandle, req: SignInReq) -> CmdResult<SessionInfo> {
         return Err(CmdError::new("busy", "A sign-in window is already open."));
     }
     let session = match req.method.as_str() {
-        "webview" => state.signin.obtain(&app, &host, &url, true, true).await?,
+        "webview" | "auto" => state.signin.obtain(&app, &host, &url, true, true).await?,
         "edge" | "chrome" => {
             let kind = if req.method == "edge" {
                 BrowserKind::Edge
@@ -456,6 +456,27 @@ pub async fn sign_in(app: AppHandle, req: SignInReq) -> CmdResult<SessionInfo> {
         status: "active".into(),
         host: session.host,
     })
+}
+
+/// The host of the sign-in question the frontend should be showing, if one is open.
+#[tauri::command(rename_all = "snake_case")]
+pub fn pending_sign_in_choice(state: State<'_, AppState>) -> Option<String> {
+    state.signin.pending_choice()
+}
+
+/// Answer the sign-in question (D26): `method` is "webview", "edge" or "chrome"; `None` cancels.
+/// With `remember` the choice becomes the default and the question is not asked again.
+#[tauri::command(rename_all = "snake_case")]
+pub fn choose_sign_in(state: State<'_, AppState>, method: Option<String>, remember: bool) -> CmdResult<()> {
+    let choice = method.as_deref().and_then(SignInChoice::from_method);
+    if let (true, Some(c)) = (remember, choice) {
+        let mut s = state.settings();
+        s.sign_in_with = Some(c);
+        s.save()?;
+        *state.settings.write().unwrap_or_else(|p| p.into_inner()) = s;
+    }
+    state.signin.resolve_choice(choice);
+    Ok(())
 }
 
 #[tauri::command(rename_all = "snake_case")]

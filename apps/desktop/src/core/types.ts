@@ -2,6 +2,8 @@
 
 export type CloseBehavior = "ask" | "tray" | "pause";
 export type SplashMode = "on" | "reduced" | "off";
+/** How to sign in when a link needs it; absent = ask every time (D26). */
+export type SignInChoice = "window" | "edge" | "chrome";
 
 export interface Settings {
   /** Simultaneous downloads when `auto_tune` is off. */
@@ -10,6 +12,8 @@ export interface Settings {
   auto_tune: boolean;
   /** Notify when a download finishes, fails or needs sign-in; absent until the user was asked (D23). */
   notify_on_finish?: boolean | null;
+  /** The remembered way to sign in; absent means ask every time (D26). */
+  sign_in_with?: SignInChoice | null;
   /** Startup animation (D25). */
   splash: SplashMode;
   range_size: number;

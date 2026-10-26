@@ -11,6 +11,7 @@
   import About from "./views/About.svelte";
   import Tour from "./parts/Tour.svelte";
   import ClosePrompt from "./parts/ClosePrompt.svelte";
+  import SignInChooser from "./parts/SignInChooser.svelte";
   import LinkDrop from "./parts/LinkDrop.svelte";
 
   const titles: Record<ViewId, string> = {
@@ -109,6 +110,7 @@
 
 {#if app.tourOpen}<Tour />{/if}
 {#if app.closePrompt}<ClosePrompt />{/if}
+{#if app.signInChoose}<SignInChooser />{/if}
 <LinkDrop />
 
 <style>
