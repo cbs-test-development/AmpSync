@@ -122,6 +122,8 @@ pub fn run() {
             commands::check_sessions,
             commands::sign_in,
             commands::cancel_sign_in,
+            commands::choose_sign_in,
+            commands::pending_sign_in_choice,
             commands::sign_out,
             commands::get_settings,
             commands::set_settings,

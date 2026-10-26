@@ -4,6 +4,7 @@
   import { ago } from "../core/format";
   import type { SessionInfo } from "../core/types";
   import SignInForm from "../parts/SignInForm.svelte";
+  import { SIGN_IN_DEFAULTS, defaultFromValue, defaultValue } from "../core/signin";
 
   let newLink = $state("");
   let confirmOut = $state<string | null>(null);
@@ -30,7 +31,8 @@
 
   async function signInAgain(host: string) {
     try {
-      await api.signIn(`https://${host}/`, "webview");
+      // "auto": the remembered way, or the question if none is remembered.
+      await api.signIn(`https://${host}/`, "auto");
       app.toast("Signed in.");
     } catch (e) {
       const err = toCmdError(e);
@@ -103,6 +105,16 @@
 </div>
 
 <div class="panel">
+  <div class="panel-h"><span class="label">When AmpSync needs you to sign in</span></div>
+  <div class="dflt">
+    <label class="label" for="si-default">Sign in with</label>
+    <select class="field" id="si-default" value={defaultValue(app.settings?.sign_in_with)} disabled={app.settings === null} onchange={(e) => app.saveSettings({ sign_in_with: defaultFromValue(e.currentTarget.value) })}>
+      {#each SIGN_IN_DEFAULTS as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+    </select>
+  </div>
+</div>
+
+<div class="panel">
   <div class="panel-h"><span class="label">Sign in to a site</span><span class="meta">tried in this order</span></div>
   <div class="addr">
     <label class="label" for="si-link">SharePoint address or link</label>
@@ -122,5 +134,7 @@
   .actions .btn + .btn { margin-left: 8px; }
   .empty-row { margin: 0; padding: 18px 14px; color: var(--muted); font-size: 13px; }
   .addr { display: grid; gap: 6px; padding: 14px; border-bottom: 1px solid var(--line); }
+  .dflt { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px 14px; font-size: 13px; }
+  .dflt select { min-width: 180px; }
   .privacy { margin: 0; font-size: 12px; color: var(--muted); max-width: 80ch; }
 </style>

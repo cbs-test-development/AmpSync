@@ -40,6 +40,30 @@ pub enum SplashMode {
     Off,
 }
 
+/// How the desktop signs in when a link needs it and the stored session does not work (D26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SignInChoice {
+    /// The sign-in window inside AmpSync.
+    Window,
+    /// Installed Edge, separate temporary profile.
+    Edge,
+    /// Installed Chrome, separate temporary profile.
+    Chrome,
+}
+
+impl SignInChoice {
+    /// From the name the frontend sends (`"webview"`, `"edge"`, `"chrome"`).
+    pub fn from_method(name: &str) -> Option<Self> {
+        match name {
+            "webview" | "window" => Some(Self::Window),
+            "edge" => Some(Self::Edge),
+            "chrome" => Some(Self::Chrome),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -76,6 +100,10 @@ pub struct Settings {
     /// (D23). `None` = the user has not been asked yet; it is left out of the file in that case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notify_on_finish: Option<bool>,
+    /// The remembered way to sign in when a link needs it (D26). `None` = ask every time; it is
+    /// left out of the file in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_in_with: Option<SignInChoice>,
     /// Startup animation (D25).
     pub splash: SplashMode,
 }
@@ -96,6 +124,7 @@ impl Default for Settings {
             default_dest: None,
             close_behavior: CloseBehavior::Ask,
             notify_on_finish: None,
+            sign_in_with: None,
             splash: SplashMode::On,
         }
     }
@@ -216,6 +245,47 @@ mod tests {
             assert_eq!(text.contains("notify_on_finish"), state.is_some(), "{text}");
             assert_eq!(Settings::load_from(&path).unwrap().notify_on_finish, state);
         }
+    }
+
+    #[test]
+    fn sign_in_with_is_optional_and_lowercase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        for (state, name) in [
+            (None, ""),
+            (Some(SignInChoice::Window), "window"),
+            (Some(SignInChoice::Edge), "edge"),
+            (Some(SignInChoice::Chrome), "chrome"),
+        ] {
+            let s = Settings {
+                sign_in_with: state,
+                ..Settings::default()
+            };
+            s.save_to(&path).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.contains("sign_in_with"), state.is_some(), "{text}");
+            if state.is_some() {
+                assert!(text.contains(&format!("sign_in_with = \"{name}\"")), "{text}");
+            }
+            assert_eq!(Settings::load_from(&path).unwrap().sign_in_with, state);
+        }
+        // A file from before v1.2 loads with "ask every time".
+        std::fs::write(
+            &path,
+            "tour_seen = true
+",
+        )
+        .unwrap();
+        assert_eq!(Settings::load_from(&path).unwrap().sign_in_with, None);
+        assert_eq!(serde_json::to_string(&SignInChoice::Edge).unwrap(), "\"edge\"");
+    }
+
+    #[test]
+    fn sign_in_choice_from_method_names() {
+        assert_eq!(SignInChoice::from_method("webview"), Some(SignInChoice::Window));
+        assert_eq!(SignInChoice::from_method("edge"), Some(SignInChoice::Edge));
+        assert_eq!(SignInChoice::from_method("chrome"), Some(SignInChoice::Chrome));
+        assert_eq!(SignInChoice::from_method("paste"), None);
     }
 
     #[test]

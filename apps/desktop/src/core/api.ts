@@ -35,9 +35,13 @@ export const api = {
   clearFinished: () => invoke<void>("clear_finished"),
   sessions: () => invoke<SessionInfo[]>("sessions"),
   checkSessions: () => invoke<void>("check_sessions"),
-  signIn: (link: string, method: "webview" | "edge" | "chrome" | "paste", cookie_header?: string) =>
+  signIn: (link: string, method: "webview" | "edge" | "chrome" | "paste" | "auto", cookie_header?: string) =>
     invoke<SessionInfo>("sign_in", { req: { link, method, cookie_header } }),
   cancelSignIn: () => invoke<void>("cancel_sign_in"),
+  /** Answer the "how do you want to sign in" dialog; `null` cancels. */
+  chooseSignIn: (method: "webview" | "edge" | "chrome" | null, remember: boolean) =>
+    invoke<void>("choose_sign_in", { method, remember }),
+  pendingSignInChoice: () => invoke<string | null>("pending_sign_in_choice"),
   signOut: (host: string) => invoke<void>("sign_out", { host }),
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<Settings>("set_settings", { settings }),

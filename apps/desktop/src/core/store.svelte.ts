@@ -1,6 +1,7 @@
 import { api, on, toCmdError } from "./api";
 import { inFlight, inferChunk, isRanged, RangeMap, rangeCount } from "./fillmap";
 import { MAX_LANES, type LaneMark } from "./lanes";
+import type { SignInPhase } from "./signin";
 import type {
   AppInfo,
   ContributorList,
@@ -115,6 +116,10 @@ class Store {
   closeActive = $state(false);
   /** Host of the sign-in window that is open right now, if any. */
   signInOpen = $state<string | null>(null);
+  /** What that sign-in is waiting on: the choice dialog, the app window or the browser. */
+  signInPhase = $state<SignInPhase | null>(null);
+  /** Host of the sign-in question being asked in the dialog, if any (D26). */
+  signInChoose = $state<string | null>(null);
   ready = $state(false);
   /** A SharePoint link that arrived by paste, drop or the tray; New download opens it. */
   incoming = $state<{ link: string; n: number } | null>(null);
@@ -466,8 +471,12 @@ class Store {
     await on<JobEventPayload>("job-event", (p) => this.handleEvent(p.job_id, p.event));
     await on<null>("sessions-changed", () => void this.refreshSessions());
     await on<{ host: string; state: string }>("signin-state", (p) => {
-      this.signInOpen = p.state === "window_open" ? p.host : null;
+      const open = p.state !== "closed";
+      this.signInOpen = open ? p.host : null;
+      this.signInPhase = open ? (p.state as SignInPhase) : null;
+      if (p.state !== "choosing") this.signInChoose = null;
     });
+    await on<{ host: string }>("signin-choose", (p) => (this.signInChoose = p.host));
     await on<boolean>("close-requested", (active) => {
       this.closeActive = active;
       this.closePrompt = true;
@@ -490,6 +499,8 @@ class Store {
     this.contributors = contributors;
     this.update = update;
     await this.refreshSessions();
+    // A question that was asked before this page was listening (the window was hidden).
+    this.signInChoose = (await api.pendingSignInChoice().catch(() => null)) ?? this.signInChoose;
     this.ready = true;
     setInterval(() => this.sample(), 1000);
     if (!settings.tour_seen) this.startTour();

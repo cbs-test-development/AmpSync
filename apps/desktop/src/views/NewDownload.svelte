@@ -12,6 +12,7 @@
   import FilterBar from "../parts/FilterBar.svelte";
   import FolderTree from "../parts/FolderTree.svelte";
   import SignInForm from "../parts/SignInForm.svelte";
+  import { waitText } from "../core/signin";
 
   let link = $state("");
   let phase = $state<"idle" | "working" | "ready">("idle");
@@ -278,7 +279,8 @@
   <div class="alert info" role="status">
     <p>
       {#if app.signInOpen}
-        <strong>Sign-in window is open.</strong> Sign in to {app.signInOpen} there; this page continues by itself afterwards.
+        {@const wait = waitText(app.signInPhase ?? "window_open", app.signInOpen)}
+        <strong>{wait.title}</strong> {wait.body}
       {:else if listing.files > 0}
         <strong>Listing folders.</strong> Found {num(listing.files)} files ({size(listing.bytes)}) so far.
       {:else}

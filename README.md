@@ -9,6 +9,8 @@
 [![Downloads][badge-downloads]][releases]
 <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584?style=flat-square&amp;logo=rust" alt="Built with Rust"></a>
 
+![AmpSync downloading a SharePoint folder over seven parallel lanes, with the speed chart, per-lane progress, the file list and the queue](docs/screenshot.jpg)
+
 ## Why
 
 Downloading a very large SharePoint or OneDrive folder from the browser means asking the server to build one giant zip. For tens of gigabytes that often times out, stops halfway, or produces an archive that will not open. The usual alternative, the OneDrive sync client, needs an app installed and signed in on a device your organisation manages.
@@ -38,11 +40,11 @@ The Windows files are not code-signed yet, so SmartScreen does not recognise the
 If you want to be sure you have the file the project published, compare its checksum with the one in `SHA256SUMS.txt` on the release page:
 
 ```powershell
-Get-FileHash .\AmpSync_1.1.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\AmpSync_1.2.0_x64-setup.exe -Algorithm SHA256
 ```
 
 ```bash
-sha256sum AmpSync_1.1.0_amd64.AppImage
+sha256sum AmpSync_1.2.0_amd64.AppImage
 ```
 
 ## First run
