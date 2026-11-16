@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ampsync_core::Error;
-use ampsync_core::auth::{KeyringStore, Session, SessionStore};
+use ampsync_core::auth::{Session, SessionStore};
 use ampsync_core::autotune::AutoTuneConfig;
 use ampsync_core::engine::{Engine, Event, Summary};
 use ampsync_core::link::ParsedLink;
@@ -127,7 +127,7 @@ fn refresh_session(
             if let Err(e) = store.save(&s) {
                 eprintln!(
                     "warning: couldn't save the renewed sign-in: {}",
-                    exit::describe(&e, "")
+                    commands::with_keychain_hint(&e, Failure::from_core(&e, "")).message
                 );
             }
             Ok(s)
@@ -174,8 +174,8 @@ async fn get_inner(args: GetArgs) -> Result<u8, Failure> {
     }
     let settings = settings.sanitized();
 
-    let store = KeyringStore::new();
-    let mut session = require_session(&store, &link.host, &args.url)?;
+    let store = commands::session_store()?;
+    let mut session = require_session(&*store, &link.host, &args.url)?;
 
     let mut spec = JobSpec::new(args.url.clone(), args.dest.clone());
     spec.include = args.include.clone();
@@ -217,7 +217,7 @@ async fn get_inner(args: GetArgs) -> Result<u8, Failure> {
                     }
                     eprintln!("Sign-in expired for {host}. Refreshing it...");
                     let old = session.clone();
-                    session = refresh_session(&link, &settings, bad.then_some(&old), &store)?;
+                    session = refresh_session(&link, &settings, bad.then_some(&old), &*store)?;
                 }
                 Err(e) => return Err(Failure::from_core(&e, &args.url)),
             }
@@ -392,9 +392,9 @@ async fn get_inner(args: GetArgs) -> Result<u8, Failure> {
                         let renewed = match &display {
                             Some(d) => d.suspend(|| {
                                 eprintln!("Sign-in expired for {host}. Refreshing it...");
-                                refresh_session(&link, &settings, old_ref, &store)
+                                refresh_session(&link, &settings, old_ref, &*store)
                             }),
-                            None => refresh_session(&link, &settings, old_ref, &store),
+                            None => refresh_session(&link, &settings, old_ref, &*store),
                         };
                         match renewed {
                             Ok(s) => {

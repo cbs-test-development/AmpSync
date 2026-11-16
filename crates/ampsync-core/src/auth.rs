@@ -16,6 +16,13 @@ use url::Url;
 use crate::Error;
 
 mod browser;
+mod file_store;
+
+pub use file_store::FileStore;
+
+/// Environment variable that selects where the CLI keeps sessions: `file` for [`FileStore`]
+/// (headless machines without a keychain); unset, empty or `keychain` for the OS keychain.
+pub const SESSION_STORE_ENV: &str = "AMPSYNC_SESSION_STORE";
 
 /// How a session was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
