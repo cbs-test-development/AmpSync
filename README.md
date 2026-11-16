@@ -94,6 +94,8 @@ Before it starts, `get` lists what will be downloaded, how much disk space that 
 | `ampsync ls <url> [--depth N]` | List a remote folder |
 | `ampsync get <url> <dest> [options]` | Download. Options: `--include`, `--exclude`, `--parallel` (a fixed number of transfers; automatic when left out), `--limit`, `--redownload`, `--prune`, `--ignore-space`, `--yes`, `--json` |
 
+Running in Docker, Podman or another headless Linux container? See [Running ampsync in Docker](docs/docker.md) for signing in without a terminal.
+
 Exit codes: `0` success, `1` error (this includes not enough disk space, and Ctrl+C), `2` bad usage, `3` sign-in expired (sign in again and rerun to resume), `4` some files failed.
 
 > [!TIP]
@@ -120,7 +122,7 @@ Exit codes: `0` success, `1` error (this includes not enough disk space, and Ctr
 <details>
 <summary><strong>My company blocks the sign-in window</strong></summary>
 
-Some organisations stop apps from signing in with an embedded window. AmpSync then offers to use your installed Edge or Chrome with a temporary, separate profile that is deleted afterwards, and as a last resort lets you paste a session. See the [user guide](docs/user-guide.md#signing-in).
+Some organisations stop apps from signing in with an embedded window. AmpSync then offers to use your installed Edge or Chrome with a temporary, separate profile that is deleted afterwards, and as a last resort lets you paste a session. See the [user guide](docs/user-guide.md#signing-in). On a server or in a container, [paste a session from a file](docs/docker.md).
 
 </details>
 

@@ -78,12 +78,16 @@ Some organisations do not allow sign-in inside apps. If the AmpSync window is bl
 
 The last resort, for example on a computer without a screen. Sign in with a browser on another machine, copy the `Cookie` header of a SharePoint request from the browser's developer tools, and paste it into AmpSync (or give it to `ampsync login --method paste`).
 
+Without a terminal (scripts, containers), use `ampsync login '<link>' --cookie-file cookie.txt`, or `--cookie-file -` to read the cookie from standard input, for example from a secret. Quote the link: it usually contains `&`. See [Running ampsync in Docker](docker.md).
+
 > [!WARNING]
 > A pasted cookie is as powerful as your password for that site. Never share it, never paste it into an issue or chat, and sign out of SharePoint in the browser when you are done.
 
 ### Where the session is stored
 
 Sessions are stored per SharePoint address in your operating system's keychain: Windows Credential Manager, or the Secret Service (GNOME Keyring or KWallet) on Ubuntu. The **Sign-ins** view lists them and lets you remove each one.
+
+On a machine with no keychain, such as a container, set the environment variable `AMPSYNC_SESSION_STORE=file` (the other value is `keychain`, the default). Sessions are then stored as `sessions/<host>.json` in AmpSync's data folder (`~/.local/share/ampsync` on Linux, or the folder in `AMPSYNC_DATA_DIR`), readable only by you. Treat those files like passwords. See [Running ampsync in Docker](docker.md).
 
 ## When your sign-in expires
 
