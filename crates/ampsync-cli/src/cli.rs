@@ -44,13 +44,16 @@ pub enum Method {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = "Environment:\n  \
+    AMPSYNC_SESSION_STORE=file  keep sign-ins in files under the data directory instead of the\n                              OS keychain (containers and headless servers without a keychain)")]
 pub struct LoginArgs {
     /// A SharePoint link (the tenant host is taken from it)
     pub url: String,
     /// Sign-in method; default tries webview, then Edge/Chrome, then paste
     #[arg(long, value_enum)]
     pub method: Option<Method>,
-    /// File containing a Cookie header to use with `--method paste` (instead of typing it)
+    /// File containing a Cookie header to use with `--method paste` (instead of typing it); `-`
+    /// reads it from standard input
     #[arg(long, value_name = "FILE")]
     pub cookie_file: Option<PathBuf>,
 }

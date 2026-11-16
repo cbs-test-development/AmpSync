@@ -61,6 +61,8 @@ impl PurgeTargets {
             && Some(&over) != appdirs::default_data_dir().as_ref()
         {
             t.dirs.push(appdirs::jobs_dir(&over));
+            // Opt-in file session store (`AMPSYNC_SESSION_STORE=file`); absent unless used.
+            t.dirs.push(over.join("sessions"));
         }
         match appdirs::config_dir() {
             Some(d) => {

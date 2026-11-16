@@ -117,6 +117,12 @@ async fn browser(kind: BrowserKind, host: &str, start_url: &Url) -> Attempt {
 
 async fn paste(host: &str, start_url: &Url, cookie_file: Option<&Path>) -> Result<Session, Failure> {
     let header = match cookie_file {
+        Some(path) if path == Path::new("-") => {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut text)
+                .map_err(|e| Failure::error(format!("Can't read the cookie header from stdin: {e}")))?;
+            text
+        }
         Some(path) => std::fs::read_to_string(path)
             .map_err(|e| Failure::error(format!("Can't read {}: {e}", path.display())))?,
         None => {

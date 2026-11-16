@@ -5,7 +5,7 @@ use std::io::{BufRead, IsTerminal, Write};
 
 use ampsync_core::Error;
 use ampsync_core::PurgeReport;
-use ampsync_core::auth::{KeyringStore, Session, SessionStore, SignInMethod};
+use ampsync_core::auth::{FileStore, KeyringStore, SESSION_STORE_ENV, Session, SessionStore, SignInMethod};
 use ampsync_core::link::{self, LinkKind, ParsedLink};
 use ampsync_core::remote::{ClassicRemote, Remote, RemoteEntry};
 use ampsync_core::settings::Settings;
@@ -54,14 +54,53 @@ pub fn start_url(link: &ParsedLink) -> Url {
     }
 }
 
+/// Where this run keeps sessions: the OS keychain, unless `AMPSYNC_SESSION_STORE=file` opts in to
+/// plain files under the data directory (for containers and headless servers without a keychain).
+pub fn session_store() -> Result<Box<dyn SessionStore>, Failure> {
+    let value = std::env::var(SESSION_STORE_ENV).unwrap_or_default();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "keychain" => Ok(Box::new(KeyringStore::new())),
+        "file" => FileStore::default_location()
+            .map(|s| Box::new(s) as Box<dyn SessionStore>)
+            .map_err(|e| Failure::from_core(&e, "")),
+        other => Err(Failure::usage(format!(
+            "{SESSION_STORE_ENV} is set to \"{other}\"; the allowed values are \"keychain\" (the default) and \"file\""
+        ))),
+    }
+}
+
 pub fn require_session(store: &dyn SessionStore, host: &str, link_text: &str) -> Result<Session, Failure> {
     match store.load(host) {
         Ok(Some(s)) => Ok(s),
         Ok(None) => Err(Failure::error(format!(
             "You're not signed in to {host}. Run `ampsync login \"{link_text}\"` first."
         ))),
-        Err(e) => Err(Failure::from_core(&e, link_text)),
+        Err(e) => Err(with_keychain_hint(&e, Failure::from_core(&e, link_text))),
     }
+}
+
+/// True when sessions go to the OS keychain (the file store was not requested).
+fn keychain_selected() -> bool {
+    !std::env::var(SESSION_STORE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"))
+}
+
+const KEYCHAIN_HINT: &str = " No keychain is available here. In a container or on a headless server, set AMPSYNC_SESSION_STORE=file: https://github.com/cbs-test-development/AmpSync/blob/main/docs/docker.md";
+
+/// Pure decision for `with_keychain_hint`: Linux, keychain selected, and a keychain failure.
+fn keychain_hint_applies(is_linux: bool, keychain_selected: bool, e: &Error) -> bool {
+    is_linux && keychain_selected && matches!(e, Error::State(m) if m.starts_with("keychain:"))
+}
+
+/// Append the "use the file store" hint to `f` when `e` is a keychain failure on Linux with the
+/// keychain selected; otherwise return `f` unchanged.
+pub fn with_keychain_hint(e: &Error, mut f: Failure) -> Failure {
+    if keychain_hint_applies(cfg!(target_os = "linux"), keychain_selected(), e) {
+        if !f.message.ends_with('.') {
+            f.message.push('.');
+        }
+        f.message.push_str(KEYCHAIN_HINT);
+    }
+    f
 }
 
 /// `https://Host/x` or `Host` -> `host`.
@@ -123,9 +162,10 @@ pub async fn login(args: LoginArgs) -> u8 {
                 );
             }
         }
-        KeyringStore::new()
+        let store = session_store()?;
+        store
             .save(&session)
-            .map_err(|e| Failure::from_core(&e, &args.url))?;
+            .map_err(|e| with_keychain_hint(&e, Failure::from_core(&e, &args.url)))?;
         println!(
             "Signed in to {} ({}).",
             session.host,
@@ -140,12 +180,14 @@ pub async fn login(args: LoginArgs) -> u8 {
 pub async fn logout(args: LogoutArgs) -> u8 {
     run(async {
         let host = normalize_host(&args.host);
-        let store = KeyringStore::new();
+        let store = session_store()?;
         let had = store
             .hosts()
             .map(|h| h.iter().any(|x| x.eq_ignore_ascii_case(&host)))
             .unwrap_or(false);
-        store.delete(&host).map_err(|e| Failure::from_core(&e, &host))?;
+        store
+            .delete(&host)
+            .map_err(|e| with_keychain_hint(&e, Failure::from_core(&e, &host)))?;
         if had {
             println!("Signed out of {host}.");
         } else {
@@ -252,8 +294,10 @@ fn captured_text(s: &Session) -> String {
 /// `ampsync sessions`: host, method, captured time, and whether the server still accepts it.
 pub async fn sessions() -> u8 {
     run(async {
-        let store = KeyringStore::new();
-        let hosts = store.hosts().map_err(|e| Failure::from_core(&e, ""))?;
+        let store = session_store()?;
+        let hosts = store
+            .hosts()
+            .map_err(|e| with_keychain_hint(&e, Failure::from_core(&e, "")))?;
         if hosts.is_empty() {
             println!("No saved sign-ins. Run `ampsync login <link>` to add one.");
             return Ok(exit::OK);
@@ -265,7 +309,7 @@ pub async fn sessions() -> u8 {
                 Ok(None) => {}
                 Err(e) => eprintln!(
                     "warning: couldn't read the sign-in for {h}: {}",
-                    exit::describe(&e, "")
+                    with_keychain_hint(&e, Failure::from_core(&e, "")).message
                 ),
             }
         }
@@ -301,8 +345,8 @@ pub async fn sessions() -> u8 {
 pub async fn ls(args: LsArgs) -> u8 {
     run(async {
         let link = parse_link(&args.url)?;
-        let store = KeyringStore::new();
-        let session = require_session(&store, &link.host, &args.url)?;
+        let store = session_store()?;
+        let session = require_session(&*store, &link.host, &args.url)?;
         let remote = ClassicRemote::new(&session);
         let fail = |e: Error| Failure::from_core(&e, &args.url);
 
@@ -348,6 +392,18 @@ pub fn stdin_is_terminal() -> bool {
 mod tests {
     use super::*;
     use ampsync_core::auth::BrowserKind;
+
+    #[test]
+    fn keychain_hint_only_for_keychain_failures_on_linux_with_keychain_selected() {
+        let kc = Error::State("keychain: No default store has been set".into());
+        assert!(keychain_hint_applies(true, true, &kc));
+        assert!(!keychain_hint_applies(false, true, &kc));
+        assert!(!keychain_hint_applies(true, false, &kc));
+        let other_state = Error::State("keychain entry for h is damaged".into());
+        assert!(!keychain_hint_applies(true, true, &other_state));
+        let not_state = Error::NotFound("x".into());
+        assert!(!keychain_hint_applies(true, true, &not_state));
+    }
 
     #[test]
     fn hosts_are_normalised() {
