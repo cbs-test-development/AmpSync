@@ -3,7 +3,7 @@
 This guide is for building an automated pipeline that downloads SharePoint data with the Linux command-line program, `ampsync`, inside a container. It works the same with Docker and Podman; the examples use `docker`, and you can replace it with `podman`.
 
 > [!NOTE]
-> The features described here (`--cookie-file -` and `AMPSYNC_SESSION_STORE`) are new in the next release. Earlier versions do not have them.
+> The features described here (`--cookie-file -` and `AMPSYNC_SESSION_STORE`) are new in 1.2.1. Earlier versions do not have them.
 
 ## What is different in a container
 
@@ -74,7 +74,7 @@ The release archive is `ampsync-<version>-x86_64-unknown-linux-gnu.tar.gz` on th
 ```dockerfile
 FROM debian:bookworm-slim
 
-# Replace with the version you want, e.g. 1.3.0
+# Replace with the version you want, e.g. 1.2.1
 ARG AMPSYNC_VERSION
 
 RUN apt-get update \
@@ -100,7 +100,7 @@ ENTRYPOINT ["ampsync"]
 Build it:
 
 ```bash
-docker build --build-arg AMPSYNC_VERSION=1.3.0 -t ampsync .
+docker build --build-arg AMPSYNC_VERSION=1.2.1 -t ampsync .
 ```
 
 To check the download against the published checksums, compare it with `SHA256SUMS.txt` on the release page.
