@@ -1810,11 +1810,65 @@ async fn auto_tuning_stays_under_the_request_budget() {
         // (hysteresis), but the server never sees more than the budget allows.
         let busiest = fake.max_requests_within(window);
         assert!(busiest < 130, "{busiest} requests within {window:?}: {changes:?}");
-        // Once over budget, files are fetched with larger ranges.
+        // Whether any file starts after the budget is reached depends on how fast the climb
+        // goes, which varies with the machine; `over_budget_files_use_larger_ranges` covers it.
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn over_budget_files_use_larger_ranges() {
+    guarded(async {
+        // The budget is reached at once, at the starting four lanes, so the files that start
+        // later all see it. Four lanes with 256 KiB ranges at 1 MiB/s per connection make about
+        // 16 requests a second, 48 projected per 3 s window, against a soft limit of 16
+        // (20 * 0.8): crossed in the first 500 ms window, even at half speed (24 > 16). Files
+        // started afterwards use 512 KiB ranges: about 8 requests a second, 24 per 3 s, twice
+        // the exit level of 12 (16 * 0.75), so hysteresis keeps the budget on, and at half
+        // speed it is still 12 or more. 4 MiB files take seconds at 1 MiB/s, so most of the 12
+        // files start after the first window.
+        let fake = Fake::start().await;
+        fake.bandwidth(None, Some(MIB as u64));
+        let body = data(8, 4 * MIB);
+        for i in 0..12 {
+            fake.add_file(&key(&format!("g{i:02}.bin")), body.clone());
+        }
+        let dest = tempfile::tempdir().unwrap();
+        let cfg = AutoTuneConfig {
+            request_limit: 20,
+            ..sim_cfg()
+        };
+        let e = auto_engine(&fake, cfg);
+
+        let (summary, events) = run_watching(&e, spec(dest.path()), |_| {}).await;
+
+        assert_eq!((summary.downloaded, summary.failed), (12, 0));
+        let changes = lane_changes(&events);
         assert!(
-            fake.downloads().iter().any(|(_, s, e)| e - s > 256 * KIB as u64),
-            "no range was larger than the configured size"
+            changes.iter().any(|c| c.1 == LanesReason::Budget),
+            "the budget must have been reached: {changes:?}"
         );
+        let downloads = fake.downloads();
+        assert!(
+            downloads.iter().any(|(_, s, e)| e - s > 256 * KIB as u64),
+            "no range was larger than the configured size: {changes:?}"
+        );
+        // A file's ranges lie on one grid, fixed when the file starts: all the same length
+        // (4 MiB divides evenly into both sizes, so the last range is full as well).
+        let mut lengths: std::collections::HashMap<String, std::collections::BTreeSet<u64>> =
+            std::collections::HashMap::new();
+        for (k, s, e) in &downloads {
+            lengths.entry(k.clone()).or_default().insert(e - s);
+        }
+        assert_eq!(lengths.len(), 12, "{lengths:?}");
+        for (k, sizes) in &lengths {
+            assert!(
+                sizes.len() == 1
+                    && (sizes.contains(&(256 * KIB as u64)) || sizes.contains(&(512 * KIB as u64))),
+                "{k} mixed range sizes: {sizes:?}"
+            );
+        }
+        assert!(no_part_files(dest.path()));
     })
     .await;
 }
