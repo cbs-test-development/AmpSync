@@ -16,15 +16,15 @@
     "@fontsource/ibm-plex-sans": "^5.2.5",
     "@fontsource/ibm-plex-sans-condensed": "^5.2.5",
     "@tauri-apps/api": "^2.12.0",
-    "@tauri-apps/plugin-dialog": "^2.8.0"
+    "@tauri-apps/plugin-dialog": "^2.8.4"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tauri-apps/cli": "2.12.4",
-    "svelte": "^5.57.0",
-    "svelte-check": "^4.7.0",
+    "svelte": "^5.57.3",
+    "svelte-check": "^4.7.8",
     "typescript": "~6.0.3",
-    "vite": "^8.0.0",
-    "vitest": "^5.0.5"
+    "vite": "^8.3.7",
+    "vitest": "^5.1.0"
   }
 }
