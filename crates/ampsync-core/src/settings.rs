@@ -369,9 +369,13 @@ notify_on_finish = false
         assert!(!text.contains("link_nudge_dismissed_at"), "{text}");
         assert_eq!(Settings::load_from(&path).unwrap(), d);
         // A file without the new keys gets the new defaults.
-        std::fs::write(&path, "tour_seen = true
+        std::fs::write(
+            &path,
+            "tour_seen = true
 splash = \"off\"
-").unwrap();
+",
+        )
+        .unwrap();
         let old = Settings::load_from(&path).unwrap();
         assert!(!old.browser_link && old.renew_in_background && old.link_nudge_dismissed_at.is_none());
         // New fields round-trip.
@@ -390,12 +394,17 @@ splash = \"off\"
             serde_json::to_string(&SignInChoice::BrowserLink).unwrap(),
             "\"browser_link\""
         );
-        assert_eq!(SignInChoice::from_method("browser_link"), Some(SignInChoice::BrowserLink));
-        for c in [SignInChoice::Window, SignInChoice::Edge, SignInChoice::Chrome, SignInChoice::BrowserLink] {
-            assert_eq!(
-                serde_json::to_string(&c).unwrap(),
-                format!("\"{}\"", c.as_str())
-            );
+        assert_eq!(
+            SignInChoice::from_method("browser_link"),
+            Some(SignInChoice::BrowserLink)
+        );
+        for c in [
+            SignInChoice::Window,
+            SignInChoice::Edge,
+            SignInChoice::Chrome,
+            SignInChoice::BrowserLink,
+        ] {
+            assert_eq!(serde_json::to_string(&c).unwrap(), format!("\"{}\"", c.as_str()));
         }
     }
 

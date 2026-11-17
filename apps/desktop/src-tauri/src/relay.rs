@@ -148,7 +148,11 @@ fn spawn_line_reader(rd: Rd) -> mpsc::UnboundedReceiver<Vec<u8>> {
         let mut rd = BufReader::new(rd);
         loop {
             let mut buf = Vec::new();
-            match (&mut rd).take(MAX_MESSAGE as u64 + 1).read_until(b'\n', &mut buf).await {
+            match (&mut rd)
+                .take(MAX_MESSAGE as u64 + 1)
+                .read_until(b'\n', &mut buf)
+                .await
+            {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }

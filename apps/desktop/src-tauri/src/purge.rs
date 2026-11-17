@@ -51,7 +51,11 @@ fn purge_everything() -> Result<PurgeReport, Error> {
     let mut report = ampsync_core::purge_all()?;
     let (removed, errors) = crate::link_setup::unregister_host();
     report.registry_entries += removed;
-    report.errors.extend(errors.into_iter().map(|e| format!("browser link registration: {e}")));
+    report.errors.extend(
+        errors
+            .into_iter()
+            .map(|e| format!("browser link registration: {e}")),
+    );
     Ok(report)
 }
 

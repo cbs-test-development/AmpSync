@@ -89,7 +89,12 @@ impl Stats {
 
 /// The nudge under "Sign-in expired": the link is not set up, the person was asked to sign in at
 /// least twice this week, and has not said "not now" in the last 14 days.
-pub fn nudge(enabled: bool, prompts_7d: usize, dismissed_at: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
+pub fn nudge(
+    enabled: bool,
+    prompts_7d: usize,
+    dismissed_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> bool {
     !enabled
         && prompts_7d >= 2
         && dismissed_at.is_none_or(|d| now.unix_timestamp() - d.unix_timestamp() >= NUDGE_QUIET_SECS)
@@ -138,7 +143,12 @@ pub fn build_status(
             .and_then(|d| d.format(&time::format_description::well_known::Rfc3339).ok()),
         renewals_7d: stats.renewals_7d(t),
         prompts_7d,
-        nudge: nudge(settings.browser_link, prompts_7d, settings.link_nudge_dismissed_at, now),
+        nudge: nudge(
+            settings.browser_link,
+            prompts_7d,
+            settings.link_nudge_dismissed_at,
+            now,
+        ),
         folder,
     }
 }
@@ -302,7 +312,9 @@ impl Link {
             hello.as_ref(),
             &g.stats,
             OffsetDateTime::now_utc(),
-            crate::link_setup::extension_folder().to_string_lossy().to_string(),
+            crate::link_setup::extension_folder()
+                .to_string_lossy()
+                .to_string(),
         )
     }
 
@@ -327,7 +339,8 @@ impl Link {
             };
             let id = format!("{prefix}{}", g.next_request);
             g.next_request += 1;
-            let line = browser_link::encode_line(&build(id.clone())).map_err(|e| Error::State(e.to_string()))?;
+            let line =
+                browser_link::encode_line(&build(id.clone())).map_err(|e| Error::State(e.to_string()))?;
             let (otx, orx) = oneshot::channel();
             g.pending.insert(
                 id.clone(),
@@ -348,15 +361,26 @@ impl Link {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::State("The browser link was disconnected.".into())),
-            Err(_) => Err(Error::AuthExpired { host: host.to_string() }),
+            Err(_) => Err(Error::AuthExpired {
+                host: host.to_string(),
+            }),
         }
     }
 
     /// Ask the extension for the browser's current session for `host`. Silent: no tab the user has
     /// to look at, unless the browser needs a moment to sign in. `interactive`: leave a tab open so
     /// the user can finish signing in (up to 200 s).
-    pub async fn request_refresh(&self, host: &str, start_url: &Url, interactive: bool) -> Result<Session, Error> {
-        let timeout = if interactive { INTERACTIVE_TIMEOUT } else { SILENT_TIMEOUT };
+    pub async fn request_refresh(
+        &self,
+        host: &str,
+        start_url: &Url,
+        interactive: bool,
+    ) -> Result<Session, Error> {
+        let timeout = if interactive {
+            INTERACTIVE_TIMEOUT
+        } else {
+            SILENT_TIMEOUT
+        };
         let reply = self
             .round_trip(
                 'r',
@@ -407,7 +431,9 @@ pub fn emit_state(app: &AppHandle) {
 
 fn error_for(code: ErrorCode, host: &str) -> Error {
     match code {
-        ErrorCode::SigninRequired | ErrorCode::Timeout => Error::AuthExpired { host: host.to_string() },
+        ErrorCode::SigninRequired | ErrorCode::Timeout => Error::AuthExpired {
+            host: host.to_string(),
+        },
         ErrorCode::NoPermission => Error::State(format!(
             "The AmpSync browser extension is not allowed to read {host}. Allow it on SharePoint sites in the browser's extension settings."
         )),
@@ -458,7 +484,9 @@ async fn handle_message(app: &AppHandle, conn: u64, msg: FromExtension) {
             let app2 = app.clone();
             tauri::async_runtime::spawn(async move { renew_expired(&app2).await });
         }
-        FromExtension::Session { id, host, cookies, .. } => {
+        FromExtension::Session {
+            id, host, cookies, ..
+        } => {
             let Some(kind) = state.link.browser_of(conn) else {
                 return; // no hello yet
             };
@@ -559,7 +587,11 @@ where
     let mut rd = BufReader::new(rd);
     loop {
         let mut buf = Vec::new();
-        match (&mut rd).take(MAX_MESSAGE as u64 + 1).read_until(b'\n', &mut buf).await {
+        match (&mut rd)
+            .take(MAX_MESSAGE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .await
+        {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
@@ -577,10 +609,7 @@ where
 }
 
 #[cfg(windows)]
-fn create_pipe(
-    name: &str,
-    first: bool,
-) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+fn create_pipe(name: &str, first: bool) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use tokio::net::windows::named_pipe::ServerOptions;
     let sid = crate::link_ipc::current_user_sid()?;
     // Only this user may open the pipe; remote clients are refused outright.
@@ -789,7 +818,11 @@ mod tests {
         let link = Link::new(std::env::temp_dir().join(format!("ampsync-linkreq-{}", std::process::id())));
         assert!(!link.is_connected());
         let url = Url::parse("https://contoso.sharepoint.com/").unwrap();
-        assert!(link.request_refresh("contoso.sharepoint.com", &url, false).await.is_err());
+        assert!(
+            link.request_refresh("contoso.sharepoint.com", &url, false)
+                .await
+                .is_err()
+        );
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let conn = link.add_conn(tx);
@@ -809,7 +842,9 @@ mod tests {
         let answer = async {
             let line = rx.recv().await.unwrap();
             let msg: ToExtension = serde_json::from_slice(&line).unwrap();
-            let ToExtension::Ping { id } = msg else { panic!("{msg:?}") };
+            let ToExtension::Ping { id } = msg else {
+                panic!("{msg:?}")
+            };
             link.resolve(&id, Ok(None));
         };
         let (ok, ()) = tokio::join!(ping, answer);
@@ -832,7 +867,10 @@ mod tests {
             error_for(ErrorCode::SigninRequired, "a.sharepoint.com"),
             Error::AuthExpired { .. }
         ));
-        assert!(matches!(error_for(ErrorCode::Timeout, "a"), Error::AuthExpired { .. }));
+        assert!(matches!(
+            error_for(ErrorCode::Timeout, "a"),
+            Error::AuthExpired { .. }
+        ));
         assert!(matches!(error_for(ErrorCode::NoPermission, "a"), Error::State(_)));
         assert!(matches!(error_for(ErrorCode::BadRequest, "a"), Error::State(_)));
     }

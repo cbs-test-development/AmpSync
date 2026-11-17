@@ -180,9 +180,10 @@ pub fn validate_session(
         }
         let expires = match c.expires {
             None => None,
-            Some(secs) => Some(OffsetDateTime::from_unix_timestamp(secs).map_err(|_| {
-                Error::State(format!("cookie {} has an invalid expiry", c.name))
-            })?),
+            Some(secs) => Some(
+                OffsetDateTime::from_unix_timestamp(secs)
+                    .map_err(|_| Error::State(format!("cookie {} has an invalid expiry", c.name)))?,
+            ),
         };
         kept.push(SessionCookie {
             name: c.name.clone(),
@@ -397,10 +398,9 @@ mod tests {
 
     #[test]
     fn parses_every_message_type() {
-        let m: FromExtension = serde_json::from_str(
-            r#"{"type":"hello","ext_version":"1.0.0","browser":"edge","protocol":1}"#,
-        )
-        .unwrap();
+        let m: FromExtension =
+            serde_json::from_str(r#"{"type":"hello","ext_version":"1.0.0","browser":"edge","protocol":1}"#)
+                .unwrap();
         assert_eq!(
             m,
             FromExtension::Hello {
@@ -453,7 +453,10 @@ mod tests {
         ] {
             let m: FromExtension =
                 serde_json::from_str(&format!(r#"{{"type":"error","id":"a","code":"{text}"}}"#)).unwrap();
-            assert!(matches!(m, FromExtension::Error { code: c, .. } if c == code), "{text}");
+            assert!(
+                matches!(m, FromExtension::Error { code: c, .. } if c == code),
+                "{text}"
+            );
         }
     }
 
@@ -614,7 +617,10 @@ mod tests {
         assert!(write_native_frame(&mut Vec::new(), &big).is_err());
         let mut w = Vec::new();
         write_native_frame(&mut w, &vec![b'a'; MAX_INCOMING]).unwrap();
-        assert_eq!(read_native_frame(&mut io::Cursor::new(w)).unwrap().unwrap().len(), MAX_INCOMING);
+        assert_eq!(
+            read_native_frame(&mut io::Cursor::new(w)).unwrap().unwrap().len(),
+            MAX_INCOMING
+        );
 
         let header = ((MAX_INCOMING + 1) as u32).to_le_bytes().to_vec();
         assert!(read_native_frame(&mut io::Cursor::new(header)).is_err());
@@ -656,13 +662,19 @@ mod tests {
         assert_ne!(a, pipe_name_for("S-1-5-21-1-2-3-1002"));
         let hex = a.strip_prefix(r"\\.\pipe\ampsync-link-").unwrap();
         assert_eq!(hex.len(), 16);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]
     fn places() {
         let data = Path::new("/data");
-        assert_eq!(socket_path(Some(Path::new("/run/user/1000")), data), Path::new("/run/user/1000/ampsync-link.sock"));
+        assert_eq!(
+            socket_path(Some(Path::new("/run/user/1000")), data),
+            Path::new("/run/user/1000/ampsync-link.sock")
+        );
         assert_eq!(socket_path(None, data), Path::new("/data/link.sock"));
         assert_eq!(extension_dir(data), Path::new("/data/browser-link"));
         assert_eq!(native_host_dir(data), Path::new("/data/native-host"));
@@ -671,8 +683,12 @@ mod tests {
             Path::new("/data/native-host").join("io.github.ampsync.browserlink.json")
         );
         assert_eq!(signin_stats_path(data), Path::new("/data/signin-stats.json"));
-        assert!(is_allowed_origin("chrome-extension://foohiaphdliphaogfjlahdmbjemmaocp/"));
-        assert!(!is_allowed_origin("chrome-extension://foohiaphdliphaogfjlahdmbjemmaocp"));
+        assert!(is_allowed_origin(
+            "chrome-extension://foohiaphdliphaogfjlahdmbjemmaocp/"
+        ));
+        assert!(!is_allowed_origin(
+            "chrome-extension://foohiaphdliphaogfjlahdmbjemmaocp"
+        ));
         assert!(!is_allowed_origin("chrome-extension://other/"));
         assert!(ALLOWED_ORIGIN.contains(EXTENSION_ID));
     }
@@ -692,11 +708,15 @@ mod tests {
         let files = linux_manifest_targets(Path::new("/home/u/.config"));
         assert_eq!(
             files[0].path,
-            Path::new("/home/u/.config/microsoft-edge/NativeMessagingHosts/io.github.ampsync.browserlink.json")
+            Path::new(
+                "/home/u/.config/microsoft-edge/NativeMessagingHosts/io.github.ampsync.browserlink.json"
+            )
         );
         assert_eq!(
             files[1].path,
-            Path::new("/home/u/.config/google-chrome/NativeMessagingHosts/io.github.ampsync.browserlink.json")
+            Path::new(
+                "/home/u/.config/google-chrome/NativeMessagingHosts/io.github.ampsync.browserlink.json"
+            )
         );
         assert_eq!(files[1].browser, BrowserKind::Chrome);
     }

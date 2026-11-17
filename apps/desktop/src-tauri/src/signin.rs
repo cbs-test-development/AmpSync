@@ -223,7 +223,13 @@ impl SignInCoordinator {
     }
 
     /// Ask the user's own browser for its session through the browser link; Cancel stops the wait.
-    async fn run_link(&self, app: &AppHandle, host: &str, start_url: &Url, interactive: bool) -> Result<Session, Error> {
+    async fn run_link(
+        &self,
+        app: &AppHandle,
+        host: &str,
+        start_url: &Url,
+        interactive: bool,
+    ) -> Result<Session, Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         *self.link_cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
         let state = app.state::<crate::AppState>();

@@ -62,12 +62,13 @@ fn main() {
 /// extension folder except its unit tests and README (neither belongs in a browser profile).
 /// A missing folder (a source archive without it) yields an empty table rather than a failed build.
 fn embed_extension() {
-    let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("extensions")
-        .join("browser-link");
+    let root =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("extensions")
+            .join("browser-link");
     println!("cargo:rerun-if-changed={}", root.display());
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     collect_extension_files(&root, "", &mut files);
@@ -76,10 +77,14 @@ fn embed_extension() {
     for (name, path) in &files {
         println!("cargo:rerun-if-changed={}", path.display());
         // `{:?}` escapes backslashes in Windows paths.
-        code.push_str(&format!("    ({name:?}, include_bytes!({:?})),\n", path.to_string_lossy()));
+        code.push_str(&format!(
+            "    ({name:?}, include_bytes!({:?})),\n",
+            path.to_string_lossy()
+        ));
     }
     code.push_str("];\n");
-    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("extension_files.rs");
+    let out =
+        PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("extension_files.rs");
     std::fs::write(out, code).expect("cannot write extension_files.rs");
 }
 
@@ -96,15 +101,12 @@ fn collect_extension_files(dir: &std::path::Path, prefix: &str, out: &mut Vec<(S
             format!("{prefix}/{name}")
         };
         match entry.file_type() {
-            Ok(t) if t.is_dir() => {
-                if name != "test" && name != "node_modules" {
-                    collect_extension_files(&path, &rel, out);
-                }
+            // Tests and the README are for developers, not for the unpacked extension.
+            Ok(t) if t.is_dir() && name != "test" && name != "node_modules" => {
+                collect_extension_files(&path, &rel, out);
             }
-            Ok(t) if t.is_file() => {
-                if !(prefix.is_empty() && name.eq_ignore_ascii_case("README.md")) {
-                    out.push((rel, path));
-                }
+            Ok(t) if t.is_file() && !(prefix.is_empty() && name.eq_ignore_ascii_case("README.md")) => {
+                out.push((rel, path));
             }
             _ => {}
         }

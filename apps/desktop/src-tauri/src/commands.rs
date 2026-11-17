@@ -681,12 +681,16 @@ pub async fn link_test(app: AppHandle) -> CmdResult<LinkTest> {
         BrowserKind::Chrome => "Chrome",
     };
     if !state.link.ping().await {
-        return fail(format!("{browser} did not answer. Reload the AmpSync extension and try again."));
+        return fail(format!(
+            "{browser} did not answer. Reload the AmpSync extension and try again."
+        ));
     }
     let Some(host) = state.store.hosts()?.into_iter().next() else {
         return Ok(LinkTest {
             ok: true,
-            message: format!("{browser} answered. Download from SharePoint once and AmpSync will keep the sign-in fresh."),
+            message: format!(
+                "{browser} answered. Download from SharePoint once and AmpSync will keep the sign-in fresh."
+            ),
         });
     };
     let Some(url) = crate::link::start_url_for(&app, &host) else {
@@ -716,7 +720,9 @@ pub fn link_unlink(app: AppHandle) -> CmdResult<()> {
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn link_dismiss_nudge(app: AppHandle) -> CmdResult<()> {
-    crate::link::update_settings(&app, |s| s.link_nudge_dismissed_at = Some(time::OffsetDateTime::now_utc()))?;
+    crate::link::update_settings(&app, |s| {
+        s.link_nudge_dismissed_at = Some(time::OffsetDateTime::now_utc())
+    })?;
     crate::link::emit_state(&app);
     Ok(())
 }

@@ -63,7 +63,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= u32::from(b);
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -132,7 +136,9 @@ fn zip_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
 /// Write the embedded extension as a zip to `dest`.
 pub fn save_zip(dest: &Path) -> Result<(), Error> {
     if EXTENSION_FILES.is_empty() {
-        return Err(Error::State("this build does not include the browser extension".into()));
+        return Err(Error::State(
+            "this build does not include the browser extension".into(),
+        ));
     }
     std::fs::write(dest, zip_bytes(EXTENSION_FILES)).map_err(|e| Error::io(dest, e))
 }
@@ -156,12 +162,19 @@ fn register_platform(manifest: &Path, _text: &str) -> Result<(), Error> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let value = manifest.to_string_lossy().to_string();
     for target in browser_link::registry_targets() {
-        let (key, _) = hkcu
-            .create_subkey(&target.subkey)
-            .map_err(|e| Error::State(format!("cannot register the browser link ({}): {e}", target.subkey)))?;
+        let (key, _) = hkcu.create_subkey(&target.subkey).map_err(|e| {
+            Error::State(format!(
+                "cannot register the browser link ({}): {e}",
+                target.subkey
+            ))
+        })?;
         // The default value (empty name) is the path of the manifest.
-        key.set_value("", &value)
-            .map_err(|e| Error::State(format!("cannot register the browser link ({}): {e}", target.subkey)))?;
+        key.set_value("", &value).map_err(|e| {
+            Error::State(format!(
+                "cannot register the browser link ({}): {e}",
+                target.subkey
+            ))
+        })?;
     }
     Ok(())
 }
@@ -226,7 +239,9 @@ pub fn unlink() -> Result<(), Error> {
         tracing::warn!("could not remove the browser link host manifest: {e}");
     }
     match errors.first() {
-        Some(first) => Err(Error::State(format!("could not remove the browser link registration: {first}"))),
+        Some(first) => Err(Error::State(format!(
+            "could not remove the browser link registration: {first}"
+        ))),
         None => Ok(()),
     }
 }
@@ -234,7 +249,8 @@ pub fn unlink() -> Result<(), Error> {
 /// Register the native host for this exe and unpack the extension; returns the extension folder.
 /// Run at launch when the link is on, and by `link_prepare`.
 pub fn prepare() -> Result<PathBuf, Error> {
-    let exe = std::env::current_exe().map_err(|e| Error::State(format!("cannot find AmpSync's own path: {e}")))?;
+    let exe =
+        std::env::current_exe().map_err(|e| Error::State(format!("cannot find AmpSync's own path: {e}")))?;
     register_host(&data_dir(), &exe)?;
     extract_extension()?;
     Ok(extension_folder())
@@ -309,7 +325,8 @@ mod tests {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!("ampsync-linksetup-{tag}-{}-{nanos}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ampsync-linksetup-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -374,6 +391,10 @@ mod tests {
     fn the_embedded_extension_has_a_manifest_and_no_tests() {
         // The extension folder ships with the repository, so a build without it is a mistake.
         assert!(EXTENSION_FILES.iter().any(|(n, _)| *n == "manifest.json"));
-        assert!(EXTENSION_FILES.iter().all(|(n, _)| !n.starts_with("test/") && *n != "README.md"));
+        assert!(
+            EXTENSION_FILES
+                .iter()
+                .all(|(n, _)| !n.starts_with("test/") && *n != "README.md")
+        );
     }
 }
