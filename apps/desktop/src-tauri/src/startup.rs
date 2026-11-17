@@ -3,6 +3,9 @@
 //! For every saved host: one cheap authenticated request. If the session is gone, try a silent
 //! refresh in a hidden window with AmpSync's own profile. Only when that fails and a queued job
 //! needs the host does the sign-in window open, and it opens before any job starts.
+//!
+//! With the browser link on, the extension is registered and unpacked first, and the user's own
+//! browser is asked before the hidden window (`SignInCoordinator::obtain` does the asking).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,6 +14,9 @@ use tauri::{AppHandle, Manager, Url};
 
 use crate::AppState;
 use crate::signin::{Validity, site_url_of, validate};
+
+/// How long the launch-time check waits for a browser extension to attach before it falls back.
+const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// The launch-time check has answered for every saved sign-in (the startup splash waits for it).
 static CHECKED: AtomicBool = AtomicBool::new(false);
@@ -21,6 +27,15 @@ pub fn checked() -> bool {
 
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        if app.state::<AppState>().settings().browser_link {
+            // Keeps the registration pointing at this exe (a portable exe may have moved) and the
+            // unpacked extension at this version.
+            match tauri::async_runtime::spawn_blocking(crate::link_setup::prepare).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("browser link set-up failed: {e}"),
+                Err(e) => tracing::warn!("browser link set-up failed: {e}"),
+            }
+        }
         check_all(&app, true).await;
         CHECKED.store(true, Ordering::SeqCst);
         app.state::<AppState>().queue.open_gate();
@@ -32,6 +47,7 @@ pub async fn check_all(app: &AppHandle, allow_window: bool) {
     let state = app.state::<AppState>();
     let hosts = state.store.hosts().unwrap_or_default();
     let pending = state.queue.pending_hosts();
+    let mut waited_for_link = false;
     for host in hosts {
         let Ok(Some(session)) = state.store.load(&host) else {
             continue;
@@ -58,6 +74,11 @@ pub async fn check_all(app: &AppHandle, allow_window: bool) {
                 continue;
             }
             Validity::Invalid => {}
+        }
+        // The relay retries the app every 5 s, so an open browser attaches within moments of launch.
+        if !waited_for_link && state.settings().browser_link && !state.link.is_connected() {
+            waited_for_link = true;
+            state.link.wait_connected(LINK_WAIT).await;
         }
         let interactive = allow_window && pending.contains(&host);
         match state.signin.obtain(app, &host, &url, true, interactive).await {

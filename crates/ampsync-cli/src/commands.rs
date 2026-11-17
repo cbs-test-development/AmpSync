@@ -125,6 +125,10 @@ pub fn method_label(m: &SignInMethod) -> &'static str {
             ampsync_core::auth::BrowserKind::Chrome => "chrome",
         },
         SignInMethod::Pasted => "pasted",
+        SignInMethod::BrowserLink { kind } => match kind {
+            ampsync_core::auth::BrowserKind::Edge => "Edge (browser link)",
+            ampsync_core::auth::BrowserKind::Chrome => "Chrome (browser link)",
+        },
     }
 }
 
@@ -456,6 +460,18 @@ mod tests {
                 kind: BrowserKind::Edge
             }),
             "edge"
+        );
+        assert_eq!(
+            method_label(&SignInMethod::BrowserLink {
+                kind: BrowserKind::Edge
+            }),
+            "Edge (browser link)"
+        );
+        assert_eq!(
+            method_label(&SignInMethod::BrowserLink {
+                kind: BrowserKind::Chrome
+            }),
+            "Chrome (browser link)"
         );
     }
 
