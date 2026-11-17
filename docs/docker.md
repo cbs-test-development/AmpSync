@@ -74,7 +74,7 @@ The release archive is `ampsync-<version>-x86_64-unknown-linux-gnu.tar.gz` on th
 ```dockerfile
 FROM debian:bookworm-slim
 
-# Replace with the version you want, e.g. 1.2.1
+# Replace with the version you want, e.g. 1.3.0
 ARG AMPSYNC_VERSION
 
 RUN apt-get update \
@@ -100,7 +100,7 @@ ENTRYPOINT ["ampsync"]
 Build it:
 
 ```bash
-docker build --build-arg AMPSYNC_VERSION=1.2.1 -t ampsync .
+docker build --build-arg AMPSYNC_VERSION=1.3.0 -t ampsync .
 ```
 
 To check the download against the published checksums, compare it with `SHA256SUMS.txt` on the release page.
