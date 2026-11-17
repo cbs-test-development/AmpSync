@@ -34,6 +34,8 @@ pub enum SignInMethod {
     Browser { kind: BrowserKind },
     /// The user pasted a `Cookie` header.
     Pasted,
+    /// Cookies handed over by the AmpSync browser extension from the user's own `kind` profile.
+    BrowserLink { kind: BrowserKind },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

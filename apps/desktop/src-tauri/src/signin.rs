@@ -4,6 +4,9 @@
 //! is detected by polling the webview cookie store from an async task, never from a WebView2
 //! callback (that deadlocks). The same profile is used for silent refreshes: the SharePoint site
 //! is loaded in an invisible window and the cookies are polled for a while.
+//!
+//! When the browser link is connected (`link.rs`) the user's own browser is asked first, silently,
+//! and again with a visible tab before the chooser is shown.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +83,15 @@ unsafe impl Send for SendEnv {}
 #[cfg(windows)]
 unsafe impl Sync for SendEnv {}
 
+/// The remembered sign-in choice, as `obtain` may act on it without asking. A remembered browser
+/// link is only usable while the link is connected; otherwise the question is asked again.
+fn effective_choice(remembered: Option<SignInChoice>, link_usable: bool) -> Option<SignInChoice> {
+    match remembered {
+        Some(SignInChoice::BrowserLink) if !link_usable => None,
+        other => other,
+    }
+}
+
 /// The question "how do you want to sign in?" while the frontend shows it (D26).
 struct PendingChoice {
     host: String,
@@ -124,6 +136,8 @@ pub struct SignInCoordinator {
     pending: Mutex<Option<PendingChoice>>,
     /// Stops the sign-in browser that is running, if any.
     browser_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Stops the browser link request that is waiting, if any.
+    link_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(windows)]
     env: Mutex<Option<SendEnv>>,
     #[cfg(not(windows))]
@@ -143,6 +157,7 @@ impl SignInCoordinator {
             interactive_open: AtomicBool::new(false),
             pending: Mutex::new(None),
             browser_cancel: Mutex::new(None),
+            link_cancel: Mutex::new(None),
             #[cfg(windows)]
             env: Mutex::new(None),
             #[cfg(not(windows))]
@@ -207,9 +222,31 @@ impl SignInCoordinator {
         r
     }
 
-    /// Close any sign-in window, chooser or sign-in browser (used by Cancel).
+    /// Ask the user's own browser for its session through the browser link; Cancel stops the wait.
+    async fn run_link(
+        &self,
+        app: &AppHandle,
+        host: &str,
+        start_url: &Url,
+        interactive: bool,
+    ) -> Result<Session, Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.link_cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+        let state = app.state::<crate::AppState>();
+        let r = tokio::select! {
+            r = state.link.request_refresh(host, start_url, interactive) => r,
+            _ = rx => Err(Error::Cancelled),
+        };
+        self.link_cancel.lock().unwrap_or_else(|p| p.into_inner()).take();
+        r
+    }
+
+    /// Close any sign-in window, chooser, sign-in browser or link wait (used by Cancel).
     pub fn cancel(&self, app: &AppHandle) {
         self.resolve_choice(None);
+        if let Some(tx) = self.link_cancel.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = tx.send(());
+        }
         if let Some(tx) = self
             .browser_cancel
             .lock()
@@ -235,8 +272,9 @@ impl SignInCoordinator {
         }
     }
 
-    /// Return a session that works, trying in order: the stored one, a silent refresh in the
-    /// hidden window, then (if `interactive`) the visible sign-in window.
+    /// Return a session that works, trying in order: the stored one, the user's browser through
+    /// the browser link (silent), a silent refresh in the hidden window, then (if `interactive`)
+    /// the browser link with a visible tab, and finally the chooser or the remembered way.
     ///
     /// `force` skips the stored session (used after the server said it expired).
     pub async fn obtain(
@@ -266,6 +304,20 @@ impl SignInCoordinator {
         }
         let settings = state.settings();
         state.set_status(app, host, "checking");
+        // The browser link first: the user's own profile is usually signed in already.
+        if state.link.is_connected() {
+            match self.run_link(app, host, start_url, false).await {
+                Ok(s) => {
+                    if validate(&s, &site).await != Validity::Invalid {
+                        state.set_status(app, host, "active");
+                        return Ok(s);
+                    }
+                    tracing::info!("the browser link returned a session SharePoint does not accept");
+                }
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(e) => tracing::info!("silent browser link refresh did not work: {e}"),
+            }
+        }
         if let Ok((s, verdict)) = self
             .run_window(app, host, start_url, &site, &settings, false)
             .await
@@ -280,27 +332,71 @@ impl SignInCoordinator {
         }
         let _open = OpenGuard::new(app, &self.interactive_open, host);
         crate::notify::send(app, &crate::notify::Trigger::SignInNeeded { host: host.into() });
-        let choice = match settings.sign_in_with {
-            Some(c) => Some(c),
-            None => self.ask(app, host).await,
-        };
-        let res = match choice {
-            None => Err(Error::Cancelled),
-            Some(SignInChoice::Window) => {
-                emit_state(app, host, "window_open");
-                self.run_window(app, host, start_url, &site, &settings, true)
-                    .await
+        // One interactive prompt, however many ways are tried: this feeds the "link your browser"
+        // nudge (`signin-stats.json`).
+        state.link.record_prompt();
+        crate::link::emit_state(app);
+        // Through the link first: "Finish signing in in Edge". If that does not work, the chooser
+        // (or the remembered way) is the fallback.
+        let mut link_tried = false;
+        if state.link.is_connected() {
+            link_tried = true;
+            emit_state(app, host, "link_open");
+            match self.run_link(app, host, start_url, true).await {
+                Ok(s) => {
+                    if validate(&s, &site).await != Validity::Invalid {
+                        state.store.save(&s)?;
+                        state.set_status(app, host, "active");
+                        return Ok(s);
+                    }
+                    tracing::info!("the browser link returned a session SharePoint does not accept");
+                }
+                Err(Error::Cancelled) => {
+                    state.set_status(app, host, "expired");
+                    return Err(Error::Cancelled);
+                }
+                Err(e) => tracing::info!("interactive browser link refresh did not work: {e}"),
             }
-            Some(c) => {
-                emit_state(app, host, "browser_open");
-                let kind = if c == SignInChoice::Edge {
-                    BrowserKind::Edge
-                } else {
-                    BrowserKind::Chrome
-                };
-                self.run_browser(kind, host, start_url)
-                    .await
-                    .map(|s| (s, Validity::Valid))
+        }
+        let mut choice = effective_choice(settings.sign_in_with, !link_tried && state.link.is_connected());
+        let res = loop {
+            let c = match choice.take() {
+                Some(c) => c,
+                None => match self.ask(app, host).await {
+                    Some(c) => c,
+                    None => break Err(Error::Cancelled),
+                },
+            };
+            match c {
+                SignInChoice::Window => {
+                    emit_state(app, host, "window_open");
+                    break self
+                        .run_window(app, host, start_url, &site, &settings, true)
+                        .await;
+                }
+                SignInChoice::BrowserLink => {
+                    if !state.link.is_connected() {
+                        // Nothing to hand over to: ask again.
+                        continue;
+                    }
+                    emit_state(app, host, "link_open");
+                    break self
+                        .run_link(app, host, start_url, true)
+                        .await
+                        .map(|s| (s, Validity::Valid));
+                }
+                SignInChoice::Edge | SignInChoice::Chrome => {
+                    emit_state(app, host, "browser_open");
+                    let kind = if c == SignInChoice::Edge {
+                        BrowserKind::Edge
+                    } else {
+                        BrowserKind::Chrome
+                    };
+                    break self
+                        .run_browser(kind, host, start_url)
+                        .await
+                        .map(|s| (s, Validity::Valid));
+                }
             }
         };
         match res {
@@ -641,6 +737,16 @@ mod tests {
             site("https://contoso.sharepoint.com/:f:/x"),
             "https://contoso.sharepoint.com/"
         );
+    }
+
+    #[test]
+    fn a_remembered_browser_link_is_only_used_while_connected() {
+        use SignInChoice::*;
+        assert_eq!(effective_choice(Some(BrowserLink), true), Some(BrowserLink));
+        assert_eq!(effective_choice(Some(BrowserLink), false), None);
+        assert_eq!(effective_choice(Some(Edge), false), Some(Edge));
+        assert_eq!(effective_choice(Some(Window), true), Some(Window));
+        assert_eq!(effective_choice(None, true), None);
     }
 
     #[test]

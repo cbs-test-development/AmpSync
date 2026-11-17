@@ -54,7 +54,7 @@ sha256sum AmpSync_1.2.1_amd64.AppImage
 3. **Pick folders.** AmpSync lists what is inside. Tick the folders you want, or leave everything ticked, and choose where to save them.
 4. **Download.** Press start. You see speed, time left and which files are in progress. You can pause, close the app and come back later.
 
-On the very first launch a short walkthrough points out each part of the window. You can skip it, and replay it from Settings.
+On the very first launch a short walkthrough points out each part of the window. You can skip it, and replay it from Settings. If you are asked to sign in often, you can link your Edge or Chrome to stop the prompts; see [Stop signing in](docs/user-guide.md#stop-signing-in-browser-link).
 
 More detail is in the [user guide](docs/user-guide.md).
 
@@ -62,8 +62,9 @@ More detail is in the [user guide](docs/user-guide.md).
 
 - **No telemetry.** AmpSync does not collect usage data and has no account of its own.
 - **Your sign-in stays on your machine**, in the operating system's keychain (Windows Credential Manager, or the Secret Service on Ubuntu).
-- **It never touches your browser profiles.** It does not read, copy or sign in to Edge, Chrome, Teams or anything else you use. Its own sign-in window keeps a separate profile in AmpSync's own folder, and "Sign out" deletes it.
-- **It talks to two places only:** your SharePoint tenant (to list and download the files you asked for) and GitHub (an optional once-a-day check for a newer release, which you can turn off in Settings). It never installs updates by itself.
+- **It never reads your browser profile files.** It does not read, copy or sign in to Edge, Chrome, Teams or anything else you use. Its own sign-in window keeps a separate profile in AmpSync's own folder, and "Sign out" deletes it.
+- **The browser link is opt-in.** If you set it up, a small AmpSync extension in your own Edge or Chrome shares only your SharePoint sign-in cookies with AmpSync on this computer. It never reads passwords, other sites or browsing history. It stays on this computer, and you can unlink it at any time in the Sign-ins view.
+- **It talks to two places only:** your SharePoint tenant (to list and download the files you asked for) and GitHub (an optional once-a-day check for a newer release, which you can turn off in Settings). The browser link stays on this computer. It never installs updates by itself.
 
 ## Command line
 

@@ -4,6 +4,9 @@
 //!   set and the network is reachable, fetch the contributors and their avatars from GitHub and
 //!   embed them as JSON with data URIs. Otherwise embed an empty list.
 //! - build identification: short commit id and target triple for the About page.
+//! - the browser link extension (`extensions/browser-link`), embedded as a table of file names and
+//!   `include_bytes!` so the app can unpack it for "Load unpacked" without a download (and so the
+//!   portable single-file exe still carries it).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -50,7 +53,64 @@ fn main() {
         std::env::var("TARGET").unwrap_or_default()
     );
 
+    embed_extension();
+
     tauri_build::build();
+}
+
+/// Write `$OUT_DIR/extension_files.rs`: `EXTENSION_FILES: &[(&str, &[u8])]` with every file of the
+/// extension folder except its unit tests and README (neither belongs in a browser profile).
+/// A missing folder (a source archive without it) yields an empty table rather than a failed build.
+fn embed_extension() {
+    let root =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("extensions")
+            .join("browser-link");
+    println!("cargo:rerun-if-changed={}", root.display());
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    collect_extension_files(&root, "", &mut files);
+    files.sort();
+    let mut code = String::from("pub static EXTENSION_FILES: &[(&str, &[u8])] = &[\n");
+    for (name, path) in &files {
+        println!("cargo:rerun-if-changed={}", path.display());
+        // `{:?}` escapes backslashes in Windows paths.
+        code.push_str(&format!(
+            "    ({name:?}, include_bytes!({:?})),\n",
+            path.to_string_lossy()
+        ));
+    }
+    code.push_str("];\n");
+    let out =
+        PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("extension_files.rs");
+    std::fs::write(out, code).expect("cannot write extension_files.rs");
+}
+
+fn collect_extension_files(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match entry.file_type() {
+            // Tests and the README are for developers, not for the unpacked extension.
+            Ok(t) if t.is_dir() && name != "test" && name != "node_modules" => {
+                collect_extension_files(&path, &rel, out);
+            }
+            Ok(t) if t.is_file() && !(prefix.is_empty() && name.eq_ignore_ascii_case("README.md")) => {
+                out.push((rel, path));
+            }
+            _ => {}
+        }
+    }
 }
 
 fn valid_slug(s: &str) -> bool {

@@ -9,6 +9,7 @@ This guide walks through a download from start to finish and explains what AmpSy
 - [Checking the disk first](#checking-the-disk-first)
 - [Signing in](#signing-in)
 - [When your sign-in expires](#when-your-sign-in-expires)
+- [Stop signing in: browser link](#stop-signing-in-browser-link)
 - [When the disk is full](#when-the-disk-is-full)
 - [Parallel lanes: Auto](#parallel-lanes-auto)
 - [Big files and the fill map](#big-files-and-the-fill-map)
@@ -49,16 +50,17 @@ It looks again whenever you change the **Save to** folder, when you come back to
 
 ## Signing in
 
-When AmpSync needs you to sign in (you pasted a link, or a queued download's sign-in ran out) and it cannot renew the session quietly, a small dialog opens in the AmpSync window, which comes forward if it was in the tray. It names the site and offers two ways:
+When AmpSync needs you to sign in (you pasted a link, or a queued download's sign-in ran out) and it cannot renew the session quietly, a small dialog opens in the AmpSync window, which comes forward if it was in the tray. It names the site and offers these ways:
 
+- **Through my browser** uses the browser link (see [Stop signing in](#stop-signing-in-browser-link)). If the link is not set up yet, it opens the setup guide instead.
 - **Via AmpSync** is the sign-in window inside the app (method 1 below). Recommended for personal devices.
 - **Via Edge or Chrome** opens that browser instead (method 2 below), with **Use Edge** and **Use Chrome** buttons. Recommended for work devices.
 
 **Remember my choice** is ticked by default, so the next sign-in goes straight to that method. Untick it to be asked again next time. **Cancel** (or Escape) closes the dialog without signing in; New download then shows the other ways to sign in, and a queued download waits as *needs sign-in*.
 
-You can change the remembered choice any time under **Sign-ins, When AmpSync needs you to sign in**: *Ask every time*, *AmpSync window*, *Edge* or *Chrome*. The **Sign in** button next to an expired site follows the same setting. The three-method form further down the Sign-ins view always lets you pick a method yourself.
+You can change the remembered choice any time under **Sign-ins, When AmpSync needs you to sign in**: *Ask every time*, *AmpSync window*, *Edge*, *Chrome* or *Browser link*. The **Sign in** button next to an expired site follows the same setting. The three-method form further down the Sign-ins view always lets you pick a method yourself.
 
-AmpSync uses your normal SharePoint sign-in, including multi-factor authentication. It tries three methods in order, and moves on only if the previous one does not work.
+AmpSync uses your normal SharePoint sign-in, including multi-factor authentication. If you have linked your browser, it tries that first. Then it tries three methods in order, and moves on only if the previous one does not work.
 
 ### 1. AmpSync window
 
@@ -98,6 +100,46 @@ SharePoint sessions end after a while, and very large downloads can outlast one.
 3. If Microsoft needs you to type a password or approve a prompt, the sign-in window opens. Sign in and the download resumes by itself.
 
 If you are away, it stays paused until you return. With the command line, the exit code is `3`; sign in again with `ampsync login` and run the same `ampsync get` command to continue.
+
+To stop these prompts, set up the [browser link](#stop-signing-in-browser-link). With the link connected, the sign-in finishes in your browser instead of an AmpSync window.
+
+## Stop signing in: browser link
+
+Some organisations end SharePoint sign-ins often. AmpSync then asks you to sign in again, sometimes in the middle of a long download. Your Edge or Chrome often stays signed in in the meantime. The browser link lets AmpSync use that sign-in, so you are asked less often.
+
+The browser link is optional. Nothing changes until you set it up. When it is on:
+
+- A small AmpSync extension in your own browser shares **only your SharePoint sign-in cookies** (`FedAuth` and `rtFa`, for SharePoint sites) with AmpSync on this computer.
+- It never reads passwords, other sites or your browsing history. It sends nothing over the network.
+- AmpSync still never reads your browser's profile files.
+
+### Set it up
+
+You install the extension by hand, and AmpSync guides you through it. You can open the guide from the **Sign-ins** view, from **Settings** under *Signing in*, or from the sign-in dialog.
+
+1. Open the extensions page: `edge://extensions` in Edge, or `chrome://extensions` in Chrome. The guide opens your browser and copies the address for you: paste it into the address bar (Ctrl+V) and press Enter. Browsers do not let other programs open these pages directly.
+2. Turn on **Developer mode**. In Edge it is at the bottom of the left panel. In Chrome it is at the top right.
+3. Click **Load unpacked** and choose the folder AmpSync shows. On Windows it is `%LOCALAPPDATA%\AmpSync\browser-link`. On Ubuntu it is `~/.local/share/ampsync/browser-link`. The guide has **Copy path** and, on Windows, **Show in Explorer**. If you would rather not use the folder, **Save the zip** saves the extension as a zip file.
+4. AmpSync connects to the extension by itself. The guide then shows **Linked to Edge** (or Chrome). You do not need to change anything else.
+
+### How it works after setup
+
+- AmpSync tries the browser link first whenever it needs a sign-in. This happens quietly, and you see nothing. If the link cannot renew the sign-in, AmpSync tries its other methods. If you are needed, the sign-in finishes in your browser instead of an AmpSync window.
+- While a download runs, AmpSync renews the sign-in through the link every 30 minutes. You can turn this off under **Settings, Signing in, Keep sign-ins fresh in the background**.
+- AmpSync keeps a session from the extension only for sites you already have a saved sign-in for, or that a queued download uses.
+- Sign-ins sent while AmpSync is closed are not kept. When AmpSync starts, it asks the browser for fresh ones.
+
+### Unlinking
+
+In the **Sign-ins** view, choose **Unlink**. AmpSync removes its registration with the browser and stops using the link. Your saved sign-ins stay. You can also remove the AmpSync extension on the browser's extensions page. That works as well.
+
+### Troubleshooting the browser link
+
+- **Edge says developer-mode extensions may be turned off.** Edge can show this message when it starts. Close the message with its X button. Do not choose to turn the extensions off, because that unlinks AmpSync.
+- **The extension is turned off.** AmpSync shows the link as disconnected. Turn the extension back on, and AmpSync connects again by itself.
+- **The extension popup says "AmpSync is not running".** Start AmpSync. The link only works while AmpSync is running, either in its window or in the tray.
+- **Your company blocks browser extensions.** The link only works where IT allows extensions. If it does not, the browser will not load the extension, or it removes it, and AmpSync shows the link as disconnected. AmpSync then uses its other sign-in methods, so downloads still work, but you may be asked to sign in more often. AmpSync cannot allow extensions for you; ask your IT team.
+- **Check it with Test now.** In the **Sign-ins** view, choose **Test now**. AmpSync checks that the browser answers and renews the sign-in for one of your saved sites, then shows the result. If the test fails, go through the items above first.
 
 ## When the disk is full
 
@@ -178,6 +220,7 @@ Settings save automatically.
 | Startup animation | **On**, **Reduced motion** or **Off**. See [Startup animation](#startup-animation). |
 | Remember passwords in the sign-in window | Off by default. |
 | Use the Windows work account (Windows) | Single sign-on with the account Windows is signed in with. On by default. |
+| Keep sign-ins fresh in the background | On by default. While a download runs, AmpSync renews the sign-in through a linked browser every 30 minutes. Needs the browser link. See [Stop signing in](#stop-signing-in-browser-link). |
 | Replay the walkthrough | Shows the first-run tour again. |
 | Remove all AmpSync data | Signs out everywhere and deletes AmpSync's settings, sign-ins and history, then restarts it fresh. Your downloaded files stay. See [Removing everything](#removing-everything). |
 
@@ -273,6 +316,7 @@ The disk-space check before the start applies to `--json` too: with too little s
 | Settings (`settings.toml`) | `%APPDATA%\AmpSync\config` | `~/.config/ampsync` |
 | App data: each job's progress (`jobs`), queue, sign-in window profile (`signin-profile`) | `%LOCALAPPDATA%\AmpSync\data` | `~/.local/share/ampsync` |
 | The app window's own WebView cache | `%LOCALAPPDATA%\io.github.ampsync.desktop` | `~/.local/share/io.github.ampsync.desktop` |
+| The browser link's extension folder (only if you set it up) | `%LOCALAPPDATA%\AmpSync\browser-link` | `~/.local/share/ampsync/browser-link` |
 | Sign-in sessions | Windows Credential Manager | Secret Service (keyring) |
 
 ## Running a download again
@@ -281,7 +325,7 @@ Run the same link and destination again at any time. AmpSync lists the folder, s
 
 ## Removing everything
 
-AmpSync keeps its own files in a few per-user folders and your sign-ins in the system keychain; your download folders hold nothing of AmpSync. Removing everything deletes every saved sign-in, the settings, the job progress and download history, the queue, the sign-in window's profile, the app window's cache and, on Windows, the small registry entry that lets notifications show as AmpSync. **Downloaded files are never touched.** Pick whichever fits how you installed it:
+AmpSync keeps its own files in a few per-user folders and your sign-ins in the system keychain; your download folders hold nothing of AmpSync. Removing everything deletes every saved sign-in, the settings, the job progress and download history, the queue, the sign-in window's profile, the app window's cache and, on Windows, the small registry entry that lets notifications show as AmpSync. If you set up the browser link, it also removes that link's registration with the browser, its extension folder and its sign-in prompt statistics. **Downloaded files are never touched.** Pick whichever fits how you installed it:
 
 - **Windows installer (uninstalling).** *Settings, Apps, AmpSync, Uninstall.* The uninstaller shows the box **Also remove my sign-ins, settings and download history (your downloaded files are not touched)**. It is **ticked by default**. Leave it ticked to remove everything, including the entries in Windows Credential Manager, or untick it to keep your sign-ins and settings for a later reinstall. If AmpSync is running, the uninstaller asks to close it first. Silent and update installs never remove your data. For scripted removal, run `uninstall.exe /S /REMOVEALL`.
 - **Without uninstalling (any install).** Open **Settings** and choose **Remove all data** under *Remove all AmpSync data*, then confirm. AmpSync signs you out everywhere, deletes its data, closes and starts again as if it was just installed (the walkthrough shows again).
@@ -297,7 +341,7 @@ AmpSync keeps its own files in a few per-user folders and your sign-ins in the s
 
 If you prefer to do it by hand:
 
-1. In **Sign-ins**, choose **Sign out** for every site. This deletes the stored session and the sign-in window's profile.
+1. In **Sign-ins**, unlink the browser link if you set it up, then choose **Sign out** for every site. This deletes the stored session and the sign-in window's profile.
 2. Uninstall AmpSync (Windows: *Settings, Apps*; Ubuntu: `sudo apt remove ampsync` for the .deb, or delete the AppImage).
 3. Delete AmpSync's data folders if they still exist:
 
@@ -319,7 +363,7 @@ If you used the command line, also run `ampsync sessions` and `ampsync logout <h
 
 ## Troubleshooting
 
-- **"Sign-in expired" keeps appearing.** Sign in again from the Sign-ins view. If your organisation shortens session lifetimes, a long job will pause more than once; it resumes each time.
+- **"Sign-in expired" keeps appearing.** Sign in again from the Sign-ins view. If your organisation shortens session lifetimes, a long job will pause more than once; it resumes each time. To stop these prompts, set up the [browser link](#stop-signing-in-browser-link).
 - **The sign-in window is blank or blocked.** Choose the Edge or Chrome method instead. To stop being offered the window, set **Sign-ins, When AmpSync needs you to sign in** to Edge or Chrome.
 - **Downloads are slow or pause for a while.** SharePoint asks apps to slow down when it is busy, and AmpSync obeys. On Auto it backs off by itself; with a fixed number, try fewer files at the same time.
 - **"D: is full" and the download stopped.** See [When the disk is full](#when-the-disk-is-full). Free some space and press Retry.

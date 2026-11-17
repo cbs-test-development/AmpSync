@@ -47,7 +47,7 @@ pub struct SplitPath {
 }
 
 /// Host suffixes accepted as SharePoint Online (commercial, GCC High/DoD, China, Germany).
-const SHAREPOINT_SUFFIXES: &[&str] = &[
+pub const SHAREPOINT_SUFFIXES: &[&str] = &[
     ".sharepoint.com",
     ".sharepoint.us",
     ".sharepoint.cn",
@@ -140,7 +140,8 @@ pub fn parse(input: &str) -> Result<ParsedLink, Error> {
     })
 }
 
-fn is_sharepoint_host(host: &str) -> bool {
+/// Whether `host` (already lower-case) is a tenant host under one of [`SHAREPOINT_SUFFIXES`].
+pub fn is_sharepoint_host(host: &str) -> bool {
     SHAREPOINT_SUFFIXES
         .iter()
         .any(|s| host.len() > s.len() && host.ends_with(s))

@@ -8,7 +8,7 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 |---|----------|-----|
 | D1 | Download only. Re-running a job mirrors: unchanged files are skipped, partial files resume, nothing local is deleted unless `--prune`. | Replaces OneDrive zip downloads; two-way sync is out of scope. |
 | D2 | Auth uses the user's SharePoint browser session (FedAuth / rtFa cookies). No Entra app registration. | Works in any tenant without IT involvement. |
-| D3 | Sign-in methods, tried in order: (1) embedded webview (persistent profile, see D15), (2) installed Edge/Chrome with a throwaway profile read over the DevTools protocol, (3) pasted `Cookie` header. | Conditional Access may block embedded webviews. |
+| D3 | Sign-in methods, tried in order: the browser link first when it is set up and connected (after a saved session, see D27), then (1) embedded webview (persistent profile, see D15), (2) installed Edge/Chrome with a throwaway profile read over the DevTools protocol, (3) pasted `Cookie` header. | Conditional Access may block embedded webviews. The browser link uses the user's own signed-in browser, so it does not depend on the webview. |
 | D4 | Zero config for users. The tenant host is taken from the pasted URL. Sessions live in the OS keychain, keyed by host. Settings are edited in the GUI and saved to `settings.toml` in the per-user config dir. | Non-developers must never edit a file. |
 | D5 | No hardcoded tenants, sites, URLs or company names anywhere in code. | Public, cross-org repo. |
 | D6 | Files are written to `<name>.ampsync-part`, downloaded in parallel byte ranges, verified (QuickXorHash when available, else size + unchanged eTag), then atomically renamed. | Corruption-proof, resumable. |
@@ -19,7 +19,7 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D11 | GUI is Tauri 2 + Svelte 5, with an approved "instrument panel" design (graphite + amber, IBM Plex). | |
 | D13 | First launch shows a skippable walkthrough: a dimmed overlay spotlights one control at a time with a short text box (Back / Next / Skip, step counter). It is replayable from Settings. The "seen" flag lives in `settings.toml`. | Non-developer users. |
 | D15 | The webview sign-in uses a persistent AmpSync-only browser profile (per-user data dir), separate from the user's browsers. On launch the app silently checks every saved session (hidden webview load of the site); if Microsoft needs a password or MFA, the sign-in window opens right then, before any download starts. Mid-job expiry also tries a silent refresh first and shows the window only if interaction is required. On Windows, WebView2 SSO with the OS work account is enabled, so managed machines sign in with no prompt. Password saving is a Settings toggle, off by default. "Sign out" deletes the profile and the stored session. | Personal machines otherwise hit MFA on every sign-in; prompts should come at launch, not halfway through an 80 GB job. |
-| D16 | AmpSync never reads, signs in to, or syncs with the user's existing browser profiles (Edge, Chrome, Teams, …). The webview profile lives only in AmpSync's own data dir. The Edge/Chrome fallback always launches a fresh AmpSync-owned `--user-data-dir` with `--disable-sync` and browser implicit sign-in disabled, and only the SharePoint web session is captured. No code path imports cookies or passwords from a browser profile. | User requirement; browser profiles hold personal and work identities that AmpSync must not touch. |
+| D16 | AmpSync never reads browser profile files, signs in to, or syncs with the user's existing browser profiles (Edge, Chrome, Teams, …). The one exception is the opt-in browser link (D27): an extension the user installs in their own browser shares only SharePoint sign-in cookies. The webview profile lives only in AmpSync's own data dir. The Edge/Chrome fallback always launches a fresh AmpSync-owned `--user-data-dir` with `--disable-sync` and browser implicit sign-in disabled, and only the SharePoint web session is captured. No AmpSync code path reads cookies or passwords from a browser profile; cookies arrive only from the extension (D27). | User requirement; browser profiles hold personal and work identities that AmpSync must not touch. The link is used only when the user installs it and turns it on. |
 | D17 | Release builds (installers, portable exe, AppImage, .deb, CLI binaries) run only when a `v*` tag is pushed, and publish a GitHub Release for that tag. Pushes to `main` build nothing. Pull requests run only fmt + clippy + tests on Windows and Ubuntu. `v1.0.0` is tagged after the user has tested on a personal and a work Windows machine. | Avoids burning CI and publishing artifacts on every push. |
 | D18 | Probe result (real tenant, 2026-10-22): with cookies, `/_api/v2.0/*` returns 403 and `SP.OAuth.Token/Acquire` returns 400, so no QuickXorHash. Classic REST listing works; `/_layouts/15/download.aspx?UniqueId=` honours Range (206); `GetFileByServerRelativePath/$value` ignores Range. v1 ships `ClassicRemote` only; verification is exact size + eTag unchanged (re-`stat` after download). `V2Remote` stays a documented extension point, not implemented. | Measured, not assumed. |
 | D14 | Commits and PRs carry only human authors: no bot or AI-tool co-author trailers or "generated with" lines. | The contributor list shows people. |
@@ -31,6 +31,7 @@ AmpSync downloads large SharePoint Online folders to a local disk, file by file,
 | D24 | `Event::RangeDone { rel_path, index, count }` is sent once per range of a file split into ranges; `Event::FileStarted` carries `done_ranges` (ranges already on disk when resuming). Ranges lie on a fixed grid of the file's range size, so indices are stable across resumes. | Drives the fill map for big files. |
 | D25 | `Settings.splash: SplashMode` with `on` (default), `reduced`, `off`. The desktop implements the behaviour. | Startup animation is a preference. |
 | D26 | When the desktop needs an interactive sign-in (after the silent refresh fails) it asks how: `SignIn::obtain` emits `signin-choose { host }`, raises the main window, and waits for the `choose_sign_in(method, remember)` command (`method` null = cancel, which is `Error::Cancelled`). `Settings.sign_in_with: Option<SignInChoice>` (`window`, `edge`, `chrome`; absent = ask) is the remembered answer and skips the question. `signin-state` carries `choosing`, `window_open`, `browser_open`, `closed`. `pending_sign_in_choice` lets a late-loading page show the dialog; `cancel_sign_in` cancels the question, the window or the browser. | The in-app window can render black on managed computers; the user must be able to pick the browser method without hunting for the Sign-ins view. |
+| D27 | Browser link (opt-in). The user installs a small AmpSync extension in their own Edge or Chrome profile by hand (developer mode, Load unpacked). The extension shares only SharePoint sign-in cookies (FedAuth and rtFa) with AmpSync over native messaging. The browser starts a relay from AmpSync's own exe, which reaches the running app through a per-user named pipe (Linux: a 0600 Unix socket). AmpSync checks the host and cookie domains, keeps a pushed session only for sites it already has or has queued, and never reads browser profile files. The host is registered for the current user only, and unlink or Remove all data removes it. | Stops repeated sign-in prompts where IT expires SharePoint sessions often. The user installs the extension, so the browser's own controls stay in charge. No store listing and no machine-wide install. |
 
 ## Layout
 
@@ -66,7 +67,7 @@ pub fn parse(input: &str) -> Result<ParsedLink, Error>;
 ### `auth` — sessions and where they're stored
 
 ```rust
-pub enum SignInMethod { Webview, Browser { kind: BrowserKind }, Pasted }
+pub enum SignInMethod { Webview, Browser { kind: BrowserKind }, Pasted, BrowserLink { kind: BrowserKind } }
 pub enum BrowserKind { Edge, Chrome }
 
 pub struct Session {
@@ -100,6 +101,42 @@ pub trait SignIn: Send + Sync {
 pub struct BrowserSignIn { pub kind: BrowserKind }
 pub struct PastedSignIn { pub cookie_header: String }
 ```
+
+### `browser_link` — hand-over of the user's own browser session
+
+Pure protocol, validation and location helpers (no I/O); the desktop crate does the sockets and
+registry writes. See `docs/plans/browser-link.md`.
+
+```rust
+pub const EXTENSION_ID: &str; pub const HOST_NAME: &str; pub const ALLOWED_ORIGIN: &str;
+pub const PROTOCOL_VERSION: u32;                 // 1
+pub const MAX_COOKIES: usize; MAX_COOKIE_VALUE: usize; MAX_MESSAGE: usize; MAX_INCOMING: usize;
+
+pub struct WireCookie { name, value, domain, path: String, expires: Option<i64> }
+pub enum FromExtension { Hello{ext_version,browser,protocol}, Session{id,host,reason,cookies},
+                         Error{id,host,code}, Pong{id}, Unknown }   // "type"-tagged, snake_case
+pub enum ToExtension   { Refresh{id,host,start_url,interactive}, Ping{id}, App{running} }
+pub enum SessionReason { Changed, Requested, Initial, Other }
+pub enum ErrorCode     { SigninRequired, Timeout, NoPermission, BadRequest, Other }
+
+pub fn validate_session(host: &str, cookies: &[WireCookie], kind: BrowserKind,
+                        now: OffsetDateTime) -> Result<Session, Error>;
+pub fn read_native_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>>;
+pub fn write_native_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()>;
+pub fn encode_line<T: Serialize>(msg: &T) -> io::Result<Vec<u8>>;      // JSON + '
+'
+pub fn pipe_name_for(user_identity: &str) -> String;                    // Windows, SID string in
+pub fn socket_path(runtime_dir: Option<&Path>, data_dir: &Path) -> PathBuf;   // Linux
+pub fn extension_dir / native_host_dir / host_manifest_path / signin_stats_path(data_dir: &Path) -> PathBuf;
+pub fn host_manifest_json(exe_path: &Path) -> String;
+pub fn registry_targets() -> Vec<RegistryTarget>;                       // HKCU subkeys
+pub fn linux_manifest_targets(config_home: &Path) -> Vec<ManifestTarget>;
+pub fn is_allowed_origin(arg: &str) -> bool;
+```
+
+`link::SHAREPOINT_SUFFIXES` and `link::is_sharepoint_host` are public. `Settings` gains
+`browser_link`, `renew_in_background`, `link_nudge_dismissed_at`; `SignInChoice` gains `BrowserLink`
+(`"browser_link"`).
 
 ### `remote` — talking to SharePoint
 

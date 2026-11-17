@@ -2,6 +2,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { app, type Theme } from "../core/store.svelte";
   import { api, toCmdError } from "../core/api";
+  import { browserName } from "../core/signin";
   import type { CloseBehavior, SplashMode } from "../core/types";
 
   const MB = 1024 * 1024;
@@ -86,6 +87,9 @@
     }
   }
 
+  const link = $derived(app.link);
+  const linked = $derived(link?.enabled === true);
+
   const isWindows = $derived(app.info?.os === "windows");
 </script>
 
@@ -126,10 +130,26 @@
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel signing">
+    <div class="panel-h"><span class="label">Signing in</span></div>
     <div class="toggle">
-      <div><strong>Notify when downloads finish</strong><p>A notification when a download finishes, stops with an error, or needs you to sign in, shown only while AmpSync's window is in the background.</p></div>
-      <span class="switch"><input type="checkbox" aria-label="Notify when downloads finish" checked={s.notify_on_finish === true} onchange={(e) => app.saveSettings({ notify_on_finish: e.currentTarget.checked })} /><i></i></span>
+      <div>
+        <strong>Browser link</strong><span class="new">new</span>
+        <p>Reuse the SharePoint sign-in from Edge or Chrome so AmpSync never shows a sign-in window. Needs the AmpSync extension in your browser.</p>
+      </div>
+      <span class="act">
+        {#if linked}
+          <span class="state {link?.connected ? 's-ok' : 's-wait'}">{link?.connected ? `linked · ${browserName(link.browser)}` : "linked · not connected"}</span>
+          <button type="button" class="btn ghost" onclick={() => app.go("signins")}>Manage</button>
+        {:else}
+          <span class="state s-skip">not set up</span>
+          <button type="button" class="btn primary" onclick={() => app.openGuide()}>Set up (2 min)</button>
+        {/if}
+      </span>
+    </div>
+    <div class="toggle">
+      <div><strong>Keep sign-ins fresh in the background</strong><p>While a download runs, AmpSync renews the sign-in through the browser link a little before it expires, so the download never pauses.</p></div>
+      <span class="switch"><input type="checkbox" aria-label="Keep sign-ins fresh in the background" checked={linked && s.renew_in_background} disabled={!linked} onchange={(e) => app.saveSettings({ renew_in_background: e.currentTarget.checked })} /><i></i></span>
     </div>
     <div class="toggle">
       <div><strong>Use my Windows work account</strong><p>{isWindows ? "Signs in with the account you use to log in to Windows when your company allows it, so there's often no prompt. Takes effect the next time AmpSync starts." : "Windows only."}</p></div>
@@ -139,12 +159,19 @@
       <div><strong>Remember passwords in the sign-in window</strong><p>Off by default. Only affects AmpSync's own sign-in window, never your browsers.</p></div>
       <span class="switch"><input type="checkbox" aria-label="Remember passwords in the sign-in window" checked={s.save_passwords} onchange={(e) => app.saveSettings({ save_passwords: e.currentTarget.checked })} /><i></i></span>
     </div>
+  </div>
+
+  <div class="panel">
+    <div class="toggle">
+      <div><strong>Notify when downloads finish</strong><p>A notification when a download finishes, stops with an error, or needs you to sign in, shown only while AmpSync's window is in the background.</p></div>
+      <span class="switch"><input type="checkbox" aria-label="Notify when downloads finish" checked={s.notify_on_finish === true} onchange={(e) => app.saveSettings({ notify_on_finish: e.currentTarget.checked })} /><i></i></span>
+    </div>
     <div class="toggle">
       <div><strong>Check for new versions</strong><p>Looks at GitHub Releases once a day. Nothing else is sent, and nothing is installed without you.</p></div>
       <span class="switch"><input type="checkbox" aria-label="Check for new versions" checked={s.check_updates} onchange={(e) => app.saveSettings({ check_updates: e.currentTarget.checked })} /><i></i></span>
     </div>
     <div class="toggle">
-      <div><strong>Walkthrough</strong><p>The short tour shown the first time AmpSync opens.</p></div>
+      <div><strong>Walkthrough</strong><p>The short tour shown the first time AmpSync opens, including browser link set-up.</p></div>
       <button type="button" class="btn" id="replay" onclick={() => app.startTour()}>Show again</button>
     </div>
   </div>
@@ -190,6 +217,12 @@
 {/if}
 
 <style>
+  .signing { border-color: var(--signal); }
+  .act { display: flex; gap: 12px; align-items: center; flex: none; }
+  .new {
+    font: 600 10px/1 var(--f-display); letter-spacing: .08em; text-transform: uppercase; color: var(--signal-ink);
+    background: var(--signal); border-radius: 2px; padding: 3px 5px; margin-left: 8px; vertical-align: 2px;
+  }
   .danger-zone { border-color: var(--crit); }
   .scrim { position: fixed; inset: 0; z-index: 60; background: rgba(6, 8, 11, .62); display: grid; place-items: center; padding: 16px; }
   .dlg {

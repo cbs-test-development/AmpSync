@@ -3,7 +3,7 @@
 export type CloseBehavior = "ask" | "tray" | "pause";
 export type SplashMode = "on" | "reduced" | "off";
 /** How to sign in when a link needs it; absent = ask every time (D26). */
-export type SignInChoice = "window" | "edge" | "chrome";
+export type SignInChoice = "window" | "edge" | "chrome" | "browser_link";
 
 export interface Settings {
   /** Simultaneous downloads when `auto_tune` is off. */
@@ -26,6 +26,12 @@ export interface Settings {
   use_windows_account: boolean;
   default_dest?: string | null;
   close_behavior: CloseBehavior;
+  /** The browser link was set up (set on the first successful `hello` from the extension). */
+  browser_link: boolean;
+  /** Renew sign-ins through the browser link a little before they expire. */
+  renew_in_background: boolean;
+  /** RFC 3339; the "link your browser" nudge stays away for 14 days after this. */
+  link_nudge_dismissed_at?: string | null;
 }
 
 export type ItemStatus =
@@ -160,7 +166,7 @@ export interface DiskSpace {
 
 export interface SessionInfo {
   host: string;
-  method: "webview" | "edge" | "chrome" | "paste";
+  method: "webview" | "edge" | "chrome" | "paste" | "browser_link_edge" | "browser_link_chrome";
   captured_at: string;
   status: "active" | "expired" | "checking" | "unknown";
 }
@@ -214,3 +220,31 @@ export interface EnqueueReq {
 }
 
 export type ViewId = "transfers" | "new" | "signins" | "settings" | "about";
+
+export type LinkBrowser = "edge" | "chrome";
+
+/** State of the browser link, from `link_status` and the `link-state` event. */
+export interface LinkStatus {
+  /** `settings.browser_link`. */
+  enabled: boolean;
+  /** An extension is attached through the relay right now. */
+  connected: boolean;
+  /** From the last hello. */
+  browser: LinkBrowser | null;
+  ext_version: string | null;
+  /** RFC 3339: the last session received from the link. */
+  last_renewed: string | null;
+  /** Sessions received from the link in the last 7 days. */
+  renewals_7d: number;
+  /** Interactive sign-in prompts in the last 7 days. */
+  prompts_7d: number;
+  /** `!enabled && prompts_7d >= 2 && not dismissed in the last 14 days`. */
+  nudge: boolean;
+  /** Unpacked extension folder (may not exist before `link_prepare`). */
+  folder: string;
+}
+
+export interface LinkTestResult {
+  ok: boolean;
+  message: string;
+}

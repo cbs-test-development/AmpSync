@@ -5,12 +5,16 @@ mod commands;
 mod contributors;
 mod diskspace;
 mod error;
+mod link;
+mod link_ipc;
+mod link_setup;
 mod links;
 mod notify;
 mod paths;
 mod progress;
 mod purge;
 mod queue;
+mod relay;
 mod signin;
 mod splash;
 mod startup;
@@ -35,6 +39,8 @@ pub struct AppState {
     pub store: Arc<dyn SessionStore>,
     pub signin: signin::SignInCoordinator,
     pub queue: queue::Queue,
+    /// The browser link: the extension's connection and its stats (`link.rs`).
+    pub link: link::Link,
     pub update: Mutex<Option<update::UpdateInfo>>,
     pub quitting: AtomicBool,
     statuses: Mutex<BTreeMap<String, &'static str>>,
@@ -47,6 +53,7 @@ impl AppState {
             store: Arc::new(KeyringStore::new()),
             signin: signin::SignInCoordinator::new(),
             queue: queue::Queue::new(),
+            link: link::Link::new(link_setup::data_dir()),
             update: Mutex::new(None),
             quitting: AtomicBool::new(false),
             statuses: Mutex::new(BTreeMap::new()),
@@ -85,6 +92,13 @@ impl AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Started by a browser as the native-messaging host of the browser link: relay stdio to the
+    // running app and exit. Like the purge modes below, before any window or single-instance
+    // forwarding exists, so the browser starting it never disturbs the app.
+    if let Some(origin) = relay::host_origin(std::env::args_os()) {
+        std::process::exit(relay::run(&origin));
+    }
+
     // Uninstall / "remove all data" modes run before anything else exists: no window, no WebView
     // profile open, no single-instance forwarding to a running copy.
     if let Some(mode) = purge::mode_from_args(std::env::args_os()) {
@@ -134,6 +148,14 @@ pub fn run() {
             commands::open_external,
             commands::close_decision,
             commands::known_hosts,
+            commands::link_status,
+            commands::link_prepare,
+            commands::link_open_extensions,
+            commands::link_reveal_folder,
+            commands::link_save_zip,
+            commands::link_test,
+            commands::link_unlink,
+            commands::link_dismiss_nudge,
             commands::purge_everything,
             splash::splash_info,
             splash::show_window,
@@ -148,6 +170,7 @@ pub fn run() {
             let state = app.state::<AppState>();
             state.queue.restore(&paths::queue_file());
             queue::spawn_runner(handle.clone());
+            link::spawn(handle.clone());
             startup::spawn(handle.clone());
             update::spawn(handle);
             Ok(())

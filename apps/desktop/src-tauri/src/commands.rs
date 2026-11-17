@@ -337,7 +337,8 @@ pub fn clear_finished(app: AppHandle, state: State<'_, AppState>) {
 #[derive(Serialize)]
 pub struct SessionInfo {
     pub host: String,
-    /// "webview", "edge", "chrome", "paste", or "auto" (the remembered way, else ask).
+    /// "webview", "edge", "chrome", "paste", "browser_link_edge", "browser_link_chrome", or "auto"
+    /// (the remembered way, else ask).
     pub method: &'static str,
     pub captured_at: String,
     /// "active", "expired", "checking" or "unknown".
@@ -354,6 +355,12 @@ fn method_name(m: &SignInMethod) -> &'static str {
             kind: BrowserKind::Chrome,
         } => "chrome",
         SignInMethod::Pasted => "paste",
+        SignInMethod::BrowserLink {
+            kind: BrowserKind::Edge,
+        } => "browser_link_edge",
+        SignInMethod::BrowserLink {
+            kind: BrowserKind::Chrome,
+        } => "browser_link_chrome",
     }
 }
 
@@ -387,7 +394,7 @@ pub async fn check_sessions(app: AppHandle) -> CmdResult<()> {
 pub struct SignInReq {
     /// A SharePoint link or just the address; the host is taken from it.
     pub link: String,
-    /// "webview", "edge", "chrome" or "paste".
+    /// "webview", "edge", "chrome", "paste" or "browser_link".
     pub method: String,
     pub cookie_header: Option<String>,
 }
@@ -433,6 +440,13 @@ pub async fn sign_in(app: AppHandle, req: SignInReq) -> CmdResult<SessionInfo> {
             state.store.save(&s)?;
             s
         }
+        "browser_link" => {
+            if !state.link.is_connected() {
+                return Err(CmdError::new("error", "The browser link is not connected."));
+            }
+            // The link handler saves the session; this only waits for it.
+            state.link.request_refresh(&host, &url, true).await?
+        }
         "paste" => {
             let header = req.cookie_header.unwrap_or_default();
             let s = PastedSignIn {
@@ -464,7 +478,8 @@ pub fn pending_sign_in_choice(state: State<'_, AppState>) -> Option<String> {
     state.signin.pending_choice()
 }
 
-/// Answer the sign-in question (D26): `method` is "webview", "edge" or "chrome"; `None` cancels.
+/// Answer the sign-in question (D26): `method` is "webview", "edge", "chrome" or "browser_link";
+/// `None` cancels.
 /// With `remember` the choice becomes the default and the question is not asked again.
 #[tauri::command(rename_all = "snake_case")]
 pub fn choose_sign_in(state: State<'_, AppState>, method: Option<String>, remember: bool) -> CmdResult<()> {
@@ -505,10 +520,12 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn set_settings(state: State<'_, AppState>, settings: Settings) -> CmdResult<Settings> {
+pub fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> CmdResult<Settings> {
     let settings = settings.sanitized();
     settings.save()?;
     *state.settings.write().unwrap_or_else(|p| p.into_inner()) = settings.clone();
+    // The link's `enabled` and `nudge` follow the settings.
+    crate::link::emit_state(&app);
     Ok(settings)
 }
 
@@ -599,6 +616,115 @@ pub fn close_decision(app: AppHandle, state: State<'_, AppState>, decision: Clos
 #[tauri::command(rename_all = "snake_case")]
 pub fn known_hosts(state: State<'_, AppState>) -> CmdResult<BTreeSet<String>> {
     Ok(state.store.hosts()?.into_iter().collect())
+}
+
+// ---------------------------------------------------------------- browser link
+
+fn link_browser(name: &str) -> Result<BrowserKind, CmdError> {
+    match name {
+        "edge" => Ok(BrowserKind::Edge),
+        "chrome" => Ok(BrowserKind::Chrome),
+        _ => Err(CmdError::new("error", "Unknown browser.")),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn link_status(app: AppHandle) -> crate::link::LinkStatus {
+    crate::link::status(&app)
+}
+
+/// Unpack the extension and register the native host; returns the extension folder.
+#[tauri::command(rename_all = "snake_case")]
+pub fn link_prepare(app: AppHandle) -> CmdResult<String> {
+    let folder = crate::link_setup::prepare()?;
+    crate::link::emit_state(&app);
+    Ok(folder.to_string_lossy().to_string())
+}
+
+/// Start Edge or Chrome on its extensions page; `false` when it cannot be started.
+#[tauri::command(rename_all = "snake_case")]
+pub fn link_open_extensions(browser: String) -> CmdResult<bool> {
+    Ok(crate::link_setup::open_extensions_page(link_browser(&browser)?))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn link_reveal_folder(app: AppHandle) -> CmdResult<()> {
+    let folder = crate::link_setup::prepare()?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_path(folder.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| CmdError::new("error", e.to_string()))
+}
+
+/// Write the extension as a zip (the frontend picks `dest` with the save dialog).
+#[tauri::command(rename_all = "snake_case")]
+pub fn link_save_zip(dest: String) -> CmdResult<()> {
+    crate::link_setup::save_zip(std::path::Path::new(&dest))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct LinkTest {
+    pub ok: bool,
+    pub message: String,
+}
+
+/// Round trip to the extension, then a silent refresh of one saved host.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn link_test(app: AppHandle) -> CmdResult<LinkTest> {
+    let state = app.state::<AppState>();
+    let fail = |message: String| Ok(LinkTest { ok: false, message });
+    let Some(hello) = state.link.hello() else {
+        return fail("The browser extension is not connected. Open your browser and try again.".into());
+    };
+    let browser = match hello.browser {
+        BrowserKind::Edge => "Edge",
+        BrowserKind::Chrome => "Chrome",
+    };
+    if !state.link.ping().await {
+        return fail(format!(
+            "{browser} did not answer. Reload the AmpSync extension and try again."
+        ));
+    }
+    let Some(host) = state.store.hosts()?.into_iter().next() else {
+        return Ok(LinkTest {
+            ok: true,
+            message: format!(
+                "{browser} answered. Download from SharePoint once and AmpSync will keep the sign-in fresh."
+            ),
+        });
+    };
+    let Some(url) = crate::link::start_url_for(&app, &host) else {
+        return fail("Could not work out which site to test.".into());
+    };
+    match state.link.request_refresh(&host, &url, false).await {
+        Ok(_) => Ok(LinkTest {
+            ok: true,
+            message: format!("Connected. {browser} gave AmpSync a fresh sign-in for {host}."),
+        }),
+        Err(Error::AuthExpired { .. }) => fail(format!(
+            "Connected, but {browser} is not signed in to {host}. Open the site in {browser}, sign in, and test again."
+        )),
+        Err(e) => fail(e.to_string()),
+    }
+}
+
+/// Remove the native host registration and turn the link off. Saved sessions stay.
+#[tauri::command(rename_all = "snake_case")]
+pub fn link_unlink(app: AppHandle) -> CmdResult<()> {
+    let removed = crate::link_setup::unlink();
+    crate::link::update_settings(&app, |s| s.browser_link = false)?;
+    crate::link::emit_state(&app);
+    removed?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn link_dismiss_nudge(app: AppHandle) -> CmdResult<()> {
+    crate::link::update_settings(&app, |s| {
+        s.link_nudge_dismissed_at = Some(time::OffsetDateTime::now_utc())
+    })?;
+    crate::link::emit_state(&app);
+    Ok(())
 }
 
 /// Settings > "Remove all AmpSync data". Closes every sign-in window, stops the queue, starts a

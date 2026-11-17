@@ -45,6 +45,20 @@ fn log_path() -> PathBuf {
     std::env::temp_dir().join("ampsync-purge.log")
 }
 
+/// Core's purge plus what only the desktop knows about: the browser link's registry keys (Windows)
+/// or manifest files (Linux), which live outside the folders core removes.
+fn purge_everything() -> Result<PurgeReport, Error> {
+    let mut report = ampsync_core::purge_all()?;
+    let (removed, errors) = crate::link_setup::unregister_host();
+    report.registry_entries += removed;
+    report.errors.extend(
+        errors
+            .into_iter()
+            .map(|e| format!("browser link registration: {e}")),
+    );
+    Ok(report)
+}
+
 /// Purge until nothing is reported as failing or the attempts run out (a just-closed WebView
 /// process may hold its folder for a moment). Returns a readable log.
 fn purge_with_retries<F>(attempts: u32, delay: Duration, mut purge: F) -> Vec<String>
@@ -87,7 +101,7 @@ fn write_log(lines: &[String]) {
 pub fn run(mode: Mode) {
     let result = std::panic::catch_unwind(|| match mode {
         Mode::Purge => {
-            let log = purge_with_retries(5, Duration::from_millis(1000), ampsync_core::purge_all);
+            let log = purge_with_retries(5, Duration::from_millis(1000), purge_everything);
             write_log(&log);
         }
         Mode::PurgeAndRestart => {
@@ -95,7 +109,7 @@ pub fn run(mode: Mode) {
             let mut sink = [0u8; 64];
             let mut stdin = std::io::stdin();
             while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
-            let mut log = purge_with_retries(20, Duration::from_millis(500), ampsync_core::purge_all);
+            let mut log = purge_with_retries(20, Duration::from_millis(500), purge_everything);
             // Let the old process finish exiting so the single-instance check does not see it.
             std::thread::sleep(Duration::from_millis(1500));
             match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn()) {

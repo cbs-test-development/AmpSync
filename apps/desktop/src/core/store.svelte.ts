@@ -8,6 +8,7 @@ import type {
   EngineEvent,
   IncomingLink,
   JobEventPayload,
+  LinkStatus,
   QueueItem,
   SessionInfo,
   Settings,
@@ -120,6 +121,10 @@ class Store {
   signInPhase = $state<SignInPhase | null>(null);
   /** Host of the sign-in question being asked in the dialog, if any (D26). */
   signInChoose = $state<string | null>(null);
+  /** The browser link; `null` until `link_status` has answered. */
+  link = $state<LinkStatus | null>(null);
+  /** The browser link set-up guide is open. */
+  guideOpen = $state(false);
   ready = $state(false);
   /** A SharePoint link that arrived by paste, drop or the tray; New download opens it. */
   incoming = $state<{ link: string; n: number } | null>(null);
@@ -169,6 +174,14 @@ class Store {
     this.toastTimer = setTimeout(() => (this.toastText = null), ms);
   }
 
+  openGuide() {
+    this.guideOpen = true;
+  }
+
+  closeGuide() {
+    this.guideOpen = false;
+  }
+
   setNotice(text: string | null, ms = 8000) {
     this.notice = text;
     clearTimeout(this.noticeTimer);
@@ -181,7 +194,7 @@ class Store {
    * tour and the close question keep the keyboard to themselves.
    */
   async receiveLink(text: string) {
-    if (!this.ready || this.tourOpen || this.closePrompt) return;
+    if (!this.ready || this.tourOpen || this.closePrompt || this.guideOpen) return;
     try {
       const info = await api.parseLink(text);
       this.setNotice(null);
@@ -476,6 +489,7 @@ class Store {
       this.signInPhase = open ? (p.state as SignInPhase) : null;
       if (p.state !== "choosing") this.signInChoose = null;
     });
+    await on<LinkStatus>("link-state", (l) => (this.link = l));
     await on<{ host: string }>("signin-choose", (p) => (this.signInChoose = p.host));
     await on<boolean>("close-requested", (active) => {
       this.closeActive = active;
@@ -499,6 +513,8 @@ class Store {
     this.contributors = contributors;
     this.update = update;
     await this.refreshSessions();
+    // A `link-state` event that arrived while this was loading is newer than the answer.
+    if (!this.link) this.link = await api.linkStatus().catch(() => null);
     // A question that was asked before this page was listening (the window was hidden).
     this.signInChoose = (await api.pendingSignInChoice().catch(() => null)) ?? this.signInChoose;
     this.ready = true;

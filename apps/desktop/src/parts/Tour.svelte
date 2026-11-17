@@ -2,10 +2,11 @@
   import { onMount, tick } from "svelte";
   import { app } from "../core/store.svelte";
   import { steps } from "../core/tour";
+  import { browserName } from "../core/signin";
 
   let index = $state(0);
   let box: HTMLDivElement;
-  let nextBtn: HTMLButtonElement;
+  let nextBtn = $state<HTMLButtonElement>();
   let hole = $state({ left: 0, top: 0, width: 0, height: 0, center: true });
   let boxPos = $state({ left: 16, top: 16 });
   let lastFocus: Element | null = null;
@@ -51,6 +52,11 @@
   function next() {
     if (index === steps.length - 1) end(false);
     else void show(index + 1);
+  }
+
+  /** "Set it up now": the tour ends (and counts as seen), then the browser link guide opens. */
+  function setUp() {
+    void app.endTour(false).then(() => app.openGuide());
   }
 
   function back() {
@@ -100,14 +106,26 @@
       </span>
     </div>
     <h3 id="tour-title">{step.title}</h3>
-    <p>{step.body}</p>
+    <p class:tight={step.action === "link"}>{step.body}</p>
+    {#if step.action === "link"}
+      <div class="mini" aria-hidden="true">
+        <div class="side"><span class="strike">Sign in</span><span>password + phone<br />every few hours</span></div>
+        <span class="flow"></span>
+        <div class="side"><span class="ok">✓ Signed in</span><span>taken from {browserName(app.link?.browser, "Edge")}<br />automatically</span></div>
+      </div>
+    {/if}
     <div class="row">
       <button type="button" class="skip" onclick={() => end(true)}>Skip tour</button>
       <span class="btns">
         <button type="button" class="btn ghost" hidden={index === 0} onclick={back}>Back</button>
-        <button type="button" class="btn primary" bind:this={nextBtn} onclick={next}>
-          {index === 0 ? "Show me around" : index === steps.length - 1 ? "Done" : "Next"}
-        </button>
+        {#if step.action === "link"}
+          <button type="button" class="btn ghost" onclick={next}>Later</button>
+          <button type="button" class="btn primary" bind:this={nextBtn} onclick={setUp}>Set it up now</button>
+        {:else}
+          <button type="button" class="btn primary" bind:this={nextBtn} onclick={next}>
+            {index === 0 ? "Show me around" : index === steps.length - 1 ? "Done" : "Next"}
+          </button>
+        {/if}
       </span>
     </div>
   </div>
@@ -127,6 +145,23 @@
   }
   h3 { margin: 4px 0 6px; font: 600 16px/1.25 var(--f-display); text-wrap: balance; }
   p { margin: 0 0 14px; font-size: 13px; color: var(--muted); }
+  p.tight { margin-bottom: 12px; }
+  .mini {
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 10px; padding: 12px;
+    border: 1px solid var(--line); border-radius: 4px; background: var(--bg); margin-bottom: 12px;
+  }
+  .mini .side { display: grid; gap: 4px; justify-items: center; font-size: 11.5px; color: var(--muted); text-align: center; }
+  .mini .ok { font: 500 12px var(--f-body); color: var(--ok); }
+  .strike {
+    position: relative; font: 500 12px var(--f-body); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 3px; padding: 3px 8px; background: var(--raise);
+  }
+  .strike::after { content: ""; position: absolute; left: -4px; right: -4px; top: 50%; height: 2px; background: var(--crit); transform: rotate(-8deg); }
+  .flow {
+    width: 56px; height: 2px; background: repeating-linear-gradient(90deg, var(--signal) 0 6px, transparent 6px 12px);
+    animation: flow .7s linear infinite;
+  }
+  @keyframes flow { to { background-position: 12px 0; } }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   .btns { display: flex; gap: 8px; }
   .btns [hidden] { display: none; }
@@ -141,5 +176,6 @@
   .skip:hover { color: var(--fg); }
   @media (prefers-reduced-motion: reduce) {
     .hole, .box { transition: none; }
+    .flow { animation: none; }
   }
 </style>

@@ -8,9 +8,17 @@
   let remember = $state(true);
   let first: HTMLButtonElement;
 
-  function answer(method: "webview" | "edge" | "chrome" | null) {
+  const linked = $derived(app.link?.connected === true);
+
+  function answer(method: "webview" | "edge" | "chrome" | "browser_link" | null) {
     app.signInChoose = null;
     void api.chooseSignIn(method, remember);
+  }
+
+  /** Not linked yet: the pending question is cancelled (so the backend stops waiting) and the guide opens. */
+  function setUp() {
+    answer(null);
+    app.openGuide();
   }
 
   onMount(() => {
@@ -28,13 +36,20 @@
     <h3 id="choose-title">How do you want to sign in?</h3>
     <p class="host"><span class="label">Site</span> {app.signInChoose}</p>
     <div class="opts">
-      <button type="button" class="opt" bind:this={first} onclick={() => answer("webview")}>
+      <div class="opt feat">
+        <span class="top"><strong>Through my browser</strong><span class="tag">no sign-in</span></span>
+        <span>Uses the SharePoint sign-in Edge or Chrome already keeps fresh. {linked ? "Your browser is linked." : "One-time set-up, about 2 minutes. After that, AmpSync stops asking."}</span>
+        <span class="btns">
+          <button type="button" class="btn primary" bind:this={first} onclick={() => (linked ? answer("browser_link") : setUp())}>{linked ? "Use my browser" : "Set up browser link"}</button>
+        </span>
+      </div>
+      <button type="button" class="opt" onclick={() => answer("webview")}>
         <strong>Via AmpSync</strong>
-        <span>Recommended for personal devices</span>
+        <span>A sign-in window opens inside the app, for this time only</span>
       </button>
       <div class="opt">
-        <strong>Via Edge or Chrome</strong>
-        <span>Recommended for work devices</span>
+        <strong>Via Edge or Chrome, this time only</strong>
+        <span>Opens a separate browser window to sign in once</span>
         <span class="btns">
           <button type="button" class="btn" onclick={() => answer("edge")}>Use Edge</button>
           <button type="button" class="btn" onclick={() => answer("chrome")}>Use Chrome</button>
@@ -65,6 +80,12 @@
   button.opt:hover, button.opt:focus-visible { border-color: var(--signal); }
   .opt strong { font-weight: 600; font-size: 14px; }
   .opt span { font-size: 12px; color: var(--muted); }
+  .opt.feat { border-color: var(--signal); background: color-mix(in srgb, var(--signal) 7%, var(--panel)); padding: 12px 14px; }
+  .opt .top { display: flex; gap: 8px; align-items: center; }
+  .opt .tag {
+    font: 600 10px/1 var(--f-display); letter-spacing: .08em; text-transform: uppercase; color: var(--signal-ink);
+    background: var(--signal); border-radius: 2px; padding: 3px 5px;
+  }
   .opt .btns { display: flex; gap: 8px; margin-top: 8px; }
   .remember { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-bottom: 14px; cursor: pointer; }
   .remember input { accent-color: var(--signal); }

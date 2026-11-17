@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "AmpSync Browser Link",
+  "version": "1.0.0",
+  "description": "Shares your SharePoint sign-in with the AmpSync app on this computer, so it does not ask you to sign in again.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArwMQ44FFfEelDNnB8mADTEnOvJoF3Atvu7A4nb6/z48YHC01MiTBwjeaqhkHG+ylsGbWJccV3/DbIRU9hNFKfPiHW03UIN32uF2MtSI8tpV3EeHf3zC6eZ+CV9Exm7PO5ilPIMr8iIcKgpT0LwblIh/BZnN5fFRoFyy5vrsLXd5noM0UziCYngjzDh4AFvO1K5sK2zxP0WyB0CTGrLi3/R6mi+2EC0Jydt64c+MDRJD7U0A3wvjReujooTzZxuDPVLlQb6TYyONckT6B0FmteFQ+8+xb+FDJIh4WLvHTXvHbqPL8X8Zh8bowmqotgs9mP9Rb3GgD9/kr4h07an+UCwIDAQAB",
+  "permissions": ["cookies", "nativeMessaging", "tabs", "alarms"],
+  "host_permissions": [
+    "https://*.sharepoint.com/*",
+    "https://*.sharepoint.us/*",
+    "https://*.sharepoint.cn/*",
+    "https://*.sharepoint.de/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AmpSync Browser Link",
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

@@ -63,6 +63,10 @@ impl PurgeTargets {
             t.dirs.push(appdirs::jobs_dir(&over));
             // Opt-in file session store (`AMPSYNC_SESSION_STORE=file`); absent unless used.
             t.dirs.push(over.join("sessions"));
+            // Browser link files; inside the default data directory they go with the whole of it.
+            t.dirs.push(crate::browser_link::extension_dir(&over));
+            t.dirs.push(crate::browser_link::native_host_dir(&over));
+            t.dirs.push(crate::browser_link::signin_stats_path(&over));
         }
         match appdirs::config_dir() {
             Some(d) => {

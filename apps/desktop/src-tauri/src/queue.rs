@@ -466,13 +466,17 @@ impl Queue {
         self.publish(app);
     }
 
-    /// A new session arrived (the user signed in from the Sign-ins view or the banner).
+    /// A new session arrived (the user signed in from the Sign-ins view or the banner, or the
+    /// browser link delivered one). A job waiting for sign-in resumes; a running job for the host
+    /// swaps to the fresh cookies.
     pub fn deliver_session(&self, session: &Session) {
         let g = self.lock();
         if let Some(c) = &g.current
-            && g.items
-                .iter()
-                .any(|i| i.id == c.id && i.host == session.host && i.status == ItemStatus::NeedsSignIn)
+            && g.items.iter().any(|i| {
+                i.id == c.id
+                    && i.host == session.host
+                    && matches!(i.status, ItemStatus::NeedsSignIn | ItemStatus::Running)
+            })
         {
             let _ = c.tx.send(Ctl::Replace(session.clone()));
         }
@@ -582,6 +586,15 @@ fn failure_text(e: &Error) -> String {
             "Another AmpSync download is already using this folder. Wait for it to finish, or save to a different folder.".into()
         }
         other => other.to_string(),
+    }
+}
+
+/// Stops a background task when the job's transfer loop ends, however it ends.
+struct AbortOnDrop(tauri::async_runtime::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -726,6 +739,12 @@ async fn run_item_inner(
         };
         // 3. Transfer.
         let handle = engine.start(item.spec.clone(), plan);
+        // While this job runs, keep the browser link's cookies fresh (every 30 min, if enabled).
+        let _renewal = AbortOnDrop(tauri::async_runtime::spawn(crate::link::renew_while_running(
+            app.clone(),
+            item.host.clone(),
+            start_url.clone(),
+        )));
         let mut events = handle.events();
         queue.set_status(app, id, ItemStatus::Running, None);
         let mut refreshing = false;
