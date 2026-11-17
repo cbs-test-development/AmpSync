@@ -5,6 +5,7 @@
 
 pub mod appdirs;
 pub mod auth;
+pub mod browser_link;
 pub mod autotune;
 pub mod engine;
 pub mod errors;

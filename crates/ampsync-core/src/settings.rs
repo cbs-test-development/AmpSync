@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::Error;
 
@@ -50,16 +51,30 @@ pub enum SignInChoice {
     Edge,
     /// Installed Chrome, separate temporary profile.
     Chrome,
+    /// The user's own browser, through the AmpSync browser extension (no sign-in window).
+    #[serde(rename = "browser_link")]
+    BrowserLink,
 }
 
 impl SignInChoice {
-    /// From the name the frontend sends (`"webview"`, `"edge"`, `"chrome"`).
+    /// From the name the frontend sends (`"webview"`, `"edge"`, `"chrome"`, `"browser_link"`).
     pub fn from_method(name: &str) -> Option<Self> {
         match name {
             "webview" | "window" => Some(Self::Window),
             "edge" => Some(Self::Edge),
             "chrome" => Some(Self::Chrome),
+            "browser_link" => Some(Self::BrowserLink),
             _ => None,
+        }
+    }
+
+    /// The name used in `settings.toml` and by [`from_method`](Self::from_method).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Window => "window",
+            Self::Edge => "edge",
+            Self::Chrome => "chrome",
+            Self::BrowserLink => "browser_link",
         }
     }
 }
@@ -106,6 +121,17 @@ pub struct Settings {
     pub sign_in_with: Option<SignInChoice>,
     /// Startup animation (D25).
     pub splash: SplashMode,
+    /// The browser link (extension) is set up and wanted. Set on the first successful `hello`.
+    pub browser_link: bool,
+    /// While a job runs, keep asking the browser link for fresh cookies. Default on.
+    pub renew_in_background: bool,
+    /// When the user dismissed the "link your browser" nudge; left out of the file when unset.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub link_nudge_dismissed_at: Option<OffsetDateTime>,
 }
 
 impl Default for Settings {
@@ -126,6 +152,9 @@ impl Default for Settings {
             notify_on_finish: None,
             sign_in_with: None,
             splash: SplashMode::On,
+            browser_link: false,
+            renew_in_background: true,
+            link_nudge_dismissed_at: None,
         }
     }
 }
@@ -326,6 +355,48 @@ notify_on_finish = false
         .unwrap();
         let s = Settings::load_from(&path).unwrap();
         assert!(s.auto_tune && s.notify_on_finish.is_none() && s.splash == SplashMode::On);
+    }
+
+    #[test]
+    fn browser_link_settings_round_trip_and_old_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        // The defaults, saved by this version, load back unchanged and omit the optional date.
+        let d = Settings::default();
+        assert!(!d.browser_link && d.renew_in_background && d.link_nudge_dismissed_at.is_none());
+        d.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("link_nudge_dismissed_at"), "{text}");
+        assert_eq!(Settings::load_from(&path).unwrap(), d);
+        // A file without the new keys gets the new defaults.
+        std::fs::write(&path, "tour_seen = true
+splash = \"off\"
+").unwrap();
+        let old = Settings::load_from(&path).unwrap();
+        assert!(!old.browser_link && old.renew_in_background && old.link_nudge_dismissed_at.is_none());
+        // New fields round-trip.
+        let s = Settings {
+            browser_link: true,
+            renew_in_background: false,
+            link_nudge_dismissed_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::days(20000)),
+            sign_in_with: Some(SignInChoice::BrowserLink),
+            ..Settings::default()
+        };
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("sign_in_with = \"browser_link\""), "{text}");
+        assert_eq!(Settings::load_from(&path).unwrap(), s);
+        assert_eq!(
+            serde_json::to_string(&SignInChoice::BrowserLink).unwrap(),
+            "\"browser_link\""
+        );
+        assert_eq!(SignInChoice::from_method("browser_link"), Some(SignInChoice::BrowserLink));
+        for c in [SignInChoice::Window, SignInChoice::Edge, SignInChoice::Chrome, SignInChoice::BrowserLink] {
+            assert_eq!(
+                serde_json::to_string(&c).unwrap(),
+                format!("\"{}\"", c.as_str())
+            );
+        }
     }
 
     #[test]
