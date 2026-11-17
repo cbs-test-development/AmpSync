@@ -117,7 +117,7 @@ The browser link is optional. Nothing changes until you set it up. When it is on
 
 You install the extension by hand, and AmpSync guides you through it. You can open the guide from the **Sign-ins** view, from **Settings** under *Signing in*, or from the sign-in dialog.
 
-1. Open the extensions page: `edge://extensions` in Edge, or `chrome://extensions` in Chrome. The guide can open it for you. If it cannot, it shows the address to type.
+1. Open the extensions page: `edge://extensions` in Edge, or `chrome://extensions` in Chrome. The guide opens your browser and copies the address for you: paste it into the address bar (Ctrl+V) and press Enter. Browsers do not let other programs open these pages directly.
 2. Turn on **Developer mode**. In Edge it is at the bottom of the left panel. In Chrome it is at the top right.
 3. Click **Load unpacked** and choose the folder AmpSync shows. On Windows it is `%LOCALAPPDATA%\AmpSync\browser-link`. On Ubuntu it is `~/.local/share/ampsync/browser-link`. The guide has **Copy path** and, on Windows, **Show in Explorer**. If you would rather not use the folder, **Save the zip** saves the extension as a zip file.
 4. AmpSync connects to the extension by itself. The guide then shows **Linked to Edge** (or Chrome). You do not need to change anything else.

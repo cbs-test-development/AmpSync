@@ -25,6 +25,7 @@
   let browser = $state<LinkBrowser>(initialBrowser(app.link));
   let copied = $state<"url" | "path" | null>(null);
   let hint = $state("");
+  let hintWarn = $state(false);
   let prepared = $state("");
   let dlg: HTMLDivElement;
   let primary: HTMLButtonElement;
@@ -54,7 +55,7 @@
     wasConnected = connected;
   });
 
-  async function copy(text: string, which: "url" | "path") {
+  async function copy(text: string, which: "url" | "path"): Promise<boolean> {
     let ok = false;
     try {
       await navigator.clipboard.writeText(text);
@@ -76,23 +77,28 @@
     }
     if (!ok) {
       app.toast("Could not copy. Select the text and copy it yourself.");
-      return;
+      return false;
     }
     copied = which;
     clearTimeout(copyTimer);
     copyTimer = setTimeout(() => (copied = null), 2200);
+    return true;
   }
 
-  async function openExtensions() {
+  // Browsers refuse to open their own internal pages (edge://, chrome://) when another program
+  // asks, so AmpSync opens the browser and puts the address on the clipboard for the user to paste.
+  async function openBrowser() {
     hint = "";
+    const onClipboard = await copy(url, "url");
     let opened = false;
     try {
       opened = await api.linkOpenExtensions(browser);
     } catch {
       opened = false;
     }
-    if (opened) go(1);
-    else hint = `AmpSync couldn't open ${name}. Copy the address below into ${name}'s address bar, then carry on.`;
+    const paste = onClipboard ? `paste the address (Ctrl+V) into the address bar and press Enter` : `type ${url} into the address bar and press Enter`;
+    hintWarn = !opened;
+    hint = opened ? `${name} is open: ${paste}.` : `AmpSync couldn't open ${name}. Open it yourself, then ${paste}.`;
   }
 
   async function reveal() {
@@ -115,7 +121,7 @@
   }
 
   function next() {
-    if (step === 0 && !hint) void openExtensions();
+    if (step === 0 && !hint) void openBrowser();
     else if (step === 0) go(1);
     else if (step < LAST_STEP) go(step + 1);
     else if (connected) app.closeGuide();
@@ -250,12 +256,12 @@
       <div class="copy">
         {#if step === 0}
           <h4>Open the extensions page</h4>
-          <p>AmpSync opens it in {name} for you. If nothing opens, copy this address into {name}'s address bar.</p>
+          <p>AmpSync opens {name} and copies this address for you. Paste it into {name}'s address bar and press Enter.</p>
           <div class="row2">
             <div class="field" aria-label="Extensions page address">{url}</div>
             <button type="button" class="btn" onclick={() => copy(url, "url")}>{copied === "url" ? "Copied ✓" : "Copy"}</button>
           </div>
-          {#if hint}<p class="hint warn" role="status">{hint}</p>{/if}
+          {#if hint}<p class="hint" class:warn={hintWarn} role="status">{hint}</p>{/if}
         {:else if step === 1}
           <h4>Turn on Developer mode</h4>
           <p>{developerModeWhere(browser)} It only lets {name} add an extension from a folder on your computer.</p>

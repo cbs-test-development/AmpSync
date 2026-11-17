@@ -51,8 +51,8 @@ describe("guide steps", () => {
   });
 
   it("words the primary button per step and waits for the connection at the end", () => {
-    expect(primaryLabel(0, "edge", false)).toBe("Open Edge extensions");
-    expect(primaryLabel(0, "chrome", false)).toBe("Open Chrome extensions");
+    expect(primaryLabel(0, "edge", false)).toBe("Open Edge");
+    expect(primaryLabel(0, "chrome", false)).toBe("Open Chrome");
     expect(primaryLabel(1, "edge", false)).toBe("I've turned it on");
     expect(primaryLabel(2, "edge", false)).toBe("I've added it");
     expect(primaryLabel(3, "edge", false)).toBe("Waiting…");

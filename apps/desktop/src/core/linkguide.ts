@@ -37,7 +37,7 @@ export function lede(b: LinkBrowser): string {
 /** The label of the primary button for a step. */
 export function primaryLabel(step: number, b: LinkBrowser, connected: boolean): string {
   switch (step) {
-    case 0: return `Open ${browserName(b)} extensions`;
+    case 0: return `Open ${browserName(b)}`;
     case 1: return "I've turned it on";
     case 2: return "I've added it";
     default: return connected ? "Finish" : "Waiting…";
