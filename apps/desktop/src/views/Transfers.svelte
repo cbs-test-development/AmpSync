@@ -8,6 +8,7 @@
   import type { DiskSpace, QueueItem } from "../core/types";
   import Chart from "../parts/Chart.svelte";
   import NotifyPrompt from "../parts/NotifyPrompt.svelte";
+  import LinkNudge from "../parts/LinkNudge.svelte";
   import FillMap from "../parts/FillMap.svelte";
 
   const MB = 1024 * 1024;
@@ -224,6 +225,7 @@
 <NotifyPrompt />
 
 {#if job && job.status === "needs_sign_in"}
+  <div>
   <div class="alert" role="alert">
     <p>
       <strong>Sign-in expired.</strong>
@@ -232,6 +234,8 @@
     <button type="button" class="btn primary" onclick={signInAgain} disabled={app.signInOpen !== null}>
       {app.signInOpen ? "Sign-in window is open" : "Sign in again"}
     </button>
+  </div>
+  <LinkNudge continues />
   </div>
 {/if}
 

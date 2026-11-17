@@ -11,6 +11,7 @@
   import type { CmdError, DiskSpace, PlanTree, Resolved } from "../core/types";
   import FilterBar from "../parts/FilterBar.svelte";
   import FolderTree from "../parts/FolderTree.svelte";
+  import LinkNudge from "../parts/LinkNudge.svelte";
   import SignInForm from "../parts/SignInForm.svelte";
   import { waitText } from "../core/signin";
 
@@ -279,7 +280,7 @@
   <div class="alert info" role="status">
     <p>
       {#if app.signInOpen}
-        {@const wait = waitText(app.signInPhase ?? "window_open", app.signInOpen)}
+        {@const wait = waitText(app.signInPhase ?? "window_open", app.signInOpen, app.link?.browser)}
         <strong>{wait.title}</strong> {wait.body}
       {:else if listing.files > 0}
         <strong>Listing folders.</strong> Found {num(listing.files)} files ({size(listing.bytes)}) so far.
@@ -294,8 +295,11 @@
 {/if}
 
 {#if error}
-  <div class="alert" role="alert">
-    <p><strong>Could not open that folder.</strong> {errorText}</p>
+  <div>
+    <div class="alert" role="alert">
+      <p><strong>Could not open that folder.</strong> {errorText}</p>
+    </div>
+    {#if needsSignIn}<LinkNudge />{/if}
   </div>
   {#if needsSignIn}
     <div class="panel">

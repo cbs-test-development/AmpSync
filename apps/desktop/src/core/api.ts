@@ -6,6 +6,9 @@ import type {
   ContributorList,
   DiskSpace,
   EnqueueReq,
+  LinkBrowser,
+  LinkStatus,
+  LinkTestResult,
   ParsedLinkInfo,
   PlanTree,
   QueueItem,
@@ -39,7 +42,7 @@ export const api = {
     invoke<SessionInfo>("sign_in", { req: { link, method, cookie_header } }),
   cancelSignIn: () => invoke<void>("cancel_sign_in"),
   /** Answer the "how do you want to sign in" dialog; `null` cancels. */
-  chooseSignIn: (method: "webview" | "edge" | "chrome" | null, remember: boolean) =>
+  chooseSignIn: (method: "webview" | "edge" | "chrome" | "browser_link" | null, remember: boolean) =>
     invoke<void>("choose_sign_in", { method, remember }),
   pendingSignInChoice: () => invoke<string | null>("pending_sign_in_choice"),
   signOut: (host: string) => invoke<void>("sign_out", { host }),
@@ -51,6 +54,16 @@ export const api = {
   getUpdate: () => invoke<UpdateInfo | null>("get_update"),
   openExternal: (url: string) => invoke<void>("open_external", { url }),
   purgeEverything: () => invoke<void>("purge_everything"),
+  linkStatus: () => invoke<LinkStatus>("link_status"),
+  /** Extracts and registers the extension; returns its folder. */
+  linkPrepare: () => invoke<string>("link_prepare"),
+  /** Opens the browser's extensions page; false when it could not be opened. */
+  linkOpenExtensions: (browser: LinkBrowser) => invoke<boolean>("link_open_extensions", { browser }),
+  linkRevealFolder: () => invoke<void>("link_reveal_folder"),
+  linkSaveZip: (dest: string) => invoke<void>("link_save_zip", { dest }),
+  linkTest: () => invoke<LinkTestResult>("link_test"),
+  linkUnlink: () => invoke<void>("link_unlink"),
+  linkDismissNudge: () => invoke<void>("link_dismiss_nudge"),
   closeDecision: (choice: "tray" | "pause", remember: boolean) =>
     invoke<void>("close_decision", { decision: { choice, remember } }),
 };

@@ -6,6 +6,8 @@ export interface TourStep {
   target: string | null;
   title: string;
   body: string;
+  /** Two choices instead of Next: "Later" goes on, "Set it up now" ends the tour and opens the set-up guide. */
+  action?: "link";
 }
 
 /** The first-run walkthrough, as data: which view, what to point at, what to say. */
@@ -15,6 +17,13 @@ export const steps: TourStep[] = [
     target: null,
     title: "Welcome to AmpSync",
     body: "AmpSync downloads SharePoint folders file by file and checks each one, so big downloads finish in one piece. This tour takes about 30 seconds.",
+  },
+  {
+    view: "transfers",
+    target: '[data-go="signins"]',
+    title: "Never sign in to AmpSync again",
+    body: "Your work browser already keeps you signed in to SharePoint. Link AmpSync to it once (about 2 minutes) and downloads never stop for a sign-in window again.",
+    action: "link",
   },
   {
     view: "new",
